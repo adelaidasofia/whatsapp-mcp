@@ -1,0 +1,47 @@
+# Local data (never commit)
+store/
+media/
+audit.log
+audit.log.*
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Secrets and config
+.env
+.env.local
+.env.*.local
+
+# Go
+whatsapp-bridge/whatsapp-bridge
+whatsapp-bridge/bin/
+whatsapp-bridge/vendor/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.venv/
+.uv/
+uv.lock
+
+# Whisper models (large binaries, downloaded separately)
+models/
+*.bin
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
