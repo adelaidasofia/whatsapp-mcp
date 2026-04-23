@@ -33,7 +33,6 @@ func main() {
 	log.Printf("config loaded: bind=%s:%d db=%s crm=%s whisper=%s",
 		cfg.BridgeHost, cfg.BridgePort, cfg.DBPath, truncateForLog(cfg.VaultCRMPath), cfg.WhisperBackend)
 
-	// Obtain DB encryption key from the platform secret store.
 	var dbKey string
 	if cfg.EncryptDB {
 		dbKey, err = GetOrCreateDBKey(cfg.KeychainService, cfg.KeychainAccount)
@@ -53,18 +52,26 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Bridge = whatsmeow client, wired to our SQLite-backed event handlers.
-	// Full implementation lands in bridge.go in the next commit.
-	// For v0.1.0, boot the HTTP server with a healthcheck so installs can be validated end-to-end.
-	server := NewServer(cfg, db)
+	bridge, err := NewBridge(ctx, cfg, db, dbKey)
+	if err != nil {
+		log.Fatalf("bridge init: %v", err)
+	}
+	defer bridge.Disconnect()
 
-	// Handle graceful shutdown.
+	// Connect triggers QR flow on first run or reconnect on subsequent runs.
+	if err := bridge.Connect(ctx); err != nil {
+		log.Fatalf("bridge connect: %v", err)
+	}
+
+	server := NewServer(cfg, db, bridge)
+
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		sig := <-sigs
 		log.Printf("received signal %s; shutting down", sig)
 		cancel()
+		bridge.Disconnect()
 		if err := server.Shutdown(); err != nil {
 			log.Printf("server shutdown: %v", err)
 		}
