@@ -26,6 +26,10 @@ import (
 func main() {
 	importBaileys := flag.String("import-baileys", "",
 		"Path to a baileys_store.json from the prior Baileys sync. If set, the bridge imports that store into SQLite and exits without connecting to WhatsApp.")
+	exportVault := flag.String("export-to-vault", "",
+		"Path to an output folder. If set, the bridge regenerates one markdown file per chat from SQLite into that folder and exits without connecting to WhatsApp.")
+	exportIncludeGroups := flag.Bool("export-include-groups", false,
+		"When set with --export-to-vault, also exports group chats (default exports direct chats only, matching Baileys behavior).")
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
@@ -60,6 +64,15 @@ func main() {
 			log.Fatalf("import failed: %v", err)
 		}
 		log.Println("baileys import done")
+		return
+	}
+
+	// Export-only path: regenerate markdown vault files from SQLite and exit.
+	if *exportVault != "" {
+		if err := ExportVault(db, *exportVault, *exportIncludeGroups); err != nil {
+			log.Fatalf("export failed: %v", err)
+		}
+		log.Println("export done")
 		return
 	}
 
