@@ -63,6 +63,21 @@ func main() {
 		return
 	}
 
+	// CRM name-enrichment runs asynchronously after startup so it does not block
+	// HTTP server bring-up or the whatsmeow connection. Vault folders are often
+	// in iCloud and demand-paging slows file reads; we do not want that latency
+	// on the main startup path. Safe to re-run; idempotent.
+	if cfg.VaultCRMPath != "" {
+		go func() {
+			updated, err := EnrichContactsFromVault(db, cfg.VaultCRMPath)
+			if err != nil {
+				log.Printf("crm enrich failed (continuing): %v", err)
+			} else {
+				log.Printf("crm enrich: %d contacts updated with vault names", updated)
+			}
+		}()
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 

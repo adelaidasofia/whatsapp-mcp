@@ -285,15 +285,6 @@ func (s *Server) handleSearchContacts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-// Create-draft and confirm-send land in commit 3 once the whatsmeow send flow is wired.
-func (s *Server) handleCreateDraft(w http.ResponseWriter, r *http.Request) {
-	notImplemented(w, "create_draft", "send flow lands in commit 3")
-}
-
-func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
-	notImplemented(w, "confirm_send", "send flow lands in commit 3")
-}
-
 // --- helpers ----------------------------------------------------------------
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

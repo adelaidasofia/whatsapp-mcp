@@ -363,14 +363,27 @@ async def list_messages(
 @mcp.tool()
 async def send_message(recipient_jid: str, text: str) -> dict[str, Any]:
     """Create a DRAFT text message. Does NOT send until confirm_send is called.
-    Returns a draft_id, the resolved recipient display name, and a preview.
+
+    Returns a draft_id plus the resolved recipient display name, a preview, and an
+    expires_at timestamp. Drafts expire after 1 hour. Each draft can be confirmed
+    at most once.
+
+    Args:
+        recipient_jid: The recipient's WhatsApp JID (e.g. from list_chats or search_contacts).
+                       Must include the @s.whatsapp.net or @g.us suffix.
+        text: The message text. No media / reactions / voice in v0.3.0.
+
+    Two-step pattern rationale: prevents "replied to wrong person" disasters.
+    Claude must show you the draft_id + recipient_display + preview and wait for
+    you to authorize before calling confirm_send.
     """
     start = time.time()
     body = {"recipient_jid": recipient_jid, "text": text, "send_type": "text"}
     try:
         result = await _bridge_post("/api/sends", body)
         _audit("send_message", {"recipient_jid": recipient_jid, "text_len": len(text)},
-               f"draft_id={result.get('draft_id')}", int((time.time() - start) * 1000))
+               f"draft_id={result.get('draft_id')} recipient={result.get('recipient_display')}",
+               int((time.time() - start) * 1000))
         return result
     except Exception as e:  # noqa: BLE001
         _audit("send_message", {"recipient_jid": recipient_jid, "text_len": len(text)},
@@ -380,14 +393,28 @@ async def send_message(recipient_jid: str, text: str) -> dict[str, Any]:
 
 @mcp.tool()
 async def confirm_send(draft_id: str) -> dict[str, Any]:
-    """Commit a previously-drafted send. The actual network send happens here.
-    Returns the final WhatsApp message ID on success.
+    """Commit a previously-drafted send. This is where the actual WhatsApp network
+    send happens.
+
+    Args:
+        draft_id: The draft_id returned by a previous send_message call.
+
+    Returns the final WhatsApp message ID on success. The sent message is also
+    persisted into the local message database so it shows up in list_messages
+    for the recipient chat.
+
+    Errors:
+        404: draft not found
+        409: draft already confirmed/sent/failed (each draft can only be confirmed once)
+        410: draft expired (>1 hour since creation)
+        502: send failed at whatsmeow layer (bridge disconnected, invalid recipient, etc.)
     """
     start = time.time()
     try:
         result = await _bridge_post(f"/api/sends/{draft_id}/confirm", {})
         _audit("confirm_send", {"draft_id": draft_id},
-               f"whatsapp_message_id={result.get('whatsapp_message_id')}", int((time.time() - start) * 1000))
+               f"status={result.get('status')} whatsapp_id={result.get('whatsapp_message_id')}",
+               int((time.time() - start) * 1000))
         return result
     except Exception as e:  # noqa: BLE001
         _audit("confirm_send", {"draft_id": draft_id}, "failed", int((time.time() - start) * 1000), error=str(e))

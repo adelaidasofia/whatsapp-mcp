@@ -150,6 +150,15 @@ func (b *Bridge) DeviceJID() string {
 	return b.deviceJID
 }
 
+// IsConnected returns true when the bridge has an active whatsmeow connection
+// and an authenticated device. Used by the send flow to refuse confirmations
+// when the bridge is offline.
+func (b *Bridge) IsConnected() bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.connected && b.authenticated
+}
+
 // --- Event dispatch --------------------------------------------------------
 
 func (b *Bridge) handleEvent(raw interface{}) {
