@@ -421,6 +421,137 @@ async def confirm_send(draft_id: str) -> dict[str, Any]:
         raise
 
 
+@mcp.tool()
+async def send_reply_quote(recipient_jid: str, quoted_message_id: str, text: str) -> dict[str, Any]:
+    """Create a DRAFT reply-quote message that cites a specific earlier message.
+
+    The recipient will see the original quoted message appear above your reply
+    in their WhatsApp UI (the familiar reply-indicator format).
+
+    Args:
+        recipient_jid: The chat JID (direct or group).
+        quoted_message_id: The ID of the message being quoted. Find it via list_messages.
+        text: The reply text.
+
+    Returns a draft_id. Call confirm_send(draft_id) to actually send.
+    """
+    start = time.time()
+    body = {
+        "send_type": "reply_quote",
+        "recipient_jid": recipient_jid,
+        "quoted_message_id": quoted_message_id,
+        "text": text,
+    }
+    try:
+        result = await _bridge_post("/api/sends", body)
+        _audit("send_reply_quote",
+               {"recipient_jid": recipient_jid, "quoted": quoted_message_id, "text_len": len(text)},
+               f"draft_id={result.get('draft_id')}", int((time.time() - start) * 1000))
+        return result
+    except Exception as e:  # noqa: BLE001
+        _audit("send_reply_quote", {"recipient_jid": recipient_jid, "quoted": quoted_message_id},
+               "failed", int((time.time() - start) * 1000), error=str(e))
+        raise
+
+
+@mcp.tool()
+async def send_reaction(recipient_jid: str, target_message_id: str, emoji: str) -> dict[str, Any]:
+    """Create a DRAFT emoji reaction on a specific message.
+
+    Args:
+        recipient_jid: The chat JID where the target message lives.
+        target_message_id: The ID of the message to react to. Find via list_messages.
+        emoji: The reaction emoji (e.g., "❤️", "👍", "😂"). Pass "" to remove a previous reaction.
+
+    Returns a draft_id. Call confirm_send(draft_id) to actually react.
+    """
+    start = time.time()
+    body = {
+        "send_type": "reaction",
+        "recipient_jid": recipient_jid,
+        "reaction_target": target_message_id,
+        "reaction_emoji": emoji,
+    }
+    try:
+        result = await _bridge_post("/api/sends", body)
+        _audit("send_reaction",
+               {"recipient_jid": recipient_jid, "target": target_message_id, "emoji": emoji},
+               f"draft_id={result.get('draft_id')}", int((time.time() - start) * 1000))
+        return result
+    except Exception as e:  # noqa: BLE001
+        _audit("send_reaction", {"recipient_jid": recipient_jid, "target": target_message_id},
+               "failed", int((time.time() - start) * 1000), error=str(e))
+        raise
+
+
+@mcp.tool()
+async def mark_chat_read(chat_jid: str, message_ids: list[str]) -> dict[str, Any]:
+    """Mark one or more messages as read. Affects your WhatsApp unread count on
+    this device AND across your linked devices. Low-consequence: no draft+confirm
+    needed, this is a one-step call.
+
+    Args:
+        chat_jid: The chat to mark read.
+        message_ids: List of message IDs to mark. Typically the IDs of the
+                     most recent unread messages for this chat.
+    """
+    start = time.time()
+    body = {"chat_jid": chat_jid, "message_ids": message_ids}
+    try:
+        result = await _bridge_post("/api/presence/mark_read", body)
+        _audit("mark_chat_read", {"chat_jid": chat_jid, "count": len(message_ids)},
+               "ok", int((time.time() - start) * 1000))
+        return result
+    except Exception as e:  # noqa: BLE001
+        _audit("mark_chat_read", {"chat_jid": chat_jid}, "failed",
+               int((time.time() - start) * 1000), error=str(e))
+        raise
+
+
+@mcp.tool()
+async def send_typing_indicator(chat_jid: str, state: str = "composing") -> dict[str, Any]:
+    """Show a "typing..." or "paused" indicator to the chat recipient.
+
+    Args:
+        chat_jid: The chat to signal.
+        state: "composing" (typing) or "paused" (stopped typing). Default: composing.
+
+    Useful as a courtesy signal right before calling confirm_send so the recipient
+    sees "typing..." instead of the message appearing silently. Low-consequence.
+    """
+    start = time.time()
+    body = {"chat_jid": chat_jid, "state": state}
+    try:
+        result = await _bridge_post("/api/presence/typing", body)
+        _audit("send_typing_indicator", {"chat_jid": chat_jid, "state": state},
+               "ok", int((time.time() - start) * 1000))
+        return result
+    except Exception as e:  # noqa: BLE001
+        _audit("send_typing_indicator", {"chat_jid": chat_jid}, "failed",
+               int((time.time() - start) * 1000), error=str(e))
+        raise
+
+
+@mcp.tool()
+async def set_online_presence(online: bool = True) -> dict[str, Any]:
+    """Signal your online/offline presence globally to all chats. Changing this
+    affects your "last seen" visibility per WhatsApp's privacy settings.
+
+    Args:
+        online: True to appear online, False to appear offline.
+    """
+    start = time.time()
+    body = {"online": online}
+    try:
+        result = await _bridge_post("/api/presence/online", body)
+        _audit("set_online_presence", {"online": online}, "ok", int((time.time() - start) * 1000))
+        return result
+    except Exception as e:  # noqa: BLE001
+        _audit("set_online_presence", {"online": online}, "failed",
+               int((time.time() - start) * 1000), error=str(e))
+        raise
+
+
 # --- Entry point ------------------------------------------------------------
 
 if __name__ == "__main__":

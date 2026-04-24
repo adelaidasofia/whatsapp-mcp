@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
@@ -31,10 +32,12 @@ const draftTTLSeconds = 3600
 // --- Draft (pre-send) -------------------------------------------------------
 
 type createDraftRequest struct {
-	SendType        string `json:"send_type"` // "text" (more types arrive in later commits)
+	SendType        string `json:"send_type"` // "text" | "reply_quote" | "reaction"
 	RecipientJID    string `json:"recipient_jid"`
 	Text            string `json:"text,omitempty"`
 	QuotedMessageID string `json:"quoted_message_id,omitempty"`
+	ReactionEmoji   string `json:"reaction_emoji,omitempty"`   // for reaction: the emoji (e.g., "❤️")
+	ReactionTarget  string `json:"reaction_target,omitempty"`  // for reaction: the message ID being reacted to
 }
 
 type createDraftResponse struct {
@@ -59,15 +62,35 @@ func (s *Server) handleCreateDraft(w http.ResponseWriter, r *http.Request) {
 	if req.SendType == "" {
 		req.SendType = "text"
 	}
-	if req.SendType != "text" {
+	switch req.SendType {
+	case "text":
+		if req.Text == "" {
+			writeJSON(w, http.StatusBadRequest, errorResponse{Error: "text required for send_type=text"})
+			return
+		}
+	case "reply_quote":
+		if req.Text == "" {
+			writeJSON(w, http.StatusBadRequest, errorResponse{Error: "text required for send_type=reply_quote"})
+			return
+		}
+		if req.QuotedMessageID == "" {
+			writeJSON(w, http.StatusBadRequest, errorResponse{Error: "quoted_message_id required for send_type=reply_quote"})
+			return
+		}
+	case "reaction":
+		if req.ReactionEmoji == "" {
+			writeJSON(w, http.StatusBadRequest, errorResponse{Error: "reaction_emoji required for send_type=reaction"})
+			return
+		}
+		if req.ReactionTarget == "" {
+			writeJSON(w, http.StatusBadRequest, errorResponse{Error: "reaction_target required for send_type=reaction (message ID to react to)"})
+			return
+		}
+	default:
 		writeJSON(w, http.StatusBadRequest, errorResponse{
-			Error:   fmt.Sprintf("send_type=%q not supported in v0.3.0", req.SendType),
-			Details: "only 'text' is wired in v0.3.0; media/audio/reactions land in v0.4.0",
+			Error:   fmt.Sprintf("send_type=%q not supported in v0.6.0", req.SendType),
+			Details: "supported: 'text', 'reply_quote', 'reaction'. Media/audio land in v0.7.0.",
 		})
-		return
-	}
-	if req.Text == "" {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "text required for send_type=text"})
 		return
 	}
 
@@ -77,20 +100,34 @@ func (s *Server) handleCreateDraft(w http.ResponseWriter, r *http.Request) {
 	draftID := uuid.New().String()
 	now := time.Now().Unix()
 
+	// For reactions, use the reaction target as the "quoted" message and the emoji as text.
+	// That way all drafts fit the same row schema.
+	contentText := req.Text
+	quotedID := req.QuotedMessageID
+	if req.SendType == "reaction" {
+		contentText = req.ReactionEmoji
+		quotedID = req.ReactionTarget
+	}
+
 	_, err := s.db.ExecContext(r.Context(), `
-		INSERT INTO sends (draft_id, recipient_jid, recipient_display, send_type, content_text, quoted_message_id, status, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, 'draft', ?)
-	`, draftID, req.RecipientJID, recipientDisplay, req.SendType, req.Text, nullString(req.QuotedMessageID), now)
+		INSERT INTO sends (draft_id, recipient_jid, recipient_display, send_type, content_text, quoted_message_id, reaction_emoji, status, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', ?)
+	`, draftID, req.RecipientJID, recipientDisplay, req.SendType, contentText, nullString(quotedID), nullString(req.ReactionEmoji), now)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "draft insert failed", Details: err.Error()})
 		return
+	}
+
+	preview := truncate(req.Text, 200)
+	if req.SendType == "reaction" {
+		preview = fmt.Sprintf("Reaction %s to message %s", req.ReactionEmoji, truncate(req.ReactionTarget, 32))
 	}
 
 	writeJSON(w, http.StatusOK, createDraftResponse{
 		DraftID:             draftID,
 		RecipientJID:        req.RecipientJID,
 		RecipientDisplay:    recipientDisplay,
-		Preview:             truncate(req.Text, 200),
+		Preview:             preview,
 		ExpiresAt:           now + draftTTLSeconds,
 		RecipientContactHit: hit,
 	})
@@ -124,15 +161,16 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 
 	// Load the draft, validate status and TTL.
 	var (
-		recipientJID, recipientDisplay string
-		sendType, contentText          string
-		status                         string
-		createdAt                      int64
+		recipientJID, recipientDisplay                string
+		sendType, contentText, quotedID, reactionEmoji string
+		status                                        string
+		createdAt                                     int64
 	)
 	err := s.db.QueryRowContext(r.Context(),
-		`SELECT recipient_jid, COALESCE(recipient_display, ''), send_type, COALESCE(content_text, ''), status, created_at
+		`SELECT recipient_jid, COALESCE(recipient_display, ''), send_type, COALESCE(content_text, ''),
+		        COALESCE(quoted_message_id, ''), COALESCE(reaction_emoji, ''), status, created_at
 		 FROM sends WHERE draft_id = ?`, draftID,
-	).Scan(&recipientJID, &recipientDisplay, &sendType, &contentText, &status, &createdAt)
+	).Scan(&recipientJID, &recipientDisplay, &sendType, &contentText, &quotedID, &reactionEmoji, &status, &createdAt)
 	if err == sql.ErrNoRows {
 		writeJSON(w, http.StatusNotFound, errorResponse{Error: "draft not found", Details: draftID})
 		return
@@ -165,9 +203,54 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Build the outbound message. v0.3.0: text only.
-	msg := &waE2E.Message{
-		Conversation: proto.String(contentText),
+	// Build the outbound message based on send type.
+	var msg *waE2E.Message
+	switch sendType {
+	case "text":
+		msg = &waE2E.Message{
+			Conversation: proto.String(contentText),
+		}
+	case "reply_quote":
+		// Look up the quoted message to populate ContextInfo.Participant correctly.
+		var quotedSender string
+		var quotedFromMe int
+		_ = s.db.QueryRowContext(r.Context(),
+			`SELECT COALESCE(sender_jid, ''), is_from_me FROM messages WHERE id = ?`, quotedID,
+		).Scan(&quotedSender, &quotedFromMe)
+		if quotedFromMe == 1 && s.bridge.client.Store.ID != nil {
+			quotedSender = s.bridge.client.Store.ID.String()
+		}
+		msg = &waE2E.Message{
+			ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+				Text: proto.String(contentText),
+				ContextInfo: &waE2E.ContextInfo{
+					StanzaID:    proto.String(quotedID),
+					Participant: proto.String(quotedSender),
+				},
+			},
+		}
+	case "reaction":
+		var targetFromMe int
+		_ = s.db.QueryRowContext(r.Context(),
+			`SELECT is_from_me FROM messages WHERE id = ?`, quotedID,
+		).Scan(&targetFromMe)
+		msg = &waE2E.Message{
+			ReactionMessage: &waE2E.ReactionMessage{
+				Key: &waCommon.MessageKey{
+					RemoteJID: proto.String(recipientJID),
+					FromMe:    proto.Bool(targetFromMe == 1),
+					ID:        proto.String(quotedID),
+				},
+				Text:              proto.String(reactionEmoji),
+				SenderTimestampMS: proto.Int64(time.Now().UnixMilli()),
+			},
+		}
+	default:
+		writeJSON(w, http.StatusInternalServerError, errorResponse{
+			Error:   fmt.Sprintf("unsupported send_type %q reached confirm", sendType),
+			Details: "this is a bug; the draft insert validator should have rejected it",
+		})
+		return
 	}
 
 	// Flip to confirmed BEFORE sending, so double-confirm races are blocked.

@@ -45,6 +45,10 @@ func (s *Server) registerRoutes() {
 
 	s.mux.HandleFunc("POST /api/sends", s.handleCreateDraft)
 	s.mux.HandleFunc("POST /api/sends/{draft_id}/confirm", s.handleConfirmSend)
+
+	s.mux.HandleFunc("POST /api/presence/mark_read", s.handleMarkRead)
+	s.mux.HandleFunc("POST /api/presence/typing", s.handleTyping)
+	s.mux.HandleFunc("POST /api/presence/online", s.handleOnline)
 }
 
 func (s *Server) ListenAndServe(ctx context.Context) error {
