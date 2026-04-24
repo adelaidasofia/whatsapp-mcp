@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log"
 	"os"
 	"os/signal"
@@ -23,6 +24,10 @@ import (
 )
 
 func main() {
+	importBaileys := flag.String("import-baileys", "",
+		"Path to a baileys_store.json from the prior Baileys sync. If set, the bridge imports that store into SQLite and exits without connecting to WhatsApp.")
+	flag.Parse()
+
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
 	log.Println("whatsapp-mcp bridge starting")
 
@@ -48,6 +53,15 @@ func main() {
 	}
 	defer db.Close()
 	log.Printf("DB opened: %s (encrypted=%t)", cfg.DBPath, cfg.EncryptDB)
+
+	// Import-only path: no whatsmeow connection, just read the Baileys store into SQLite.
+	if *importBaileys != "" {
+		if err := RunBaileysImport(cfg, db, *importBaileys); err != nil {
+			log.Fatalf("import failed: %v", err)
+		}
+		log.Println("baileys import done")
+		return
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
