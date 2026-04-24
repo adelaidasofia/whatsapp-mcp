@@ -26,9 +26,10 @@ import (
 // lives in a separate SQLite file, both encrypted under the same SQLCipher key as the
 // message database. The split follows whatsmeow's upstream pattern; we just share the key.
 type Bridge struct {
-	cfg    *Config
-	db     *sql.DB
-	client *whatsmeow.Client
+	cfg         *Config
+	db          *sql.DB
+	client      *whatsmeow.Client
+	transcriber *Transcriber
 
 	mu            sync.RWMutex
 	connected     bool
@@ -39,7 +40,8 @@ type Bridge struct {
 
 // NewBridge builds the whatsmeow client, prepares its session store, and registers event handlers.
 // It does NOT connect yet; call Connect().
-func NewBridge(ctx context.Context, cfg *Config, db *sql.DB, dbKey string) (*Bridge, error) {
+// If transcriber is non-nil, voice-note messages are enqueued for transcription automatically.
+func NewBridge(ctx context.Context, cfg *Config, db *sql.DB, dbKey string, transcriber *Transcriber) (*Bridge, error) {
 	sessionDir := filepath.Dir(cfg.DBPath)
 	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
 		return nil, fmt.Errorf("mkdir session dir: %w", err)
@@ -67,9 +69,10 @@ func NewBridge(ctx context.Context, cfg *Config, db *sql.DB, dbKey string) (*Bri
 	client := whatsmeow.NewClient(device, clientLog)
 
 	b := &Bridge{
-		cfg:    cfg,
-		db:     db,
-		client: client,
+		cfg:         cfg,
+		db:          db,
+		client:      client,
+		transcriber: transcriber,
 	}
 	client.AddEventHandler(b.handleEvent)
 	return b, nil
@@ -260,6 +263,22 @@ func (b *Bridge) onMessage(evt *events.Message) {
 		`, senderJID, evt.Info.Sender.User, senderDisplay, Normalize(senderDisplay), 0, ts, ts)
 		if err != nil {
 			log.Printf("onMessage: contact upsert failed: %v", err)
+		}
+	}
+
+	// Enqueue voice-note transcription. Fire-and-forget; the transcriber
+	// writes back to messages.voice_note_transcript when done.
+	if b.transcriber != nil && (msgType == "voice" || msgType == "audio") {
+		if audio := evt.Message.GetAudioMessage(); audio != nil {
+			audioMsg := audio // closure capture
+			client := b.client
+			b.transcriber.Enqueue(transcriptionJob{
+				MessageID: id,
+				MimeType:  audio.GetMimetype(),
+				AudioDownloader: func(ctx context.Context) ([]byte, error) {
+					return client.Download(ctx, audioMsg)
+				},
+			})
 		}
 	}
 }

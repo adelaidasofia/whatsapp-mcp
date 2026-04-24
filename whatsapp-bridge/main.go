@@ -81,7 +81,13 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	bridge, err := NewBridge(ctx, cfg, db, dbKey)
+	// Start the voice-note transcription worker pool. Always created; only
+	// actually does work when voice messages arrive and the configured
+	// whisper binary + model are present.
+	transcriber := NewTranscriber(cfg, db)
+	defer transcriber.Close()
+
+	bridge, err := NewBridge(ctx, cfg, db, dbKey, transcriber)
 	if err != nil {
 		log.Fatalf("bridge init: %v", err)
 	}
