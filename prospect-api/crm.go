@@ -261,13 +261,23 @@ func readCRMFile(path string) (*CRMRecord, error) {
 	return rec, nil
 }
 
+// stringField reads a frontmatter value as a string. YAML-typed dates are
+// converted to YYYY-MM-DD so the safety check in UpdateCRM (skip-if-non-empty)
+// recognizes them as populated. Without the time.Time branch, a vault note
+// whose `last_interaction: 2026-04-19` was parsed as a date would be seen as
+// empty and silently overwritten on the next backfill.
 func stringField(m map[string]any, key string) (string, bool) {
 	v, ok := m[key]
 	if !ok || v == nil {
 		return "", false
 	}
-	s, ok := v.(string)
-	return s, ok && s != ""
+	switch val := v.(type) {
+	case string:
+		return val, val != ""
+	case time.Time:
+		return val.Format("2006-01-02"), true
+	}
+	return "", false
 }
 
 func stringSliceField(m map[string]any, key string) []string {
