@@ -1,0 +1,23 @@
+# Local data
+store/
+audit.log
+audit.log.*
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Secrets
+.env
+.env.local
+.env.*.local
+
+# Build artifacts
+bin/
+*.exe
+
+# Editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
