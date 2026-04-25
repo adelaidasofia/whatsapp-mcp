@@ -24,6 +24,8 @@
 package main
 
 import (
+	"context"
+	"flag"
 	"log"
 	"os"
 	"os/signal"
@@ -32,6 +34,14 @@ import (
 )
 
 func main() {
+	backfillPhones := flag.Bool("backfill-phones", false,
+		"Cross-reference WhatsApp contacts with vault CRM notes and write matched phones into CRM frontmatter. Default is dry-run; pass --apply to write.")
+	backfillApply := flag.Bool("apply", false,
+		"With --backfill-phones: actually write changes (default is dry-run).")
+	backfillIncludeWeak := flag.Bool("include-weak", false,
+		"With --backfill-phones: include substring fuzzy matches (default off; substring matches have real false-positive risk).")
+	flag.Parse()
+
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
 	log.Println("prospect-api starting")
 
@@ -65,6 +75,24 @@ func main() {
 	if err != nil {
 		log.Fatalf("crm store: %v", err)
 	}
+
+	// One-shot CLI subcommand: --backfill-phones runs the cross-reference
+	// (dry-run by default, --apply to write) and exits. Does not bind HTTP.
+	if *backfillPhones {
+		log.Println("backfill mode (no HTTP server will start)")
+		if err := crm.indexAll(); err != nil {
+			log.Fatalf("crm index for backfill: %v", err)
+		}
+		mode := backfillMode{
+			DryRun:      !*backfillApply,
+			IncludeWeak: *backfillIncludeWeak,
+		}
+		if err := RunBackfillPhones(context.Background(), cfg, messageDB, crm, mode); err != nil {
+			log.Fatalf("backfill failed: %v", err)
+		}
+		return
+	}
+
 	// Async first index pass; iCloud demand-paging may take time.
 	go func() {
 		start := time.Now()
