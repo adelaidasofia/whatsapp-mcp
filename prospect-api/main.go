@@ -128,6 +128,13 @@ func main() {
 		}
 	}()
 
+	// Scaffold the Negotiator Playbook if it does not exist yet (idempotent).
+	if cfg.NegotiatorPlaybookPath != "" {
+		if err := ScaffoldNegotiatorPlaybook(cfg.NegotiatorPlaybookPath); err != nil {
+			log.Printf("warning: could not scaffold negotiator playbook: %v", err)
+		}
+	}
+
 	server := NewServer(cfg, messageDB, presetDB, crm)
 
 	sigs := make(chan os.Signal, 1)
