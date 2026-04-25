@@ -137,6 +137,18 @@ func main() {
 
 	server := NewServer(cfg, messageDB, presetDB, crm)
 
+	// Flush pending pings every minute (quiet-hours + budget-overflow queue).
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			FlushPendingPings(presetDB, func(row pendingPingRow) error {
+				_, err := server.sendViaBridge(row.Message)
+				return err
+			})
+		}
+	}()
+
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	go func() {

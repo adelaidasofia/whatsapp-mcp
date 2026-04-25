@@ -71,6 +71,8 @@ func (s *Server) registerRoutes() {
 	// Phase B endpoints (Sprints 7-10).
 	s.mux.HandleFunc("POST /api/get-negotiator-terms",
 		withClientIP(s.authBearer(s.rateLimit(s.handleGetNegotiatorTerms))))
+	s.mux.HandleFunc("POST /api/notify-adelaida",
+		withClientIP(s.authBearer(s.rateLimit(s.handleNotifyAdelaida))))
 }
 
 func (s *Server) ListenAndServe(_ context.Context) error {
