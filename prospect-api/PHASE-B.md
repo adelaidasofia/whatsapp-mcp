@@ -299,7 +299,7 @@ four are shipped, run an end-to-end test:
    whatsapp-bridge.
 5. The inbox file lands at the expected path.
 6. The user's WhatsApp shows the ping.
-7. Next 6am Bogota, the morning-digest scheduler fires, the digest
-   file lands with the 24h note + trends.
+7. At the configured local 6am, the morning-digest scheduler fires,
+   the digest file lands with the 24h note + trends.
 
 If all seven steps pass: Phase B is done. Tag v1.0.0.
