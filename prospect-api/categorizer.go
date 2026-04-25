@@ -27,21 +27,17 @@ const (
 //
 // Pure deterministic. No LLM. No external calls.
 func CategorizeContact(ctx context.Context, db *sql.DB, jid string, crm *CRMRecord) Category {
-	// 1. CRM hints first.
+	// 1. CRM hints first. Normalize the relationship value so "close-friend",
+	//    "close_friend", "close friend", "Close Friend" all match the same key.
 	if crm != nil {
-		switch strings.ToLower(crm.Relationship) {
-		case "close friend", "friend", "family", "personal":
-			return CategorySocial
-		case "client", "prospect", "advisor", "investor", "vendor", "professional", "co-founder", "team":
-			return CategoryBusinessDiscussion
+		rel := normalizeRelationship(crm.Relationship)
+		if cat, ok := relationshipToCategory[rel]; ok {
+			return cat
 		}
 		for _, t := range crm.Tags {
-			low := strings.ToLower(t)
-			if low == "social" || low == "friend" || low == "family" {
-				return CategorySocial
-			}
-			if low == "investor" || low == "client" || low == "prospect" || low == "advisor" {
-				return CategoryBusinessDiscussion
+			low := normalizeRelationship(t)
+			if cat, ok := relationshipToCategory[low]; ok {
+				return cat
 			}
 		}
 	}
@@ -69,6 +65,53 @@ func CategorizeContact(ctx context.Context, db *sql.DB, jid string, crm *CRMReco
 	}
 
 	return CategoryUnknown
+}
+
+// relationshipToCategory maps normalized CRM relationship/tag values to a category.
+// Synonyms are expanded so vault frontmatter can use whichever form feels natural
+// ("close-friend", "close friend", "close_friend" all hit the same bucket).
+var relationshipToCategory = map[string]Category{
+	// Social / personal
+	"close friend": CategorySocial,
+	"friend":       CategorySocial,
+	"family":       CategorySocial,
+	"personal":     CategorySocial,
+	"social":       CategorySocial,
+	"sister":       CategorySocial,
+	"brother":      CategorySocial,
+	"mother":       CategorySocial,
+	"father":       CategorySocial,
+	"partner":      CategorySocial,
+	"date":         CategorySocial,
+	// Business / professional
+	"client":       CategoryBusinessDiscussion,
+	"prospect":     CategoryBusinessDiscussion,
+	"advisor":      CategoryBusinessDiscussion,
+	"investor":     CategoryBusinessDiscussion,
+	"vendor":       CategoryBusinessDiscussion,
+	"professional": CategoryBusinessDiscussion,
+	"cofounder":    CategoryBusinessDiscussion,
+	"co founder":   CategoryBusinessDiscussion,
+	"team":         CategoryBusinessDiscussion,
+	"colleague":    CategoryBusinessDiscussion,
+	"contractor":   CategoryBusinessDiscussion,
+	"customer":     CategoryBusinessDiscussion,
+	"partner_pro":  CategoryBusinessDiscussion, // unlikely; reserved
+	"acquaintance": CategoryBusinessDiscussion,
+}
+
+// normalizeRelationship lowercases, replaces hyphens/underscores with spaces,
+// collapses internal whitespace, and trims. The result is keyable in
+// relationshipToCategory above.
+func normalizeRelationship(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.ReplaceAll(s, "-", " ")
+	s = strings.ReplaceAll(s, "_", " ")
+	// Collapse multiple spaces.
+	for strings.Contains(s, "  ") {
+		s = strings.ReplaceAll(s, "  ", " ")
+	}
+	return s
 }
 
 // schedulingKeywords are matched case-insensitively against message content text.
