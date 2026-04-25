@@ -30,6 +30,8 @@ func main() {
 		"Path to an output folder. If set, the bridge regenerates one markdown file per chat from SQLite into that folder and exits without connecting to WhatsApp.")
 	exportIncludeGroups := flag.Bool("export-include-groups", false,
 		"When set with --export-to-vault, also exports group chats (default exports direct chats only, matching Baileys behavior).")
+	exportMinMessages := flag.Int("export-min-messages", 0,
+		"With --export-to-vault: only export chats with at least this many messages (default 0 = export everything; recommended 5 to skip drive-by contacts).")
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
@@ -69,7 +71,7 @@ func main() {
 
 	// Export-only path: regenerate markdown vault files from SQLite and exit.
 	if *exportVault != "" {
-		if err := ExportVault(db, *exportVault, *exportIncludeGroups); err != nil {
+		if err := ExportVault(db, *exportVault, *exportIncludeGroups, *exportMinMessages); err != nil {
 			log.Fatalf("export failed: %v", err)
 		}
 		log.Println("export done")

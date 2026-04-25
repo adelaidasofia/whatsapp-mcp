@@ -36,24 +36,29 @@ import (
 //
 // Body: `## YYYY-MM-DD` section per date, `**HH:MM AM** You: <text>` per message.
 //
-// Per the architectural panel: we write to a separate folder from the pre-bridge
-// Baileys archive by default. If the caller points outputDir at the existing
-// Baileys folder, we refuse to overwrite files whose existing last_sync predates
-// the bridge pairing cutoff (see skipPreservedFiles).
-func ExportVault(db *sql.DB, outputDir string, includeGroups bool) error {
+// Per design conversation 2026-04-24: the existing Baileys folder is the
+// canonical chat-history write target. The bridge regenerates per-chat MDs
+// from SQLite into that folder. minMessages filters out drive-by contacts
+// (set to 0 for "everyone with at least one message", or 5 for the user's
+// preferred volume threshold).
+func ExportVault(db *sql.DB, outputDir string, includeGroups bool, minMessages int) error {
 	if outputDir == "" {
 		return fmt.Errorf("outputDir required")
 	}
 	if err := os.MkdirAll(outputDir, 0o755); err != nil {
 		return fmt.Errorf("mkdir output: %w", err)
 	}
+	if minMessages < 0 {
+		minMessages = 0
+	}
 
-	// Pull all chats with at least one message.
+	// Pull all chats whose message count meets the threshold.
 	chatRows, err := db.Query(`
-		SELECT c.jid, c.chat_type, COALESCE(c.name, ''), COALESCE(c.last_message_time, 0)
+		SELECT c.jid, c.chat_type, COALESCE(c.name, ''), COALESCE(c.last_message_time, 0),
+		       (SELECT COUNT(*) FROM messages m WHERE m.chat_jid = c.jid) AS msg_count
 		FROM chats c
-		WHERE EXISTS (SELECT 1 FROM messages m WHERE m.chat_jid = c.jid)
-	`)
+		WHERE (SELECT COUNT(*) FROM messages m WHERE m.chat_jid = c.jid) >= ?
+	`, minMessages)
 	if err != nil {
 		return fmt.Errorf("query chats: %w", err)
 	}
@@ -68,7 +73,8 @@ func ExportVault(db *sql.DB, outputDir string, includeGroups bool) error {
 	for chatRows.Next() {
 		var ck chatKey
 		var lastTime int64
-		if err := chatRows.Scan(&ck.jid, &ck.chatType, &ck.name, &lastTime); err != nil {
+		var msgCount int
+		if err := chatRows.Scan(&ck.jid, &ck.chatType, &ck.name, &lastTime, &msgCount); err != nil {
 			continue
 		}
 		if !includeGroups && ck.chatType != "direct" {
