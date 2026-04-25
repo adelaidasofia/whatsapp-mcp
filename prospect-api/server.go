@@ -75,6 +75,8 @@ func (s *Server) registerRoutes() {
 		withClientIP(s.authBearer(s.rateLimit(s.handleNotifyAdelaida))))
 	s.mux.HandleFunc("POST /api/relay-note",
 		withClientIP(s.authBearer(s.rateLimit(s.handleRelayNote))))
+	s.mux.HandleFunc("POST /api/morning-digest",
+		withClientIP(s.authBearer(s.rateLimit(s.handleMorningDigest))))
 }
 
 func (s *Server) ListenAndServe(_ context.Context) error {

@@ -137,6 +137,9 @@ func main() {
 
 	server := NewServer(cfg, messageDB, presetDB, crm)
 
+	// Daily morning-digest scheduler (fires at 06:00 local per PROSPECT_TIMEZONE).
+	startDigestScheduler(cfg, cfg.BridgeAuthToken)
+
 	// Flush pending pings every minute (quiet-hours + budget-overflow queue).
 	go func() {
 		ticker := time.NewTicker(time.Minute)
