@@ -128,7 +128,29 @@ func main() {
 		}
 	}()
 
+	// Scaffold the Negotiator Playbook if it does not exist yet (idempotent).
+	if cfg.NegotiatorPlaybookPath != "" {
+		if err := ScaffoldNegotiatorPlaybook(cfg.NegotiatorPlaybookPath); err != nil {
+			log.Printf("warning: could not scaffold negotiator playbook: %v", err)
+		}
+	}
+
 	server := NewServer(cfg, messageDB, presetDB, crm)
+
+	// Daily morning-digest scheduler (fires at 06:00 local per PROSPECT_TIMEZONE).
+	startDigestScheduler(cfg, cfg.BridgeAuthToken)
+
+	// Flush pending pings every minute (quiet-hours + budget-overflow queue).
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			FlushPendingPings(presetDB, func(row pendingPingRow) error {
+				_, err := server.sendViaBridge(row.Message)
+				return err
+			})
+		}
+	}()
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)

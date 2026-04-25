@@ -96,6 +96,18 @@ func initPresetSchema(db *sql.DB) error {
 		delivered INTEGER NOT NULL DEFAULT 0
 	);
 	CREATE INDEX IF NOT EXISTS idx_wa_pings_ts ON wa_pings(ts DESC);
+
+	CREATE TABLE IF NOT EXISTS pending_pings (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		ts INTEGER NOT NULL,
+		deliver_at INTEGER NOT NULL,
+		message TEXT NOT NULL,
+		urgency TEXT NOT NULL,
+		deeplink TEXT,
+		delivered INTEGER NOT NULL DEFAULT 0,
+		delivered_at INTEGER
+	);
+	CREATE INDEX IF NOT EXISTS idx_pending_pings_deliver_at ON pending_pings(deliver_at) WHERE delivered = 0;
 	`
 	_, err := db.Exec(schema)
 	return err
