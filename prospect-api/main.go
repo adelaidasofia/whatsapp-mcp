@@ -36,8 +36,14 @@ import (
 func main() {
 	backfillPhones := flag.Bool("backfill-phones", false,
 		"Cross-reference WhatsApp contacts with vault CRM notes and write matched phones into CRM frontmatter. Default is dry-run; pass --apply to write.")
-	backfillApply := flag.Bool("apply", false,
-		"With --backfill-phones: actually write changes (default is dry-run).")
+	createMissingCRM := flag.Bool("create-missing-crm", false,
+		"Bulk-create vault CRM notes for 1:1 WhatsApp + iMessage contacts that are saved in macOS Contacts and have ≥6 messages. Also backfills phone field on existing CRM notes when name-matched. Default is dry-run; pass --apply to write.")
+	includeUnsaved := flag.Bool("include-unsaved", false,
+		"With --create-missing-crm: include phones NOT in macOS Contacts (default off; saved-only is safer).")
+	skipIMessage := flag.Bool("skip-imessage", false,
+		"With --create-missing-crm: skip iMessage even if Full Disk Access is granted.")
+	applyFlag := flag.Bool("apply", false,
+		"With --backfill-phones or --create-missing-crm: actually write changes (default is dry-run).")
 	backfillIncludeWeak := flag.Bool("include-weak", false,
 		"With --backfill-phones: include substring fuzzy matches (default off; substring matches have real false-positive risk).")
 	flag.Parse()
@@ -84,11 +90,29 @@ func main() {
 			log.Fatalf("crm index for backfill: %v", err)
 		}
 		mode := backfillMode{
-			DryRun:      !*backfillApply,
+			DryRun:      !*applyFlag,
 			IncludeWeak: *backfillIncludeWeak,
 		}
 		if err := RunBackfillPhones(context.Background(), cfg, messageDB, crm, mode); err != nil {
 			log.Fatalf("backfill failed: %v", err)
+		}
+		return
+	}
+
+	// One-shot CLI subcommand: --create-missing-crm bulk-creates vault CRM notes
+	// for 1:1 WhatsApp contacts with ≥6 messages that have no existing CRM entry.
+	if *createMissingCRM {
+		log.Println("create-missing-crm mode (no HTTP server will start)")
+		if err := crm.indexAll(); err != nil {
+			log.Fatalf("crm index for create-missing-crm: %v", err)
+		}
+		mode := createMissingCRMMode{
+			DryRun:         !*applyFlag,
+			IncludeUnsaved: *includeUnsaved,
+			SkipIMessage:   *skipIMessage,
+		}
+		if err := RunCreateMissingCRM(context.Background(), cfg, messageDB, crm, mode); err != nil {
+			log.Fatalf("create-missing-crm failed: %v", err)
 		}
 		return
 	}

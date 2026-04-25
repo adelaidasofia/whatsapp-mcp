@@ -293,12 +293,14 @@ func stringSliceField(m map[string]any, key string) []string {
 // CRMUpdates carries the agent's requested changes. Server-side whitelist filters
 // to only allowed fields. Anything else is silently dropped (logged).
 type CRMUpdates struct {
-	Email     *string  `json:"email,omitempty"`
-	Phone     *string  `json:"phone,omitempty"`
-	Company   *string  `json:"company,omitempty"`
-	Role      *string  `json:"role,omitempty"`
-	LastTopic *string  `json:"lastTopic,omitempty"`
-	TagsAdd   []string `json:"tagsAdd,omitempty"`
+	Email           *string  `json:"email,omitempty"`
+	Phone           *string  `json:"phone,omitempty"`
+	PhoneAlt        *string  `json:"phoneAlt,omitempty"`
+	Company         *string  `json:"company,omitempty"`
+	Role            *string  `json:"role,omitempty"`
+	LastTopic       *string  `json:"lastTopic,omitempty"`
+	LastInteraction *string  `json:"lastInteraction,omitempty"`
+	TagsAdd         []string `json:"tagsAdd,omitempty"`
 }
 
 // UpdateCRM applies whitelisted updates to a CRM file.
@@ -336,9 +338,11 @@ func (s *CRMStore) UpdateCRM(filePath string, upd CRMUpdates, forceOverwrite boo
 	}
 	maybeWrite("email", upd.Email)
 	maybeWrite("phone", upd.Phone)
+	maybeWrite("phone_alt", upd.PhoneAlt)
 	maybeWrite("company", upd.Company)
 	maybeWrite("role", upd.Role)
 	maybeWrite("lastTopic", upd.LastTopic)
+	maybeWrite("last_interaction", upd.LastInteraction)
 
 	if len(upd.TagsAdd) > 0 {
 		existing := stringSliceField(rec.rawFrontmatter, "tags")
