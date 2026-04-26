@@ -45,3 +45,12 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# Local-only operator files. These contain operator-specific runtime data,
+# personal contacts, or session-specific context that should not be pushed
+# to the public repo. Generated/maintained by the operator running the bridge.
+bridge-stdout.log
+bridge-stderr.log
+prospect-api/BRIDGE-SPEC-DELTA-*.md
+prospect-api/Negotiator Playbook.md
+prospect-api/Negotiator Playbook *.md

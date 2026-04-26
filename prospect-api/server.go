@@ -63,6 +63,10 @@ func (s *Server) registerRoutes() {
 		withClientIP(s.authBearer(s.rateLimit(s.handleUpdateCRM))))
 	s.mux.HandleFunc("POST /api/check-preset",
 		withClientIP(s.authBearer(s.rateLimit(s.handleCheckPreset))))
+	s.mux.HandleFunc("POST /api/get-preset",
+		withClientIP(s.authBearer(s.rateLimit(s.handleGetPreset))))
+	s.mux.HandleFunc("POST /api/consume-preset",
+		withClientIP(s.authBearer(s.rateLimit(s.handleConsumePreset))))
 
 	// Admin-auth only (separate token). Higher trust.
 	s.mux.HandleFunc("POST /api/preset",
