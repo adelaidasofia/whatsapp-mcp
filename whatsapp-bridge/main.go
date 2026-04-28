@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 )
 
 func main() {
@@ -113,7 +114,36 @@ func main() {
 		log.Fatalf("bridge connect: %v", err)
 	}
 
-	server := NewServer(cfg, db, bridge)
+	// Self-healing voice-note transcript backfill. Periodically re-enqueues
+	// any voice/audio rows that have re-download keys but NULL transcripts.
+	// Recovers from any transient failure mode (validation, queue full,
+	// transient whisper-cli, ffmpeg crash, network blip) automatically.
+	backfiller := NewTranscriptBackfiller(db, bridge.Client(), transcriber, cfg.BackfillIntervalSeconds, cfg.BackfillWindowDays)
+	go backfiller.Run(ctx)
+	log.Printf("transcript backfiller started: interval=%ds window=%dd", cfg.BackfillIntervalSeconds, cfg.BackfillWindowDays)
+
+	// JID-alias backfill. Asks whatsmeow's local LID store for the alt form of
+	// every contact and records it in jid_aliases. Also repairs the legacy
+	// "LID stored as phone" rows. Runs once at startup, async so it can't
+	// block HTTP serving. Idempotent; cheap (single round-trip per contact
+	// against an in-memory store). See aliases.go.
+	go func() {
+		// Small delay so whatsmeow has a chance to populate its LID store
+		// from the initial connection before we ask it to enumerate.
+		select {
+		case <-time.After(15 * time.Second):
+		case <-ctx.Done():
+			return
+		}
+		written, repaired, err := BackfillJIDAliases(ctx, db, bridge.Client())
+		if err != nil {
+			log.Printf("jid alias backfill failed (non-fatal): %v", err)
+			return
+		}
+		log.Printf("jid alias backfill: %d new edges written, %d phone columns repaired", written, repaired)
+	}()
+
+	server := NewServer(cfg, db, bridge, backfiller)
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)

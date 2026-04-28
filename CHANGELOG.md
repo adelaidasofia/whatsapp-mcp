@@ -6,6 +6,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **JID alias resolution for LID + phone-number forms.** WhatsApp's privacy
+  rollout migrated most direct chats to LID-form JIDs (`<opaque>@lid`) while
+  legacy threads stayed on `<phone>@s.whatsapp.net`. Recent traffic for the
+  same human can arrive under either form depending on the contact's privacy
+  settings, and whatsmeow surfaces both forms via
+  `MessageSource.SenderAlt` / `RecipientAlt`. The bridge previously stored
+  each form as a separate contact + chat row with no link, so
+  `search_contacts` returned only the row whose stored push_name matched the
+  query string and `list_messages` returned only that JID's history — a
+  contact whose recent thread had moved to LID looked silent under their
+  legacy JID. Fix:
+  - New migration `003_jid_aliases.sql` adds a symmetric `jid_aliases` edge
+    table.
+  - `aliases.go` introduces `BackfillJIDAliases`, which walks contacts at
+    startup, asks `client.Store.LIDs.GetPNForLID` / `GetLIDForPN` for the
+    counterpart form, and writes the edge.
+  - `onMessage` now records alias edges from `Info.SenderAlt` (incoming DMs)
+    and `Info.RecipientAlt` (outgoing DMs) on every event.
+  - `onMessage` no longer stores `Sender.User` as `phone` for LID-form JIDs
+    (where `User` is the opaque LID number, not a phone). Falls back to
+    `SenderAlt.User` when the alt is the phone form, otherwise leaves
+    `phone` NULL until the startup backfill resolves it.
+  - `BackfillJIDAliases` repairs existing rows whose `phone` column was
+    populated with the LID number from the legacy ingestion path.
+  - `handleSearchContacts` returns both JID rows for any matched human, each
+    with the other(s) listed in a new `aliases` field.
+  - `handleListMessages` resolves the requested JID through
+    `jid_aliases` and queries `WHERE chat_jid IN (jid + aliases)`. Adds a
+    `merged_jids` field to the response when more than one form contributed.
+  - `/healthcheck` exposes a new `alias_coverage` block:
+    `total_edges`, `contacts_with_alias`, `direct_chats_lid`,
+    `direct_chats_phone`, and the regression guard
+    `suspicious_lid_phones` — non-zero means at least one LID contact still
+    has its `phone` column populated with the LID number itself.
+
 ### Added
 
 - Initial project scaffold.

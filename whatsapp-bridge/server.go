@@ -14,15 +14,16 @@ import (
 // Server is the HTTP REST API the Python MCP server consumes.
 // Runs on the loopback interface only (enforced in config.Validate()).
 type Server struct {
-	cfg    *Config
-	db     *sql.DB
-	bridge *Bridge
-	mux    *http.ServeMux
-	server *http.Server
+	cfg        *Config
+	db         *sql.DB
+	bridge     *Bridge
+	backfiller *TranscriptBackfiller
+	mux        *http.ServeMux
+	server     *http.Server
 }
 
-func NewServer(cfg *Config, db *sql.DB, bridge *Bridge) *Server {
-	s := &Server{cfg: cfg, db: db, bridge: bridge, mux: http.NewServeMux()}
+func NewServer(cfg *Config, db *sql.DB, bridge *Bridge, backfiller *TranscriptBackfiller) *Server {
+	s := &Server{cfg: cfg, db: db, bridge: bridge, backfiller: backfiller, mux: http.NewServeMux()}
 	s.registerRoutes()
 	s.server = &http.Server{
 		Addr:              fmt.Sprintf("%s:%d", cfg.BridgeHost, cfg.BridgePort),
@@ -49,6 +50,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/presence/mark_read", s.handleMarkRead)
 	s.mux.HandleFunc("POST /api/presence/typing", s.handleTyping)
 	s.mux.HandleFunc("POST /api/presence/online", s.handleOnline)
+
+	s.mux.HandleFunc("POST /api/admin/backfill-transcripts", s.handleBackfillTranscripts)
 }
 
 func (s *Server) ListenAndServe(ctx context.Context) error {
@@ -68,23 +71,88 @@ func (s *Server) Shutdown() error {
 // --- handlers --------------------------------------------------------------
 
 type healthcheckResponse struct {
-	Status      string `json:"status"`
-	Version     string `json:"version"`
-	DBEncrypted bool   `json:"db_encrypted"`
-	SchemaVer   int    `json:"schema_version"`
-	Timestamp   int64  `json:"timestamp"`
+	Status         string         `json:"status"`
+	Version        string         `json:"version"`
+	DBEncrypted    bool           `json:"db_encrypted"`
+	SchemaVer      int            `json:"schema_version"`
+	Timestamp      int64          `json:"timestamp"`
+	Transcription  map[string]any `json:"transcription,omitempty"`
+	AliasCoverage  AliasCoverage  `json:"alias_coverage"`
 }
 
 func (s *Server) handleHealthcheck(w http.ResponseWriter, r *http.Request) {
 	var schemaVer int
 	_ = s.db.QueryRowContext(r.Context(), "SELECT MAX(version) FROM schema_version").Scan(&schemaVer)
 
+	// Transcription health: surface the actual data points an operator
+	// needs to know whether voice notes are flowing through. Hides nothing.
+	tx := map[string]any{
+		"backend":     s.cfg.WhisperBackend,
+		"language":    s.cfg.WhisperLanguage,
+		"model_path":  s.cfg.WhisperModelPath,
+		"bin_path":    s.cfg.WhisperBinPath,
+	}
+	var pending int
+	_ = s.db.QueryRowContext(r.Context(),
+		`SELECT COUNT(*) FROM messages WHERE type IN ('voice','audio') AND voice_note_transcript IS NULL AND media_key IS NOT NULL`,
+	).Scan(&pending)
+	tx["pending_with_keys"] = pending
+
+	var orphans int
+	_ = s.db.QueryRowContext(r.Context(),
+		`SELECT COUNT(*) FROM messages WHERE type IN ('voice','audio') AND voice_note_transcript IS NULL AND media_key IS NULL`,
+	).Scan(&orphans)
+	tx["orphan_no_keys"] = orphans
+
+	var lastTranscript int64
+	_ = s.db.QueryRowContext(r.Context(),
+		`SELECT COALESCE(MAX(voice_note_transcript_at), 0) FROM messages WHERE voice_note_transcript IS NOT NULL`,
+	).Scan(&lastTranscript)
+	tx["last_transcript_at"] = lastTranscript
+
+	if s.backfiller != nil {
+		for k, v := range s.backfiller.Stats() {
+			tx["sweeper_"+k] = v
+		}
+	}
+
+	// Alias coverage. SuspiciousLIDPhones > 0 means the recurring-class bug
+	// is present in the data: at least one @lid contact has its `phone`
+	// column populated with the LID number itself (the legacy ingestion
+	// pattern). Operators can spot regressions immediately from healthcheck.
+	cov, covErr := computeAliasCoverage(r.Context(), s.db)
+	if covErr != nil {
+		log.Printf("healthcheck: alias coverage query failed: %v", covErr)
+	}
+
 	writeJSON(w, http.StatusOK, healthcheckResponse{
-		Status:      "ok",
-		Version:     "0.2.0",
-		DBEncrypted: s.cfg.EncryptDB,
-		SchemaVer:   schemaVer,
-		Timestamp:   time.Now().Unix(),
+		Status:        "ok",
+		Version:       "0.3.0",
+		DBEncrypted:   s.cfg.EncryptDB,
+		SchemaVer:     schemaVer,
+		Timestamp:     time.Now().Unix(),
+		Transcription: tx,
+		AliasCoverage: cov,
+	})
+}
+
+// handleBackfillTranscripts fires one immediate sweep. Returns the count
+// enqueued. The periodic sweeper continues to run on its own cadence;
+// this is purely an on-demand trigger (e.g. operator just received voice
+// notes during an outage and wants them transcribed now).
+func (s *Server) handleBackfillTranscripts(w http.ResponseWriter, r *http.Request) {
+	if s.backfiller == nil {
+		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "backfiller not configured"})
+		return
+	}
+	n, err := s.backfiller.SweepOnce(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "sweep failed", Details: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"enqueued":  n,
+		"timestamp": time.Now().Unix(),
 	})
 }
 
@@ -178,9 +246,10 @@ type messageRow struct {
 }
 
 type messageListResponse struct {
-	Messages []messageRow `json:"messages"`
-	Count    int          `json:"count"`
-	Chat     *chatRow     `json:"chat,omitempty"`
+	Messages    []messageRow `json:"messages"`
+	Count       int          `json:"count"`
+	Chat        *chatRow     `json:"chat,omitempty"`
+	MergedJIDs  []string     `json:"merged_jids,omitempty"`
 }
 
 func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
@@ -195,21 +264,45 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 		limit = 500
 	}
 
-	var chat chatRow
-	_ = s.db.QueryRowContext(r.Context(),
-		`SELECT jid, chat_type, COALESCE(name, ''), COALESCE(last_message_time, 0), COALESCE(last_message_preview, ''), unread_count
-		 FROM chats WHERE jid = ?`, chatJID,
-	).Scan(&chat.JID, &chat.ChatType, &chat.Name, &chat.LastMessageTime, &chat.LastMessagePreview, &chat.UnreadCount)
+	// Expand the requested JID through jid_aliases so a query for either the
+	// LID form or the @s.whatsapp.net form returns the merged history.
+	// Without this, a contact whose recent traffic moved to LID looks silent
+	// when queried by their legacy phone JID.
+	allJIDs, err := resolveAliases(r.Context(), s.db, chatJID)
+	if err != nil {
+		log.Printf("handleListMessages: alias resolve failed (continuing with single jid): %v", err)
+		allJIDs = []string{chatJID}
+	}
 
-	rows, err := s.db.QueryContext(r.Context(), `
+	// Pick the chat row to return: prefer the alias whose chats row has the
+	// most recent activity, so callers get a sensible "current" name + preview.
+	var chat chatRow
+	{
+		args := jidsToArgs(allJIDs)
+		query := fmt.Sprintf(`
+			SELECT jid, chat_type, COALESCE(name, ''), COALESCE(last_message_time, 0),
+			       COALESCE(last_message_preview, ''), unread_count
+			FROM chats WHERE jid IN (%s)
+			ORDER BY last_message_time DESC
+			LIMIT 1
+		`, inClausePlaceholders(len(allJIDs)))
+		_ = s.db.QueryRowContext(r.Context(), query, args...).Scan(
+			&chat.JID, &chat.ChatType, &chat.Name, &chat.LastMessageTime, &chat.LastMessagePreview, &chat.UnreadCount,
+		)
+	}
+
+	args := append(jidsToArgs(allJIDs), limit)
+	query := fmt.Sprintf(`
 		SELECT id, chat_jid, COALESCE(sender_jid, ''), COALESCE(sender_display, ''), timestamp, type,
 		       COALESCE(scrubbed_text, COALESCE(content_text, '')),
 		       is_from_me, voice_note_transcript, COALESCE(quoted_message_id, '')
 		FROM messages
-		WHERE chat_jid = ?
+		WHERE chat_jid IN (%s)
 		ORDER BY timestamp DESC
 		LIMIT ?
-	`, chatJID, limit)
+	`, inClausePlaceholders(len(allJIDs)))
+
+	rows, err := s.db.QueryContext(r.Context(), query, args...)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "query failed", Details: err.Error()})
 		return
@@ -231,16 +324,20 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 	if chat.JID != "" {
 		out.Chat = &chat
 	}
+	if len(allJIDs) > 1 {
+		out.MergedJIDs = allJIDs
+	}
 	writeJSON(w, http.StatusOK, out)
 }
 
 type contactRow struct {
-	JID            string `json:"jid"`
-	LID            string `json:"lid,omitempty"`
-	Phone          string `json:"phone,omitempty"`
-	PushName       string `json:"push_name"`
-	VerifiedName   string `json:"verified_name,omitempty"`
-	IsBusiness     bool   `json:"is_business"`
+	JID            string   `json:"jid"`
+	LID            string   `json:"lid,omitempty"`
+	Phone          string   `json:"phone,omitempty"`
+	PushName       string   `json:"push_name"`
+	VerifiedName   string   `json:"verified_name,omitempty"`
+	IsBusiness     bool     `json:"is_business"`
+	Aliases        []string `json:"aliases,omitempty"` // other JIDs known to refer to the same human
 }
 
 type contactListResponse struct {
@@ -262,6 +359,10 @@ func (s *Server) handleSearchContacts(w http.ResponseWriter, r *http.Request) {
 	}
 	norm := Normalize(query)
 
+	// Initial match by name/phone/lid. We then expand each match through
+	// jid_aliases so callers see every JID known to refer to the same human
+	// (LID + phone-JID forms). Without this, a name search returns only the
+	// row whose stored push_name happens to match exactly, hiding the alias.
 	rows, err := s.db.QueryContext(r.Context(), `
 		SELECT jid, COALESCE(lid, ''), COALESCE(phone, ''), COALESCE(push_name, ''), COALESCE(verified_name, ''), is_business
 		FROM contacts
@@ -273,20 +374,78 @@ func (s *Server) handleSearchContacts(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "query failed", Details: err.Error()})
 		return
 	}
-	defer rows.Close()
 
-	out := contactListResponse{Contacts: []contactRow{}}
+	// Buffer initial matches; we'll expand and dedupe before responding.
+	type match struct {
+		c    contactRow
+		isBiz int
+	}
+	var matches []match
 	for rows.Next() {
-		var c contactRow
-		var isBiz int
-		if err := rows.Scan(&c.JID, &c.LID, &c.Phone, &c.PushName, &c.VerifiedName, &isBiz); err != nil {
+		var m match
+		if err := rows.Scan(&m.c.JID, &m.c.LID, &m.c.Phone, &m.c.PushName, &m.c.VerifiedName, &m.isBiz); err != nil {
 			continue
 		}
-		c.IsBusiness = isBiz == 1
-		out.Contacts = append(out.Contacts, c)
+		m.c.IsBusiness = m.isBiz == 1
+		matches = append(matches, m)
 	}
+	rows.Close()
+
+	// Expand: for each match, gather aliases and pull any contact rows we
+	// don't already have. Dedupe by JID.
+	seen := map[string]bool{}
+	out := contactListResponse{Contacts: []contactRow{}}
+
+	for _, m := range matches {
+		if seen[m.c.JID] {
+			continue
+		}
+		aliases, _ := resolveAliases(r.Context(), s.db, m.c.JID)
+		// First slot in resolveAliases is the JID itself; the rest are aliases.
+		if len(aliases) > 1 {
+			m.c.Aliases = aliases[1:]
+		}
+		seen[m.c.JID] = true
+		out.Contacts = append(out.Contacts, m.c)
+
+		// Also surface alias rows as separate contacts so callers can list_messages
+		// against either form. They carry the original-row's aliases inverted.
+		for _, alt := range aliases[1:] {
+			if seen[alt] {
+				continue
+			}
+			altRow, ok := loadContactRow(r.Context(), s.db, alt)
+			if !ok {
+				continue
+			}
+			altAliases, _ := resolveAliases(r.Context(), s.db, alt)
+			if len(altAliases) > 1 {
+				altRow.Aliases = altAliases[1:]
+			}
+			seen[alt] = true
+			out.Contacts = append(out.Contacts, altRow)
+		}
+	}
+
 	out.Count = len(out.Contacts)
 	writeJSON(w, http.StatusOK, out)
+}
+
+// loadContactRow fetches a single contacts row by JID. Returns (row, true)
+// when present. Used by handleSearchContacts to surface alias rows that did
+// not match the name query directly.
+func loadContactRow(ctx context.Context, db *sql.DB, jid string) (contactRow, bool) {
+	var c contactRow
+	var isBiz int
+	err := db.QueryRowContext(ctx, `
+		SELECT jid, COALESCE(lid, ''), COALESCE(phone, ''), COALESCE(push_name, ''), COALESCE(verified_name, ''), is_business
+		FROM contacts WHERE jid = ?
+	`, jid).Scan(&c.JID, &c.LID, &c.Phone, &c.PushName, &c.VerifiedName, &isBiz)
+	if err != nil {
+		return c, false
+	}
+	c.IsBusiness = isBiz == 1
+	return c, true
 }
 
 // --- helpers ----------------------------------------------------------------

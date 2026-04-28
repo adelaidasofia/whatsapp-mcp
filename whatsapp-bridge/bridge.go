@@ -153,6 +153,13 @@ func (b *Bridge) DeviceJID() string {
 	return b.deviceJID
 }
 
+// Client returns the underlying whatsmeow client. Used by the backfiller
+// to call client.Download against reconstituted AudioMessages. Read-only
+// in spirit, but the whatsmeow client itself is not.
+func (b *Bridge) Client() *whatsmeow.Client {
+	return b.client
+}
+
 // IsConnected returns true when the bridge has an active whatsmeow connection
 // and an authenticated device. Used by the send flow to refuse confirmations
 // when the bridge is offline.
@@ -240,29 +247,89 @@ func (b *Bridge) onMessage(evt *events.Message) {
 		log.Printf("onMessage: chat upsert failed: %v", err)
 	}
 
-	// Insert message.
+	// Capture audio re-download fields up front so we can persist them on
+	// the same INSERT. These are exactly the fields whatsmeow.Client.Download
+	// needs to refetch the audio later if the transcriber misses on first
+	// pass (validation failure, queue full, transient error, post-mortem
+	// backfill). For non-audio messages the columns stay NULL.
+	var (
+		mediaKey, mediaEncSha, mediaSha       []byte
+		mediaURL, mediaDirectPath             sql.NullString
+		mediaFileLength, mediaKeyTimestamp    sql.NullInt64
+	)
+	if audio := evt.Message.GetAudioMessage(); audio != nil {
+		mediaKey = audio.GetMediaKey()
+		mediaEncSha = audio.GetFileEncSHA256()
+		mediaSha = audio.GetFileSHA256()
+		if u := audio.GetURL(); u != "" {
+			mediaURL = sql.NullString{String: u, Valid: true}
+		}
+		if dp := audio.GetDirectPath(); dp != "" {
+			mediaDirectPath = sql.NullString{String: dp, Valid: true}
+		}
+		if fl := audio.GetFileLength(); fl > 0 {
+			mediaFileLength = sql.NullInt64{Int64: int64(fl), Valid: true}
+		}
+		if mkt := audio.GetMediaKeyTimestamp(); mkt > 0 {
+			mediaKeyTimestamp = sql.NullInt64{Int64: mkt, Valid: true}
+		}
+	}
+
+	// Insert message. Audio columns are populated from the captured handles
+	// above; for text/sticker/etc. they go in as NULL.
 	_, err = b.db.Exec(`
-		INSERT INTO messages (id, chat_jid, sender_jid, sender_display, timestamp, type, content_text, content_normalized, is_from_me, scrubbed_text, scrub_flags_json)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO messages (id, chat_jid, sender_jid, sender_display, timestamp, type, content_text, content_normalized, is_from_me, scrubbed_text, scrub_flags_json,
+			media_key, media_direct_path, media_url, media_enc_sha256, media_sha256, media_file_length, media_key_timestamp)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO NOTHING
 	`, id, chatJID, senderJID, senderDisplay, ts, msgType, content, normalized,
-		boolToInt(evt.Info.IsFromMe), scrubbed, ScrubFlagsJSON(flags))
+		boolToInt(evt.Info.IsFromMe), scrubbed, ScrubFlagsJSON(flags),
+		mediaKey, mediaDirectPath, mediaURL, mediaEncSha, mediaSha, mediaFileLength, mediaKeyTimestamp)
 	if err != nil {
 		log.Printf("onMessage: message insert failed: %v", err)
 	}
 
 	// Upsert contact row for the sender (non-group messages; group participants sync separately).
+	//
+	// Phone-column rule: only store `evt.Info.Sender.User` as phone when the
+	// JID is the @s.whatsapp.net (DefaultUserServer) form, where User IS a
+	// phone number. For @lid (HiddenUserServer) JIDs, User is an opaque LID
+	// number, NOT a phone. Storing it as phone produces the bug class where
+	// search and CRM lookups by phone silently miss the LID-form row. Prefer
+	// SenderAlt when it's the phone form; otherwise leave phone NULL and let
+	// the startup BackfillJIDAliases repair it once whatsmeow's LID store
+	// learns the mapping.
 	if !evt.Info.IsGroup {
+		var phoneToStore sql.NullString
+		switch {
+		case evt.Info.Sender.Server == types.DefaultUserServer:
+			phoneToStore = sql.NullString{String: evt.Info.Sender.User, Valid: true}
+		case !evt.Info.SenderAlt.IsEmpty() && evt.Info.SenderAlt.Server == types.DefaultUserServer:
+			phoneToStore = sql.NullString{String: evt.Info.SenderAlt.User, Valid: true}
+		}
 		_, err = b.db.Exec(`
 			INSERT INTO contacts (jid, phone, push_name, normalized_name, is_business, created_at, updated_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(jid) DO UPDATE SET
 				push_name = excluded.push_name,
 				normalized_name = excluded.normalized_name,
+				phone = COALESCE(excluded.phone, contacts.phone),
 				updated_at = excluded.updated_at
-		`, senderJID, evt.Info.Sender.User, senderDisplay, Normalize(senderDisplay), 0, ts, ts)
+		`, senderJID, phoneToStore, senderDisplay, Normalize(senderDisplay), 0, ts, ts)
 		if err != nil {
 			log.Printf("onMessage: contact upsert failed: %v", err)
+		}
+
+		// Record JID alias edges. WhatsApp now exposes most contacts as a
+		// (LID, phone-JID) pair; whatsmeow surfaces the alt form via
+		// SenderAlt for incoming DMs and RecipientAlt for outgoing. Without
+		// this, the two forms accumulate as orphaned rows and search/list
+		// returns whichever the bridge happened to see first. See aliases.go.
+		ctx := context.Background()
+		if evt.Info.IsFromMe {
+			recordJIDAlias(ctx, b.db, evt.Info.Chat, evt.Info.RecipientAlt, "message_recipient", ts)
+		} else {
+			recordJIDAlias(ctx, b.db, evt.Info.Sender, evt.Info.SenderAlt, "message_sender", ts)
 		}
 	}
 
