@@ -52,6 +52,11 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/presence/online", s.handleOnline)
 
 	s.mux.HandleFunc("POST /api/admin/backfill-transcripts", s.handleBackfillTranscripts)
+
+	// On-demand media download. Lets the receipts pipeline (and any other
+	// Python consumer) materialize a single message's bytes without
+	// flipping the global WHATSAPP_AUTO_DOWNLOAD_MEDIA flag.
+	s.mux.HandleFunc("POST /api/media/download", s.handleDownloadMedia)
 }
 
 func (s *Server) ListenAndServe(ctx context.Context) error {

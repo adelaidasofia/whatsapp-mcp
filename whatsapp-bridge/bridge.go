@@ -247,44 +247,26 @@ func (b *Bridge) onMessage(evt *events.Message) {
 		log.Printf("onMessage: chat upsert failed: %v", err)
 	}
 
-	// Capture audio re-download fields up front so we can persist them on
-	// the same INSERT. These are exactly the fields whatsmeow.Client.Download
-	// needs to refetch the audio later if the transcriber misses on first
-	// pass (validation failure, queue full, transient error, post-mortem
-	// backfill). For non-audio messages the columns stay NULL.
-	var (
-		mediaKey, mediaEncSha, mediaSha       []byte
-		mediaURL, mediaDirectPath             sql.NullString
-		mediaFileLength, mediaKeyTimestamp    sql.NullInt64
-	)
-	if audio := evt.Message.GetAudioMessage(); audio != nil {
-		mediaKey = audio.GetMediaKey()
-		mediaEncSha = audio.GetFileEncSHA256()
-		mediaSha = audio.GetFileSHA256()
-		if u := audio.GetURL(); u != "" {
-			mediaURL = sql.NullString{String: u, Valid: true}
-		}
-		if dp := audio.GetDirectPath(); dp != "" {
-			mediaDirectPath = sql.NullString{String: dp, Valid: true}
-		}
-		if fl := audio.GetFileLength(); fl > 0 {
-			mediaFileLength = sql.NullInt64{Int64: int64(fl), Valid: true}
-		}
-		if mkt := audio.GetMediaKeyTimestamp(); mkt > 0 {
-			mediaKeyTimestamp = sql.NullInt64{Int64: mkt, Valid: true}
-		}
-	}
+	// Capture re-download fields up front for any media-bearing message
+	// (image/video/document/audio/sticker), so we can refetch later via
+	// whatsmeow.Client.Download. Without these, image/document content is
+	// only available at the moment of receipt — any consumer that wakes up
+	// later (receipts pipeline, vision OCR, vault export with attachments)
+	// has no way to recover the bytes. See media_download.go.
+	mfields, _ := extractDownloadableFields(evt)
 
-	// Insert message. Audio columns are populated from the captured handles
-	// above; for text/sticker/etc. they go in as NULL.
+	// Insert message. Media columns are populated for image/video/document/
+	// audio/sticker; for text/system/reaction etc. they go in as NULL.
 	_, err = b.db.Exec(`
 		INSERT INTO messages (id, chat_jid, sender_jid, sender_display, timestamp, type, content_text, content_normalized, is_from_me, scrubbed_text, scrub_flags_json,
-			media_key, media_direct_path, media_url, media_enc_sha256, media_sha256, media_file_length, media_key_timestamp)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			media_key, media_direct_path, media_url, media_enc_sha256, media_sha256, media_file_length, media_key_timestamp, media_mime)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO NOTHING
 	`, id, chatJID, senderJID, senderDisplay, ts, msgType, content, normalized,
 		boolToInt(evt.Info.IsFromMe), scrubbed, ScrubFlagsJSON(flags),
-		mediaKey, mediaDirectPath, mediaURL, mediaEncSha, mediaSha, mediaFileLength, mediaKeyTimestamp)
+		mfields.MediaKey, mfields.MediaDirectPath, mfields.MediaURL,
+		mfields.MediaEncSHA, mfields.MediaSHA, mfields.MediaFileLength,
+		mfields.MediaKeyTimestamp, mfields.MediaMime)
 	if err != nil {
 		log.Printf("onMessage: message insert failed: %v", err)
 	}
