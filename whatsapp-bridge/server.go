@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -57,6 +58,52 @@ func (s *Server) registerRoutes() {
 	// Python consumer) materialize a single message's bytes without
 	// flipping the global WHATSAPP_AUTO_DOWNLOAD_MEDIA flag.
 	s.mux.HandleFunc("POST /api/media/download", s.handleDownloadMedia)
+
+	// On-demand history-sync request. Asks WhatsApp for older messages in
+	// a chat so processHistorySyncEvent can backfill media-key fields.
+	// Recovers historical media for messages received before the
+	// media-key-on-all-types patch.
+	s.mux.HandleFunc("POST /api/admin/request-history", s.handleRequestHistory)
+}
+
+// handleRequestHistory triggers a peer HistorySyncOnDemandRequest for a chat.
+// WhatsApp delivers the response asynchronously over the history-sync stream;
+// this endpoint returns as soon as the request is sent.
+func (s *Server) handleRequestHistory(w http.ResponseWriter, r *http.Request) {
+	type req struct {
+		ChatJID string `json:"chat_jid"`
+		Count   int    `json:"count"`
+	}
+	var body req
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<14)).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid JSON body"})
+		return
+	}
+	if body.ChatJID == "" {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "chat_jid required"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	anchorID, resp, err := s.bridge.RequestChatHistory(ctx, body.ChatJID, body.Count)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorResponse{
+			Error:   "history request failed",
+			Details: err.Error(),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"chat_jid":         body.ChatJID,
+		"anchor_message":   anchorID,
+		"requested_count":  body.Count,
+		"sent_message_id":  resp.ID,
+		"sent_at_unix":     resp.Timestamp.Unix(),
+		"hint":             "WhatsApp delivers the response asynchronously over the history-sync stream. Watch ~/Library/Logs/whatsapp-bridge.stdout.log for 'history_sync: backfilled media-key for N rows' lines, then re-run any consumers that need the historical media (e.g. POST /api/media/download for individual receipts).",
+	})
 }
 
 func (s *Server) ListenAndServe(ctx context.Context) error {

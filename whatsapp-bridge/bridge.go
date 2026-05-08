@@ -207,6 +207,9 @@ func (b *Bridge) handleEvent(raw interface{}) {
 		b.mu.Unlock()
 		log.Printf("whatsmeow: history sync chunk (progress=%d, conversations=%d)",
 			evt.Data.GetProgress(), len(evt.Data.GetConversations()))
+		// Backfill media-key fields for any historical image/video/document/
+		// sticker messages WhatsApp re-delivers. See history_sync.go.
+		b.processHistorySyncEvent(evt)
 	case *events.CallOffer:
 		b.onCallOffer(evt)
 	case *events.CallTerminate:
