@@ -53,8 +53,12 @@ func ExportVault(db *sql.DB, outputDir string, includeGroups bool, minMessages i
 	}
 
 	// Pull all chats whose message count meets the threshold.
+	// participants_count is nullable (NULL for direct chats); COALESCE keeps
+	// the Scan target a non-nullable int. The frontmatter writer below only
+	// emits the field for group chats so direct files stay clean.
 	chatRows, err := db.Query(`
 		SELECT c.jid, c.chat_type, COALESCE(c.name, ''), COALESCE(c.last_message_time, 0),
+		       COALESCE(c.participants_count, 0),
 		       (SELECT COUNT(*) FROM messages m WHERE m.chat_jid = c.jid) AS msg_count
 		FROM chats c
 		WHERE (SELECT COUNT(*) FROM messages m WHERE m.chat_jid = c.jid) >= ?
@@ -65,16 +69,17 @@ func ExportVault(db *sql.DB, outputDir string, includeGroups bool, minMessages i
 	defer chatRows.Close()
 
 	type chatKey struct {
-		jid      string
-		chatType string
-		name     string
+		jid               string
+		chatType          string
+		name              string
+		participantsCount int
+		lastMessageTs     int64
 	}
 	chats := make([]chatKey, 0)
 	for chatRows.Next() {
 		var ck chatKey
-		var lastTime int64
 		var msgCount int
-		if err := chatRows.Scan(&ck.jid, &ck.chatType, &ck.name, &lastTime, &msgCount); err != nil {
+		if err := chatRows.Scan(&ck.jid, &ck.chatType, &ck.name, &ck.lastMessageTs, &ck.participantsCount, &msgCount); err != nil {
 			continue
 		}
 		if !includeGroups && ck.chatType != "direct" {
@@ -87,6 +92,7 @@ func ExportVault(db *sql.DB, outputDir string, includeGroups bool, minMessages i
 
 	written := 0
 	skipped := 0
+	skippedUnchanged := 0
 	todayStr := time.Now().Format("2006-01-02")
 
 	// Small bounded concurrency to hide I/O latency when the output folder is on iCloud.
@@ -101,7 +107,8 @@ func ExportVault(db *sql.DB, outputDir string, includeGroups bool, minMessages i
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			if err := exportOneChat(db, outputDir, ck.jid, ck.chatType, ck.name, todayStr); err != nil {
+			result, err := exportOneChat(db, outputDir, ck.jid, ck.chatType, ck.name, ck.participantsCount, ck.lastMessageTs, todayStr)
+			if err != nil {
 				log.Printf("export chat %s: %v", ck.jid, err)
 				mu.Lock()
 				skipped++
@@ -109,17 +116,36 @@ func ExportVault(db *sql.DB, outputDir string, includeGroups bool, minMessages i
 				return
 			}
 			mu.Lock()
-			written++
+			switch result {
+			case writeResultWrote:
+				written++
+			case writeResultUnchanged:
+				skippedUnchanged++
+			case writeResultEmpty:
+				skipped++
+			}
 			mu.Unlock()
 		}(ck)
 	}
 	wg.Wait()
 
-	log.Printf("export: done (%d written, %d skipped)", written, skipped)
+	log.Printf("export: done (%d written, %d skipped-unchanged, %d skipped-empty)",
+		written, skippedUnchanged, skipped)
 	return nil
 }
 
-func exportOneChat(db *sql.DB, outputDir, jid, chatType, name, todayStr string) error {
+// writeResult enumerates the outcomes of exportOneChat so callers can
+// distinguish "skipped because nothing changed since last export" from
+// "skipped because the chat had zero messages."
+type writeResult int
+
+const (
+	writeResultWrote writeResult = iota
+	writeResultUnchanged
+	writeResultEmpty
+)
+
+func exportOneChat(db *sql.DB, outputDir, jid, chatType, name string, participantsCount int, lastMessageTs int64, todayStr string) (writeResult, error) {
 	// Resolve display name: prefer chats.name, else contacts.push_name, else phone.
 	display := name
 	var phone string
@@ -144,6 +170,20 @@ func exportOneChat(db *sql.DB, outputDir, jid, chatType, name, todayStr string) 
 		phone = extractPhone(jid)
 	}
 
+	// Unchanged-skip: if the existing chat file already covers up to lastMessageTs,
+	// don't re-pull messages and re-write the file. Mirrors iMessage's _is_unchanged
+	// behavior. Saves significant I/O on iCloud-synced vaults and avoids needless
+	// extractor re-tagging cycles. The check works only after files have been
+	// written once with the new last_message_ts field; on first run after the
+	// migration, all files rewrite (existing ts = 0 < incoming).
+	filename := sanitizeFilename(display) + ".md"
+	out := filepath.Join(outputDir, filename)
+	if lastMessageTs > 0 {
+		if existingTs := readExistingLastMessageTs(out); existingTs >= lastMessageTs {
+			return writeResultUnchanged, nil
+		}
+	}
+
 	// Pull messages for this chat, newest first, but assemble in chronological order.
 	rows, err := db.Query(`
 		SELECT timestamp, COALESCE(scrubbed_text, COALESCE(content_text, '')), COALESCE(sender_display, ''), is_from_me, type, COALESCE(voice_note_transcript, '')
@@ -152,7 +192,7 @@ func exportOneChat(db *sql.DB, outputDir, jid, chatType, name, todayStr string) 
 		ORDER BY timestamp ASC
 	`, jid)
 	if err != nil {
-		return fmt.Errorf("query messages: %w", err)
+		return writeResultEmpty, fmt.Errorf("query messages: %w", err)
 	}
 	defer rows.Close()
 
@@ -175,7 +215,7 @@ func exportOneChat(db *sql.DB, outputDir, jid, chatType, name, todayStr string) 
 		messages = append(messages, m)
 	}
 	if len(messages) == 0 {
-		return nil // nothing to write
+		return writeResultEmpty, nil // nothing to write
 	}
 
 	byDate := map[string][]string{}
@@ -257,7 +297,7 @@ func exportOneChat(db *sql.DB, outputDir, jid, chatType, name, todayStr string) 
 	}
 	sort.Strings(dates)
 	if len(dates) == 0 {
-		return nil
+		return writeResultEmpty, nil
 	}
 
 	lines := []string{
@@ -270,21 +310,135 @@ func exportOneChat(db *sql.DB, outputDir, jid, chatType, name, todayStr string) 
 		fmt.Sprintf(`message_count: %d`, len(messages)),
 		fmt.Sprintf("first_message: %s", dates[0]),
 		fmt.Sprintf("last_message: %s", dates[len(dates)-1]),
+		fmt.Sprintf("last_message_ts: %d", lastMessageTs),
 		fmt.Sprintf("last_sync: %s", todayStr),
+	}
+	// Only emit participants_count for groups; direct chats stay clean.
+	// Downstream tooling can use this to enforce per-vault group-size policies
+	// (e.g. only auto-ingest groups with fewer than N participants).
+	if chatType == "group" {
+		lines = append(lines, fmt.Sprintf("participants_count: %d", participantsCount))
+	}
+
+	// Preserve extractor-added frontmatter from the existing file. Without
+	// this, every export nukes vault-metadata-extract's whatsapp_* fields and
+	// any other downstream-added keys (word_count etc.). Path was already
+	// computed at the top of this function for the unchanged-skip check.
+	if extras := extractNonCanonicalFrontmatter(out); len(extras) > 0 {
+		lines = append(lines, extras...)
+	}
+
+	lines = append(lines,
 		"---",
 		"",
 		fmt.Sprintf("# WhatsApp: %s", display),
 		"",
-	}
+	)
 	for _, d := range dates {
 		lines = append(lines, fmt.Sprintf("## %s", d), "")
 		lines = append(lines, byDate[d]...)
 		lines = append(lines, "")
 	}
 
-	filename := sanitizeFilename(display) + ".md"
-	out := filepath.Join(outputDir, filename)
-	return os.WriteFile(out, []byte(strings.Join(lines, "\n")), 0o644)
+	if err := os.WriteFile(out, []byte(strings.Join(lines, "\n")), 0o644); err != nil {
+		return writeResultEmpty, err
+	}
+	return writeResultWrote, nil
+}
+
+// canonicalFrontmatterKeys lists the keys this exporter owns. Anything else
+// in an existing chat file's frontmatter is treated as user/extractor data
+// and preserved across re-exports.
+var canonicalFrontmatterKeys = map[string]bool{
+	"type":               true,
+	"contact":            true,
+	"phone":              true,
+	"jid":                true,
+	"chat_type":          true,
+	"message_count":      true,
+	"first_message":      true,
+	"last_message":       true,
+	"last_message_ts":    true,
+	"last_sync":          true,
+	"participants_count": true,
+}
+
+// readExistingLastMessageTs returns the int64 last_message_ts from an existing
+// chat file, or 0 if the file is missing, has no frontmatter, or the field
+// isn't present. Used by the unchanged-skip optimization.
+func readExistingLastMessageTs(path string) int64 {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	content := string(data)
+	if !strings.HasPrefix(content, "---\n") {
+		return 0
+	}
+	rest := content[4:]
+	end := strings.Index(rest, "\n---")
+	if end < 0 {
+		return 0
+	}
+	for _, line := range strings.Split(rest[:end], "\n") {
+		if strings.HasPrefix(line, "last_message_ts:") {
+			val := strings.TrimSpace(strings.TrimPrefix(line, "last_message_ts:"))
+			var ts int64
+			if _, err := fmt.Sscanf(val, "%d", &ts); err == nil {
+				return ts
+			}
+			return 0
+		}
+	}
+	return 0
+}
+
+// extractNonCanonicalFrontmatter reads an existing chat file (if present)
+// and returns the non-canonical frontmatter lines verbatim (preserving
+// whatever extractors or downstream tools wrote). Returns empty slice if
+// the file is missing, has no frontmatter, or the format is unexpected.
+//
+// Format assumption: the bridge writes single-line "key: value" frontmatter
+// only — no multi-line YAML continuations. Any indented continuation lines
+// are skipped for safety. Inline JSON arrays (`key: ["a", "b"]`) are kept
+// since they fit on one line.
+func extractNonCanonicalFrontmatter(path string) []string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	content := string(data)
+	if !strings.HasPrefix(content, "---\n") {
+		return nil
+	}
+	rest := content[4:]
+	end := strings.Index(rest, "\n---")
+	if end < 0 {
+		return nil
+	}
+	fm := rest[:end]
+
+	var extras []string
+	for _, line := range strings.Split(fm, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		// Skip indented continuation lines. The bridge never writes them
+		// and our extractor pipeline emits inline JSON arrays for lists.
+		if line[0] == ' ' || line[0] == '\t' {
+			continue
+		}
+		idx := strings.Index(line, ":")
+		if idx <= 0 {
+			continue
+		}
+		key := strings.TrimSpace(line[:idx])
+		if canonicalFrontmatterKeys[key] {
+			continue
+		}
+		extras = append(extras, line)
+	}
+	return extras
 }
 
 func sanitizeFilename(name string) string {
