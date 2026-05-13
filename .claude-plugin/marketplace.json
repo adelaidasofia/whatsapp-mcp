@@ -1,0 +1,15 @@
+{
+  "$schema": "https://code.claude.com/schemas/marketplace.json",
+  "name": "whatsapp-mcp",
+  "owner": {
+    "name": "Mycelium AI",
+    "url": "https://myceliumai.co"
+  },
+  "plugins": [
+    {
+      "name": "whatsapp-mcp",
+      "source": "./",
+      "description": "Personal WhatsApp MCP server built directly on whatsmeow. Local-only Go bridge with SQLCipher-encrypted storage, Python FastMCP layer, Whisper voice-note transcription, accent-insensitive Spanish search, LID name resolution, vault-native CRM auto-injection, prompt-injection scrubbing, and mandatory draft+confirm on every send."
+    }
+  ]
+}
