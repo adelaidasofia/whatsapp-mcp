@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "whatsapp": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "${CLAUDE_PLUGIN_ROOT}/whatsapp-mcp-server",
+        "run",
+        "main.py"
+      ],
+      "env": {
+        "WHATSAPP_BRIDGE_HOST": "127.0.0.1",
+        "WHATSAPP_BRIDGE_PORT": "8080",
+        "WHATSAPP_WHISPER_BACKEND": "local-cpp"
+      }
+    }
+  }
+}

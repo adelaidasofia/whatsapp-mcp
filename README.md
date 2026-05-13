@@ -27,6 +27,16 @@ Two components, both local:
 
 ## Install
 
+Open Claude Code, paste:
+
+    /plugin marketplace add adelaidasofia/whatsapp-mcp
+    /plugin install whatsapp-mcp@whatsapp-mcp
+
+This installs the Python MCP server side. The Go bridge still needs the one-time QR pairing flow with your phone — see the legacy install block below for those steps.
+
+<details>
+<summary>Legacy install (manual, full Go bridge + QR pairing)</summary>
+
 See [SETUP.md](SETUP.md) for step-by-step install. In short:
 
 1. Prereqs: Go 1.24+, Python 3.11+, FFmpeg, uv
@@ -36,6 +46,8 @@ See [SETUP.md](SETUP.md) for step-by-step install. In short:
 5. Scan the QR code with WhatsApp on your phone (Settings, Linked Devices, Link a Device)
 6. Register the MCP in your Claude Code `.mcp.json`
 7. Restart Claude Code
+
+</details>
 
 ## Configuration
 
