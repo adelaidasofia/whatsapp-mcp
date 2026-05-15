@@ -1,0 +1,38 @@
+name: build
+# Auto-managed by ~/.local/bin/gh-harden-repos.sh. Do not hand-edit.
+# Minimal Go build gate. Walks every go.mod in the tree and runs
+# `go build ./...` to catch compile failures (untracked files, missing
+# imports, broken refactors) before anyone else pulls. On failure,
+# GitHub emails the repo owner via their primary notification email.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+      - name: Build all Go modules
+        run: |
+          set -e
+          shopt -s globstar nullglob 2>/dev/null || true
+          found=0
+          while IFS= read -r modfile; do
+            found=$((found + 1))
+            moddir=$(dirname "$modfile")
+            echo "::group::Building $moddir"
+            (cd "$moddir" && go build ./...)
+            echo "::endgroup::"
+          done < <(find . -name go.mod -not -path './vendor/*' -not -path '*/vendor/*' -not -path '*/.git/*')
+          if [ "$found" -eq 0 ]; then
+            echo "No go.mod found — failing loud (workflow shouldn't have been installed)"
+            exit 1
+          fi
+          echo "Built $found module(s) cleanly."
