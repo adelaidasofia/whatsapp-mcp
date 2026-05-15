@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	// SQLCipher driver. Encrypted-at-rest SQLite. See SECURITY.md for threat model.
@@ -61,15 +62,53 @@ func applyMigrations(db *sql.DB) error {
 	}
 	sort.Strings(names)
 
+	// Read which versions have already been applied. Errors here just mean
+	// the schema_version table doesn't exist yet (very first boot); 001
+	// creates it idempotently and we run 001 unconditionally.
+	applied := map[int]bool{}
+	if rows, err := db.Query(`SELECT version FROM schema_version`); err == nil {
+		for rows.Next() {
+			var v int
+			if scanErr := rows.Scan(&v); scanErr == nil {
+				applied[v] = true
+			}
+		}
+		rows.Close()
+	}
+
 	for _, name := range names {
+		v := parseMigrationVersion(name)
+		// 001 is fully idempotent (IF NOT EXISTS / OR IGNORE). 002+ contain
+		// non-idempotent DDL like ALTER TABLE ADD COLUMN, so skip when the
+		// version is already recorded.
+		if v >= 2 && applied[v] {
+			continue
+		}
 		sqlBytes, err := migrationsFS.ReadFile(filepath.Join("migrations", name))
 		if err != nil {
 			return fmt.Errorf("read migration %s: %w", name, err)
 		}
-		// Each migration is expected to be idempotent (IF NOT EXISTS on tables, IGNORE on inserts).
 		if _, err := db.Exec(string(sqlBytes)); err != nil {
 			return fmt.Errorf("apply migration %s: %w", name, err)
 		}
 	}
 	return nil
+}
+
+// parseMigrationVersion extracts the leading integer from a filename like
+// "002_voice_backfill.sql" → 2. Returns 0 for unparseable names so the
+// loader treats them as "always run" (matches 001 historic behavior).
+func parseMigrationVersion(name string) int {
+	end := 0
+	for end < len(name) && name[end] >= '0' && name[end] <= '9' {
+		end++
+	}
+	if end == 0 {
+		return 0
+	}
+	v, err := strconv.Atoi(name[:end])
+	if err != nil {
+		return 0
+	}
+	return v
 }

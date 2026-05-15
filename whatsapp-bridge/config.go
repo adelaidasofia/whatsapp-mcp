@@ -41,6 +41,12 @@ type Config struct {
 	CaptureCalls      bool
 	CaptureReactions  bool
 	AutoDownloadMedia bool
+
+	// Voice-note transcript backfill sweeper. Periodically re-enqueues any
+	// voice/audio rows with media keys but NULL transcripts, so transient
+	// failures self-heal instead of leaving permanent NULLs.
+	BackfillIntervalSeconds int
+	BackfillWindowDays      int
 }
 
 // LoadConfig reads every env var, applies defaults, and returns a populated Config.
@@ -74,9 +80,11 @@ func LoadConfig() (*Config, error) {
 		AuditLogPath:         expandPath(getenv("WHATSAPP_AUDIT_LOG_PATH", filepath.Join(defaultRoot, "audit.log")), home),
 		AuditLogRetention:    getenvInt("WHATSAPP_AUDIT_LOG_RETENTION_DAYS", 30),
 		WebhookURL:           getenv("WHATSAPP_WEBHOOK_URL", ""),
-		CaptureCalls:         getenvBool("WHATSAPP_CAPTURE_CALLS", true),
-		CaptureReactions:     getenvBool("WHATSAPP_CAPTURE_REACTIONS", true),
-		AutoDownloadMedia:    getenvBool("WHATSAPP_AUTO_DOWNLOAD_MEDIA", false),
+		CaptureCalls:            getenvBool("WHATSAPP_CAPTURE_CALLS", true),
+		CaptureReactions:        getenvBool("WHATSAPP_CAPTURE_REACTIONS", true),
+		AutoDownloadMedia:       getenvBool("WHATSAPP_AUTO_DOWNLOAD_MEDIA", false),
+		BackfillIntervalSeconds: getenvInt("WHATSAPP_BACKFILL_INTERVAL_SECONDS", 900),
+		BackfillWindowDays:      getenvInt("WHATSAPP_BACKFILL_WINDOW_DAYS", 14),
 	}
 
 	if err := c.Validate(); err != nil {
@@ -99,6 +107,17 @@ func (c *Config) Validate() error {
 	}
 	if c.WhisperBackend == "openai-api" && c.WhisperAPIKey == "" {
 		return fmt.Errorf("WHATSAPP_WHISPER_BACKEND=openai-api requires WHATSAPP_WHISPER_API_KEY to be set")
+	}
+	// Fail loud at startup rather than silently per-job in the transcriber.
+	// Earlier behavior: missing model path → every voice note dropped with
+	// only a debug-level log line, no signal at boot.
+	if c.WhisperBackend == "local-cpp" {
+		if c.WhisperModelPath == "" {
+			return fmt.Errorf("WHATSAPP_WHISPER_MODEL_PATH is required for local-cpp backend (set to absolute path of ggml-*.bin)")
+		}
+		if _, err := os.Stat(c.WhisperModelPath); err != nil {
+			return fmt.Errorf("WHATSAPP_WHISPER_MODEL_PATH=%s not readable: %w", c.WhisperModelPath, err)
+		}
 	}
 	if c.AuditLogRetention < 1 {
 		return fmt.Errorf("WHATSAPP_AUDIT_LOG_RETENTION_DAYS must be >= 1")
