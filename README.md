@@ -1,8 +1,23 @@
 # whatsapp-mcp
 
-A personal WhatsApp MCP server for Claude, built directly on [whatsmeow](https://github.com/tulir/whatsmeow). Full audit surface, encrypted-at-rest storage, Whisper voice-note transcription, accent-insensitive Spanish search, vault-native CRM integration, and a send-confirmation dry-run pattern that prevents replying to the wrong contact.
+A WhatsApp MCP server for Claude, built directly on [whatsmeow](https://github.com/tulir/whatsmeow). Encrypted at rest, prompt-injection-scrubbed, draft-and-confirm on every send, full audit trail, daily CI security gates. Actively maintained.
 
-Not a fork of any existing WhatsApp MCP. The Go bridge is built directly against whatsmeow; the Python MCP layer and SQLite schema are original. Other implementations (lharries, LukasHaas, verygoodplugins) were read as reference only.
+## Why this one?
+
+The most-starred WhatsApp MCP (`lharries/whatsapp-mcp`, 5.6K stars) is the architectural reference for this pattern, but has not shipped since July 2025 and leaves the [lethal-trifecta](https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/) problem entirely to the user. This implementation closes the gaps:
+
+| | Canonical | This implementation |
+|---|---|---|
+| Last shipped | July 2025 | Active |
+| DB encryption | Plain SQLite | SQLCipher with key in macOS Keychain |
+| Prompt-injection scrubber | None | Every inbound message |
+| Send safety | Fires immediately | Mandatory `confirm_send` between draft and delivery |
+| Audit log | None | Every tool call, 30-day retention |
+| Voice notes | Not transcribed | `whisper.cpp` local, Spanish-tuned default |
+| LID alias resolution | Open issue cluster upstream | Shipped, with backfill migration for legacy threads |
+| CI security | None | `govulncheck` + `pip-audit` + Dependabot, daily |
+
+Not a fork. The Go bridge is built directly against `whatsmeow`; the Python MCP layer and SQLite schema are original. Other implementations (`lharries`, `LukasHaas`, `verygoodplugins`) were read as reference only.
 
 ## What this gives you
 
@@ -12,7 +27,7 @@ Claude can:
 - Search messages with accent-insensitive, typo-tolerant matching
 - Transcribe voice notes locally via `whisper.cpp` (Spanish-tuned by default)
 - Resolve LID (Linked IDentifier) names instead of numeric placeholders
-- Send text, media, voice, reactions, and reply-quotes (with mandatory confirmation)
+- Send text messages, reactions, and reply-quotes, with a mandatory `confirm_send` step between draft and delivery
 - Pull matching CRM context from your Obsidian vault when reading a chat
 - See only prompt-injection-scrubbed message text, never raw adversarial input
 
@@ -23,7 +38,7 @@ Everything runs locally on your machine. No cloud sync. No telemetry. Optional O
 Two components, both local:
 
 - **`whatsapp-bridge/`** (Go). Binds to 127.0.0.1 only. Wraps `whatsmeow` for the WhatsApp Web multidevice protocol. Owns SQLite persistence with SQLCipher encryption. Handles QR and pairing-code auth, media up/download, session recovery from `StreamReplaced` conflicts, call history capture. Exposes a REST API the Python MCP layer consumes.
-- **`whatsapp-mcp-server/`** (Python, FastMCP). Consumes the Go bridge REST API. Exposes 20+ MCP tools to Claude. Runs via `uv` and stdio transport.
+- **`whatsapp-mcp-server/`** (Python, FastMCP). Consumes the Go bridge REST API. Exposes 11 MCP tools to Claude: full read surface (chats, messages, contacts), accent-insensitive search, presence (typing, online, mark-read), and text-send + reactions + reply-quotes with mandatory `confirm_send`. Runs via `uv` and stdio transport.
 
 ## Install
 
@@ -84,7 +99,13 @@ Short version:
 
 ## Status
 
-Early. v0.1.0 is the initial scaffold with auth and core read tools. See [CHANGELOG.md](CHANGELOG.md) for current state.
+v0.1.0, actively maintained.
+
+Shipped: QR + pairing-code auth, full read surface (chats, messages, contacts), accent-insensitive NFD-normalized search, LID alias resolution with backfill migration for legacy threads, Baileys-store import for one-shot history migration, vault-format markdown export, local `whisper.cpp` voice transcription, presence (typing, online, mark-read), text-send with mandatory `confirm_send`, reactions, reply-quotes, prompt-injection scrubber, SQLCipher-encrypted persistence with macOS Keychain key handling, audit log, CI security gates.
+
+Not yet shipped: media-send (image, document), audio-message-send (FFmpeg-Opus path), group broadcast helpers.
+
+See [CHANGELOG.md](CHANGELOG.md) for full history.
 
 ## Related MCPs
 
