@@ -49,6 +49,9 @@ jobs:
   pip-audit:
     # uv.lock is gitignored here, so the audit targets a fresh resolve of
     # pyproject.toml, the dependency tree an install actually produces.
+    # --all-extras audits the optional extras too (e.g. the openai extra),
+    # i.e. the full shippable surface; --no-dev leaves out dev-only tools
+    # (pytest, ruff) so the gate stays signal, not noise.
     # pip-audit reads the OSV / PyPI advisory database. A genuinely
     # unfixable advisory can be waived with
     # `pip-audit --ignore-vuln <GHSA-id>` plus a justifying comment,
@@ -56,7 +59,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v8.1.0
       - name: pip-audit (whatsapp-mcp-server)
         working-directory: whatsapp-mcp-server
-        run: uv run --no-dev --with pip-audit pip-audit
+        run: uv run --no-dev --all-extras --with pip-audit pip-audit
