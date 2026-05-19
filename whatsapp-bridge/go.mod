@@ -2,6 +2,8 @@ module github.com/adelaidasofia/whatsapp-mcp/whatsapp-bridge
 
 go 1.25.0
 
+toolchain go1.26.3
+
 // Dependencies are populated by `go mod tidy` on first build.
 // Upgrading any dependency requires a manual diff review per SECURITY.md.
 

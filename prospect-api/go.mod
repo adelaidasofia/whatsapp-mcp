@@ -2,6 +2,8 @@ module github.com/adelaidasofia/whatsapp-mcp/prospect-api
 
 go 1.25.0
 
+toolchain go1.26.3
+
 // Phase A: lookup, pull-context, update-crm, preset, check-preset.
 // Phase B (Sprints 7-10) lands here too as additional handlers.
 //
