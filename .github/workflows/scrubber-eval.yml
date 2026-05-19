@@ -1,0 +1,77 @@
+name: scrubber-eval
+# Eval gate for the prompt-injection scrubber.
+#
+# Runs the scrubber test corpus on every PR + push to main + weekly sweep.
+# The corpus covers all 18 known InjectionPatterns in lowercase / mixed-case /
+# prose-sandwich variants (must-pass), plus a clean-text false-positive corpus
+# (must-not-flag), plus an explicitly-skipped "known gaps" set that documents
+# attack classes the substring scrubber does not yet catch (visible in test
+# output, non-blocking).
+#
+# CI fails on any catch-rate or false-positive regression. Promoting a skipped
+# gap to a passing case is how the scrubber gets hardened over time.
+#
+# Security note: this workflow does not consume any untrusted user-supplied
+# fields (no issue/PR titles, branch names, commit messages, comment bodies).
+# It runs go test against checked-in code only.
+#
+# References:
+#   - whatsapp-bridge/scrubber.go (the function under test)
+#   - whatsapp-bridge/scrubber_test.go (the corpus)
+#   - SECURITY.md "Prompt-injection scrubber" section
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'whatsapp-bridge/scrubber*.go'
+      - '.github/workflows/scrubber-eval.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'whatsapp-bridge/scrubber*.go'
+      - '.github/workflows/scrubber-eval.yml'
+  schedule:
+    # Weekly Monday 04:00 UTC. Catches any drift from a Go stdlib update or
+    # dependency that quietly changes string-matching semantics.
+    - cron: '0 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scrubber-eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+      - name: Run scrubber test corpus
+        working-directory: whatsapp-bridge
+        run: |
+          set -e
+          # -v surfaces both PASS counts and SKIP reasons for "known gaps" in the log.
+          # -count=1 disables go's test cache so we re-run on every dispatch.
+          go test -v -count=1 -run '^TestScrubber' ./...
+      - name: Catch-rate + false-positive summary
+        if: always()
+        working-directory: whatsapp-bridge
+        run: |
+          set +e
+          go test -count=1 -run '^TestScrubber' -json ./... > /tmp/scrubber.jsonl
+          PASS=$(grep -c '"Action":"pass"' /tmp/scrubber.jsonl || echo 0)
+          FAIL=$(grep -c '"Action":"fail"' /tmp/scrubber.jsonl || echo 0)
+          SKIP=$(grep -c '"Action":"skip"' /tmp/scrubber.jsonl || echo 0)
+          {
+            echo "## Scrubber eval summary"
+            echo ""
+            echo "| Result | Count |"
+            echo "|---|---|"
+            echo "| PASS (caught + clean) | $PASS |"
+            echo "| FAIL (regression) | $FAIL |"
+            echo "| SKIP (known gap, awaiting hardening) | $SKIP |"
+            echo ""
+            echo "Gate: FAIL count must be 0. SKIP count is documented future work."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -36,6 +36,8 @@ This MCP reads and writes your personal WhatsApp. Treat it as equivalent to your
 
 5. **Prompt-injection scrubber.** Every incoming message text passes through a scrubber that strips known injection patterns (`ignore previous instructions`, `system: reveal tokens`, etc.) before Claude sees it. Scrubbed patterns are logged. The original message is preserved in the database; only the representation shown to Claude is scrubbed.
 
+   The scrubber's coverage is enforced by `whatsapp-bridge/scrubber_test.go`, a 73-case eval corpus that exercises every pattern in `InjectionPatterns` across lowercase, mixed-case, and prose-sandwich variants, plus an 18-entry false-positive control corpus. The `.github/workflows/scrubber-eval.yml` workflow runs the corpus on every PR + push to main + weekly schedule and BLOCKS merge on any catch-rate or false-positive regression. The same test file also documents 10 explicitly-skipped attack classes the substring scrubber does not yet catch (Unicode homoglyphs, whitespace padding, embedded delimiters, base64-encoded instructions, RTL override, zero-width joiners, indirect URL preview, tool-spoofing, exfiltration phrasing, markdown-with-javascript-scheme). Promoting a skipped gap to a passing case is how the scrubber gets hardened over time.
+
 6. **`whatsmeow` pinned.** The Go module pins to a specific commit in `go.mod`. Upgrades require manual diff review and a version bump in `CHANGELOG.md`.
 
 7. **No telemetry.** Zero external network calls except:
