@@ -1,5 +1,7 @@
 # whatsapp-mcp
 
+<!-- mcp-name: io.github.adelaidasofia/whatsapp-mcp -->
+
 A WhatsApp MCP server for Claude, built directly on [whatsmeow](https://github.com/tulir/whatsmeow). Encrypted at rest, prompt-injection-scrubbed, draft-and-confirm on every send, full audit trail, daily CI security gates. Actively maintained.
 
 ## Why this one?
@@ -106,6 +108,26 @@ Shipped: QR + pairing-code auth, full read surface (chats, messages, contacts), 
 Not yet shipped: media-send (image, document), audio-message-send (FFmpeg-Opus path), group broadcast helpers.
 
 See [CHANGELOG.md](CHANGELOG.md) for full history.
+
+## MCP Registry
+
+This server is configured to publish to the [official MCP Registry](https://registry.modelcontextprotocol.io) under the namespace `io.github.adelaidasofia/whatsapp-mcp`.
+
+The publishing pipeline lives at [.github/workflows/publish-mcp.yml](.github/workflows/publish-mcp.yml). Tagging the repo with `v0.1.x` runs the full pipeline end-to-end:
+
+1. Build the Python wheel + sdist for `whatsapp-mcp-server`
+2. Publish to PyPI via OIDC trusted-publisher
+3. Install `mcp-publisher` CLI
+4. Authenticate to the registry via GitHub OIDC
+5. Publish `server.json` to the registry
+6. Verify registration via the public search API
+
+Two one-time prereqs are required before the first tag push works:
+
+- [PyPI trusted-publisher](https://pypi.org/manage/account/publishing/) configured to accept uploads from this repo + the `publish-mcp.yml` workflow.
+- PyPI package name `whatsapp-mcp-server` reserved (claimed via pending-publisher OR seeded from a logged-in upload).
+
+The verification marker (`mcp-name: io.github.adelaidasofia/whatsapp-mcp`) is embedded in the README as an HTML comment so the registry can confirm package-to-server ownership at publish time.
 
 ## Related MCPs
 

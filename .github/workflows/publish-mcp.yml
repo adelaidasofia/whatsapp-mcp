@@ -1,0 +1,144 @@
+name: publish-mcp
+# Publish whatsapp-mcp-server to PyPI + register on the official MCP Registry.
+#
+# Triggered by version tags (v0.1.0, v0.1.1, etc.) or manual dispatch.
+#
+# Prerequisites (one-time setup, owner only):
+#   1. PyPI trusted-publisher configured for adelaidasofia/whatsapp-mcp:
+#      - Visit https://pypi.org/manage/account/publishing/
+#      - Add a new publisher pointing at this repo + this workflow filename
+#        (.github/workflows/publish-mcp.yml) + the publish job + the
+#        environment "pypi" if you want to gate publishing behind an env.
+#   2. PyPI package "whatsapp-mcp-server" name reserved on first publish.
+#      Cannot be reserved without an initial upload from a logged-in user
+#      OR via a one-time trusted-publisher pending-publisher claim.
+#
+# Once both are configured, tagging the repo with `git tag v0.1.x &&
+# git push --tags` triggers this workflow end-to-end with zero secrets to
+# manage.
+#
+# Security note: all untrusted inputs (git ref, dispatch input) flow through
+# env: bindings and are consumed via "$VAR" inside the shell scripts. No
+# direct ${{ }} interpolation inside run: blocks. This is the SAFE pattern
+# documented at
+# https://github.blog/security/vulnerability-research/how-to-catch-github-actions-workflow-injections-before-attackers-do/
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (e.g., 0.1.0). For manual dispatch only.'
+        required: true
+        default: '0.1.0'
+
+permissions:
+  contents: read
+  id-token: write  # required for both PyPI OIDC and MCP Registry github-oidc
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute version
+        id: version
+        env:
+          GH_REF: ${{ github.ref }}
+          DISPATCH_VERSION: ${{ inputs.version }}
+        run: |
+          set -e
+          if [ -n "$DISPATCH_VERSION" ]; then
+            VERSION="$DISPATCH_VERSION"
+          else
+            VERSION="${GH_REF#refs/tags/v}"
+          fi
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([.\-+][a-zA-Z0-9.\-]+)?$'; then
+            echo "::error::Invalid version: $VERSION"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Publishing version $VERSION"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Stage README + LICENSE into package dir
+        # pyproject.toml currently uses parent-dir paths (readme = "../README.md").
+        # PyPI build backends require package-local references, so we copy +
+        # patch in the CI workspace only. The source tree is untouched.
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -e
+          cp README.md whatsapp-mcp-server/README.md
+          cp LICENSE whatsapp-mcp-server/LICENSE
+          sed -i 's|readme = "../README.md"|readme = "README.md"|' whatsapp-mcp-server/pyproject.toml
+          sed -i 's|file = "../LICENSE"|file = "LICENSE"|' whatsapp-mcp-server/pyproject.toml
+          sed -i "s|^version = \"[^\"]*\"|version = \"$VERSION\"|" whatsapp-mcp-server/pyproject.toml
+
+      - name: Build distribution
+        working-directory: whatsapp-mcp-server
+        run: uv build
+
+      - name: Publish to PyPI (OIDC trusted-publisher)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: whatsapp-mcp-server/dist
+
+      - name: Wait for PyPI propagation
+        run: sleep 30
+
+      - name: Install mcp-publisher
+        run: |
+          set -e
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" \
+            | tar xz mcp-publisher
+          chmod +x mcp-publisher
+          ./mcp-publisher --help
+
+      - name: Sync server.json version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -e
+          jq --arg v "$VERSION" '.version = $v | .packages[0].version = $v' server.json > server.tmp.json
+          mv server.tmp.json server.json
+          cat server.json
+
+      - name: Authenticate to MCP Registry (github-oidc)
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish to MCP Registry
+        run: ./mcp-publisher publish
+
+      - name: Verify registration
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set +e
+          sleep 10
+          RESULT=$(curl -fsSL "https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.adelaidasofia/whatsapp-mcp")
+          {
+            echo "## MCP Registry publish summary"
+            echo ""
+            echo "- **Server name:** \`io.github.adelaidasofia/whatsapp-mcp\`"
+            echo "- **Version:** \`$VERSION\`"
+            echo "- **PyPI:** https://pypi.org/project/whatsapp-mcp-server/$VERSION/"
+            echo "- **Registry query:** https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.adelaidasofia/whatsapp-mcp"
+            echo ""
+            echo "### Registry response"
+            echo '```json'
+            echo "$RESULT" | head -c 2000
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
