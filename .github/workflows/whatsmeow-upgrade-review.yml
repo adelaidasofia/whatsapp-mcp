@@ -1,0 +1,194 @@
+name: whatsmeow-upgrade-review
+# Enforcement layer for SECURITY.md item 6: "whatsmeow pinned; upgrades require
+# manual diff review."
+#
+# Triggers when a PR modifies whatsapp-bridge/go.mod or go.sum. Detects whether
+# the go.mau.fi/whatsmeow pin specifically moved. If yes, clones upstream
+# (github.com/tulir/whatsmeow), produces a commit log between old and new pins,
+# posts it as a PR comment, and applies the whatsmeow-diff-review-required
+# label.
+#
+# Reviewer responsibility: read the diff, then either (a) add the
+# whatsmeow-diff-reviewed label to authorize merge, or (b) request changes.
+#
+# Security note: all untrusted inputs (base ref, head sha, PR number, repo
+# full-name) are passed via env: bindings and consumed via "$VAR" inside the
+# shell scripts. No direct ${{ }} interpolation inside run: blocks. This is
+# the SAFE pattern documented at
+# https://github.blog/security/vulnerability-research/how-to-catch-github-actions-workflow-injections-before-attackers-do/
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'whatsapp-bridge/go.mod'
+      - 'whatsapp-bridge/go.sum'
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  diff-review:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_REPO: tulir/whatsmeow
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract old + new whatsmeow pins
+        id: pins
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -e
+          git fetch origin "$BASE_REF"
+          OLD_MOD=$(git show "origin/${BASE_REF}:whatsapp-bridge/go.mod" 2>/dev/null || echo "")
+          NEW_MOD=$(cat whatsapp-bridge/go.mod)
+
+          # whatsmeow pseudo-version format: v0.0.0-YYYYMMDDHHMMSS-<12-char-sha>
+          extract_sha() {
+            echo "$1" | grep -E '^[[:space:]]*go\.mau\.fi/whatsmeow' | head -n1 \
+              | grep -oE '-[0-9a-f]{12}([[:space:]]|$)' | head -n1 \
+              | tr -d ' \n-'
+          }
+
+          OLD_SHA=$(extract_sha "$OLD_MOD")
+          NEW_SHA=$(extract_sha "$NEW_MOD")
+
+          echo "old_sha=$OLD_SHA" >> "$GITHUB_OUTPUT"
+          echo "new_sha=$NEW_SHA" >> "$GITHUB_OUTPUT"
+
+          if [ -z "$OLD_SHA" ] || [ -z "$NEW_SHA" ]; then
+            echo "changed=indeterminate" >> "$GITHUB_OUTPUT"
+            echo "::warning::Could not extract whatsmeow pins (old=$OLD_SHA new=$NEW_SHA). Treating as needs-review."
+          elif [ "$OLD_SHA" = "$NEW_SHA" ]; then
+            echo "changed=no" >> "$GITHUB_OUTPUT"
+            echo "whatsmeow pin unchanged ($OLD_SHA). Nothing to review."
+          else
+            echo "changed=yes" >> "$GITHUB_OUTPUT"
+            echo "whatsmeow pin moved: $OLD_SHA -> $NEW_SHA"
+          fi
+
+      - name: Fetch upstream commit log
+        if: steps.pins.outputs.changed == 'yes'
+        id: upstream
+        env:
+          OLD_SHA: ${{ steps.pins.outputs.old_sha }}
+          NEW_SHA: ${{ steps.pins.outputs.new_sha }}
+        run: |
+          set -e
+          git clone --quiet "https://github.com/${UPSTREAM_REPO}.git" /tmp/whatsmeow
+          cd /tmp/whatsmeow
+
+          if ! git cat-file -e "${OLD_SHA}" 2>/dev/null; then
+            echo "::error::Old SHA $OLD_SHA not found in upstream ${UPSTREAM_REPO}"
+            exit 1
+          fi
+          if ! git cat-file -e "${NEW_SHA}" 2>/dev/null; then
+            echo "::error::New SHA $NEW_SHA not found in upstream ${UPSTREAM_REPO}"
+            exit 1
+          fi
+
+          {
+            git log --no-merges --pretty=format:'%h  %s  (%an, %ad)' --date=short \
+              "${OLD_SHA}..${NEW_SHA}"
+            echo ""
+            echo "---"
+            echo ""
+            git diff --shortstat "${OLD_SHA}..${NEW_SHA}"
+          } > /tmp/upstream-log.txt
+
+          COMMIT_COUNT=$(git rev-list --no-merges --count "${OLD_SHA}..${NEW_SHA}")
+          echo "commit_count=$COMMIT_COUNT" >> "$GITHUB_OUTPUT"
+
+          # Truncate to ~50KB to stay safely under GitHub's 65KB comment limit.
+          head -c 50000 /tmp/upstream-log.txt > /tmp/upstream-log-truncated.txt
+          if [ "$(wc -c < /tmp/upstream-log.txt)" -gt 50000 ]; then
+            echo "" >> /tmp/upstream-log-truncated.txt
+            echo "...[truncated, see workflow log for full diff]" >> /tmp/upstream-log-truncated.txt
+          fi
+
+      - name: Surface diff in workflow summary
+        if: steps.pins.outputs.changed == 'yes'
+        env:
+          OLD_SHA: ${{ steps.pins.outputs.old_sha }}
+          NEW_SHA: ${{ steps.pins.outputs.new_sha }}
+          COMMIT_COUNT: ${{ steps.upstream.outputs.commit_count }}
+        run: |
+          {
+            echo "## whatsmeow upgrade detected"
+            echo ""
+            echo "- **Old pin:** \`${OLD_SHA}\`"
+            echo "- **New pin:** \`${NEW_SHA}\`"
+            echo "- **Commits between:** ${COMMIT_COUNT}"
+            echo "- **Upstream:** https://github.com/tulir/whatsmeow/compare/${OLD_SHA}...${NEW_SHA}"
+            echo ""
+            echo "### Commit log"
+            echo ""
+            echo '```'
+            cat /tmp/upstream-log-truncated.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post PR comment + apply review-required label
+        if: steps.pins.outputs.changed == 'yes' && github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          OLD_SHA: ${{ steps.pins.outputs.old_sha }}
+          NEW_SHA: ${{ steps.pins.outputs.new_sha }}
+          COMMIT_COUNT: ${{ steps.upstream.outputs.commit_count }}
+        run: |
+          set -e
+          {
+            echo "## whatsmeow upgrade detected"
+            echo ""
+            echo "Pin moved \`${OLD_SHA}\` -> \`${NEW_SHA}\` (${COMMIT_COUNT} commits)."
+            echo ""
+            echo "Compare: https://github.com/tulir/whatsmeow/compare/${OLD_SHA}...${NEW_SHA}"
+            echo ""
+            echo "<details>"
+            echo "<summary>Commit log</summary>"
+            echo ""
+            echo '```'
+            cat /tmp/upstream-log-truncated.txt
+            echo '```'
+            echo ""
+            echo "</details>"
+            echo ""
+            echo "Per SECURITY.md item 6, this requires manual diff review."
+            echo "Reviewer: read the changes above, then add label \`whatsmeow-diff-reviewed\` to authorize merge."
+          } > /tmp/pr-comment.md
+
+          # Ensure both labels exist
+          gh label create whatsmeow-diff-review-required \
+            --description "PR moves the whatsmeow pin; manual diff review required per SECURITY.md item 6" \
+            --color B60205 --force --repo "$REPO" 2>/dev/null || true
+          gh label create whatsmeow-diff-reviewed \
+            --description "whatsmeow upgrade has been diff-reviewed; safe to merge" \
+            --color 0E8A16 --force --repo "$REPO" 2>/dev/null || true
+
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/pr-comment.md
+          gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label whatsmeow-diff-review-required
+
+      - name: Indeterminate-pin warning comment
+        if: steps.pins.outputs.changed == 'indeterminate' && github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -e
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body \
+            "::warning:: Could not parse the whatsmeow pin in go.mod. Treating this PR as needs-manual-review out of caution. Per SECURITY.md item 6."
+          gh label create whatsmeow-diff-review-required \
+            --description "PR moves the whatsmeow pin; manual diff review required per SECURITY.md item 6" \
+            --color B60205 --force --repo "$REPO" 2>/dev/null || true
+          gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label whatsmeow-diff-review-required

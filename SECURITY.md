@@ -40,6 +40,8 @@ This MCP reads and writes your personal WhatsApp. Treat it as equivalent to your
 
 6. **`whatsmeow` pinned.** The Go module pins to a specific commit in `go.mod`. Upgrades require manual diff review and a version bump in `CHANGELOG.md`.
 
+   Enforced by `.github/workflows/whatsmeow-upgrade-review.yml`. Any PR that modifies `whatsapp-bridge/go.mod` or `whatsapp-bridge/go.sum` is intercepted: the workflow extracts the old + new pseudo-version SHAs, clones the upstream `github.com/tulir/whatsmeow` mirror, generates the full commit log + diff stats between the two pins, posts that as a PR comment, and applies the `whatsmeow-diff-review-required` label. Reviewer must read the diff and add the `whatsmeow-diff-reviewed` label to authorize merge.
+
 7. **No telemetry.** Zero external network calls except:
    - WhatsApp's multidevice endpoint (required for the tool to function).
    - OpenAI Whisper API only if `WHATSAPP_WHISPER_BACKEND=openai-api` is explicitly set (default is local `whisper.cpp`).
