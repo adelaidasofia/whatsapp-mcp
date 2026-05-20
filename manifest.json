@@ -5,7 +5,7 @@
   "version": "0.1.0",
   "description": "Personal WhatsApp MCP for Claude, built directly on whatsmeow. Encrypted-at-rest storage, Whisper voice-note transcription, accent-insensitive Spanish search, vault-native CRM integration, send-confirmation safety.",
   "author": {
-    "name": "Adelaida Diaz-Roa",
+    "name": "adelaidasofia",
     "url": "https://github.com/adelaidasofia"
   },
   "repository": {

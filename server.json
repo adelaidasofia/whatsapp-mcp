@@ -11,12 +11,12 @@
   "packages": [
     {
       "registryType": "mcpb",
-      "identifier": "https://github.com/adelaidasofia/whatsapp-mcp/releases/latest/download/whatsapp-mcp.mcpb",
+      "identifier": "https://github.com/adelaidasofia/whatsapp-mcp/releases/download/v0.1.0/whatsapp-mcp.mcpb",
       "version": "0.1.0",
       "transport": {
         "type": "stdio"
       },
-      "fileSha256": "8fbf661ba23dfe10c8eea3d3136315ccb7e66199ba492cc07603fe1049f2210a"
+      "fileSha256": "445ed78fc133477a67f193441d1a5a277fb58dcf159b11561da83c5445da1e5b"
     }
   ]
 }
