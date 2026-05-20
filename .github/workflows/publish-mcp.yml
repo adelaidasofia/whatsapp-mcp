@@ -61,7 +61,10 @@ jobs:
           else
             VERSION="${GH_REF#refs/tags/v}"
           fi
-          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([.\-+][a-zA-Z0-9.\-]+)?$'; then
+          # Character classes: dash MUST come first (or be escaped via backslash)
+          # so grep doesn't interpret it as a range. Previous form `[.\-+]` failed
+          # on GNU grep with "Invalid range end".
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([-+.][-a-zA-Z0-9.]*)?$'; then
             echo "::error::Invalid version: $VERSION"
             exit 1
           fi
