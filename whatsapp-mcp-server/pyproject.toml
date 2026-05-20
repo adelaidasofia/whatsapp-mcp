@@ -2,9 +2,14 @@
 name = "adelaidasofia-whatsapp-mcp"
 version = "0.1.1"
 description = "Python MCP server for whatsapp-mcp. Consumes the Go bridge REST API and exposes tools to Claude."
-readme = "../README.md"
+# readme: inline text + Homepage link in [project.urls] below. The full README
+# at the repo root cannot be referenced via `readme = "../README.md"` because
+# setuptools 77+ rejects file refs outside the package root (see
+# docs/TROUBLESHOOTING.md "uv sync fails on the Python MCP server"). The
+# publish pipeline includes its own staging; this field is what local CI sees.
+readme = { text = "Python MCP server for whatsapp-mcp. The Go bridge ships separately; see the full README at https://github.com/adelaidasofia/whatsapp-mcp for install + threat model + tool reference.", content-type = "text/markdown" }
 requires-python = ">=3.11"
-license = { file = "../LICENSE" }
+license = "MIT"
 authors = [
     { name = "Adelaida Diaz-Roa" },
 ]
@@ -49,3 +54,13 @@ dev = [
     "pytest-asyncio>=0.23",
     "ruff>=0.5",
 ]
+
+[tool.pytest.ini_options]
+# Tests live under tests/ as a separate directory.
+# pythonpath = ["."] lets `from main import ...` resolve since main.py ships as
+# a top-level module per [tool.setuptools] py-modules above (not a package).
+testpaths = ["tests"]
+pythonpath = ["."]
+# -q: keep parameterized output compact (we have ~50+ scrubber cases).
+# -r s: show skip reasons (the known-gap corpus surfaces uncovered attack classes).
+addopts = "-q -r s"

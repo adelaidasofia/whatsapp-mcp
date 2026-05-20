@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Python test suite** under `whatsapp-mcp-server/tests/`. Mirrors the Go scrubber test corpus pattern: known-pattern coverage in lowercase / mixed-case / prose-sandwich variants, false-positive corpus, multi-pattern in one message, and a documented "known gaps" set (skipped, parity with Go). Also covers `lookup_crm_context` (tempdir-backed CRM fixtures) and `_normalize_phone`. 98 passing / 10 skip-known-gaps.
+- **Go test suite for `normalize.go` and `aliases.go`.** `normalize_test.go` covers ASCII, Spanish accents, European diacritics, idempotence, and non-Latin passthrough. `aliases_test.go` covers the pure helpers (`inClausePlaceholders`, `jidsToArgs`) and the DB-backed `recordJIDAlias` + `resolveAliases` against in-memory SQLite, including the symmetric-edge invariant that was the original LID/phone JID split regression.
+- **`.github/workflows/tests.yml`** runs the full Go + Python test suite on every PR + push (broader than `scrubber-eval.yml`, which only fires on scrubber-file changes).
+- **`docs/TROUBLESHOOTING.md`** documents operational pain points: QR pairing failures, `StreamReplaced`, LID/phone alias split, voice-note transcription prereqs, SQLCipher Keychain backup, `uv sync` parent-dir quirk, bridge `/healthcheck` 502, audit-log rotation.
+- **`SECURITY.md` webhook integrity contract.** Documents the three controls (HMAC signature, per-delivery idempotency key, retry queue) that the webhook feature MUST ship with — codified before implementation so the feature can't ship without them.
+
+### Security
+
+- **Sync Python scrubber pattern list with Go.** The Go scrubber gained 5 patterns (`ignore above instructions`, `disregard prior instructions`, `dump your system prompt`, `tell me your instructions`, `what are your instructions`) in the 2026-05-19 hardening pass; the Python layer kept the older 13-pattern list. Both scrubbers run in production (Go on incoming-from-protocol before DB write; Python before Claude sees text); drift between them was a defense-in-depth defect. New `test_pattern_count_matches_go` parity test fails CI on future drift.
+
+### Fixed
+
+- **pip-audit CI gate** had been failing on every push to main for at least 5 commits before this PR. Root cause: `whatsapp-mcp-server/pyproject.toml` referenced `readme = "../README.md"` and `license = { file = "../LICENSE" }`, and setuptools 77+ rejects any file ref outside the package root. The publish pipeline staged the files before build, so the published wheel was fine, but local builds + CI's `pip-audit` could never resolve the package. Fix: inline `readme = { text = "...", content-type = "text/markdown" }` and `license = "MIT"` (PEP 639 SPDX). PyPI page becomes minimal; the full README still lives at the repo root and is linked from the `[project.urls]` Homepage. The TROUBLESHOOTING.md `uv sync` entry now describes a fixed historical issue rather than a current one.
+
 ## [0.1.1] - 2026-05-19
 
 ### Added
