@@ -554,5 +554,13 @@ async def set_online_presence(online: bool = True) -> dict[str, Any]:
 
 # --- Entry point ------------------------------------------------------------
 
-if __name__ == "__main__":
+
+def main() -> None:
+    """Console-script entry point. Wired in pyproject.toml [project.scripts]
+    so `uvx adelaidasofia-whatsapp-mcp` launches the server, and exposed for
+    direct invocation via `python -m main` or `python main.py`."""
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()

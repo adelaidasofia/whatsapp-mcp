@@ -19,6 +19,30 @@ dependencies = [
 [project.optional-dependencies]
 openai = ["openai>=1.30.0"]
 
+[project.scripts]
+# Wired so `uvx adelaidasofia-whatsapp-mcp` launches the MCP server.
+# Matches the runtimeHint in server.json. The Go bridge is a separate
+# runtime prereq; the README documents both halves of the install.
+adelaidasofia-whatsapp-mcp = "main:main"
+
+[project.urls]
+Homepage = "https://github.com/adelaidasofia/whatsapp-mcp"
+Repository = "https://github.com/adelaidasofia/whatsapp-mcp"
+Issues = "https://github.com/adelaidasofia/whatsapp-mcp/issues"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+# main.py ships as a single top-level module. uvx consumers reach it via
+# the entry point above, not via direct import, so the top-level-name
+# collision risk is bounded to people who explicitly `import main` from
+# their own code (vanishingly rare; if it becomes an issue, the rename to
+# a proper package directory lands cleanly with a tool.setuptools.packages
+# swap).
+py-modules = ["main"]
+
 [dependency-groups]
 dev = [
     "pytest>=8.0",
