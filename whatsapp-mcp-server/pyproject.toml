@@ -1,5 +1,5 @@
 [project]
-name = "whatsapp-mcp-server"
+name = "adelaidasofia-whatsapp-mcp"
 version = "0.1.0"
 description = "Python MCP server for whatsapp-mcp. Consumes the Go bridge REST API and exposes tools to Claude."
 readme = "../README.md"

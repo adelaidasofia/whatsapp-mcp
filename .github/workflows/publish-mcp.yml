@@ -1,5 +1,5 @@
 name: publish-mcp
-# Publish whatsapp-mcp-server to PyPI + register on the official MCP Registry.
+# Publish the adelaidasofia-whatsapp-mcp Python package to PyPI + register on the official MCP Registry.
 #
 # Triggered by version tags (v0.1.0, v0.1.1, etc.) or manual dispatch.
 #
@@ -9,7 +9,12 @@ name: publish-mcp
 #      - Add a new publisher pointing at this repo + this workflow filename
 #        (.github/workflows/publish-mcp.yml) + the publish job + the
 #        environment "pypi" if you want to gate publishing behind an env.
-#   2. PyPI package "whatsapp-mcp-server" name reserved on first publish.
+#   2. PyPI package "adelaidasofia-whatsapp-mcp" name reserved on first publish.
+#      The unprefixed names ("whatsapp-mcp-server", "whatsapp-mcp") were
+#      already claimed on PyPI by unrelated projects (msaelices and
+#      yanrujing respectively), so the package name is namespaced under
+#      the maintainer's GitHub username, matching the server-name pattern
+#      in server.json (io.github.adelaidasofia/whatsapp-mcp).
 #      Cannot be reserved without an initial upload from a logged-in user
 #      OR via a one-time trusted-publisher pending-publisher claim.
 #
@@ -134,7 +139,7 @@ jobs:
             echo ""
             echo "- **Server name:** \`io.github.adelaidasofia/whatsapp-mcp\`"
             echo "- **Version:** \`$VERSION\`"
-            echo "- **PyPI:** https://pypi.org/project/whatsapp-mcp-server/$VERSION/"
+            echo "- **PyPI:** https://pypi.org/project/adelaidasofia-whatsapp-mcp/$VERSION/"
             echo "- **Registry query:** https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.adelaidasofia/whatsapp-mcp"
             echo ""
             echo "### Registry response"

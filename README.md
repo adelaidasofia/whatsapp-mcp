@@ -115,7 +115,7 @@ This server is configured to publish to the [official MCP Registry](https://regi
 
 The publishing pipeline lives at [.github/workflows/publish-mcp.yml](.github/workflows/publish-mcp.yml). Tagging the repo with `v0.1.x` runs the full pipeline end-to-end:
 
-1. Build the Python wheel + sdist for `whatsapp-mcp-server`
+1. Build the Python wheel + sdist for the `adelaidasofia-whatsapp-mcp` PyPI package (the unprefixed `whatsapp-mcp-server` and `whatsapp-mcp` names were already claimed on PyPI by unrelated projects, hence the username-prefixed namespace)
 2. Publish to PyPI via OIDC trusted-publisher
 3. Install `mcp-publisher` CLI
 4. Authenticate to the registry via GitHub OIDC
@@ -125,7 +125,7 @@ The publishing pipeline lives at [.github/workflows/publish-mcp.yml](.github/wor
 Two one-time prereqs are required before the first tag push works:
 
 - [PyPI trusted-publisher](https://pypi.org/manage/account/publishing/) configured to accept uploads from this repo + the `publish-mcp.yml` workflow.
-- PyPI package name `whatsapp-mcp-server` reserved (claimed via pending-publisher OR seeded from a logged-in upload).
+- PyPI package name `adelaidasofia-whatsapp-mcp` reserved (claimed via pending-publisher OR seeded from a logged-in upload).
 
 The verification marker (`mcp-name: io.github.adelaidasofia/whatsapp-mcp`) is embedded in the README as an HTML comment so the registry can confirm package-to-server ownership at publish time.
 
