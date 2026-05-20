@@ -29,9 +29,10 @@ jobs:
     # govulncheck fails the build only on vulnerabilities reachable from
     # each module's own code, per its call-graph analysis.
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
         with:
           go-version: 'stable'
           cache-dependency-path: |
@@ -57,8 +58,9 @@ jobs:
     # `pip-audit --ignore-vuln <GHSA-id>` plus a justifying comment,
     # never by deleting this gate.
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v8.1.0
       - name: pip-audit (whatsapp-mcp-server)
         working-directory: whatsapp-mcp-server
