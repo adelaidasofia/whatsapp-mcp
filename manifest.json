@@ -1,0 +1,46 @@
+{
+  "manifest_version": "0.4",
+  "name": "whatsapp-mcp",
+  "display_name": "Personal WhatsApp MCP for Claude, built directly on whatsmeow",
+  "version": "0.1.0",
+  "description": "Personal WhatsApp MCP for Claude, built directly on whatsmeow. Encrypted-at-rest storage, Whisper voice-note transcription, accent-insensitive Spanish search, vault-native CRM integration, send-confirmation safety.",
+  "author": {
+    "name": "Adelaida Diaz-Roa",
+    "url": "https://github.com/adelaidasofia"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/adelaidasofia/whatsapp-mcp.git"
+  },
+  "homepage": "https://github.com/adelaidasofia/whatsapp-mcp",
+  "documentation": "https://github.com/adelaidasofia/whatsapp-mcp#readme",
+  "support": "https://github.com/adelaidasofia/whatsapp-mcp/issues",
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "claude",
+    "fastmcp",
+    "whatsapp"
+  ],
+  "server": {
+    "type": "python",
+    "entry_point": "whatsapp-mcp-server/main.py",
+    "mcp_config": {
+      "command": "python3",
+      "args": [
+        "${__dirname}/whatsapp-mcp-server/main.py"
+      ],
+      "env": {}
+    }
+  },
+  "tools_generated": true,
+  "compatibility": {
+    "claude_desktop": ">=0.10.0",
+    "platforms": [
+      "darwin",
+      "win32",
+      "linux"
+    ]
+  }
+}
