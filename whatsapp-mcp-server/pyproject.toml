@@ -1,6 +1,6 @@
 [project]
 name = "adelaidasofia-whatsapp-mcp"
-version = "0.1.0"
+version = "0.1.1"
 description = "Python MCP server for whatsapp-mcp. Consumes the Go bridge REST API and exposes tools to Claude."
 readme = "../README.md"
 requires-python = ">=3.11"

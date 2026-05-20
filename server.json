@@ -2,18 +2,18 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.adelaidasofia/whatsapp-mcp",
   "title": "WhatsApp MCP",
-  "description": "WhatsApp MCP for Claude, built directly on whatsmeow. SQLCipher-encrypted at rest, prompt-injection scrubber with a CI-enforced 73-case eval corpus, mandatory draft-and-confirm on every send, whisper.cpp local voice-note transcription with Spanish-tuned default, vault-native CRM auto-injection, full audit log with 30-day retention.",
+  "description": "WhatsApp MCP. SQLCipher-encrypted, scrubber-CI-gated, draft-and-confirm sends, voice transcription.",
   "repository": {
     "url": "https://github.com/adelaidasofia/whatsapp-mcp",
     "source": "github"
   },
-  "version": "0.1.0",
+  "version": "0.1.1",
   "packages": [
     {
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "adelaidasofia-whatsapp-mcp",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"
