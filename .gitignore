@@ -54,3 +54,5 @@ bridge-stderr.log
 prospect-api/BRIDGE-SPEC-DELTA-*.md
 prospect-api/Negotiator Playbook.md
 prospect-api/Negotiator Playbook *.md
+# Generated MCP bundle (uploaded to GitHub Releases, not tracked in git)
+*.mcpb

@@ -15,7 +15,8 @@
       "version": "0.1.0",
       "transport": {
         "type": "stdio"
-      }
+      },
+      "fileSha256": "8fbf661ba23dfe10c8eea3d3136315ccb7e66199ba492cc07603fe1049f2210a"
     }
   ]
 }
