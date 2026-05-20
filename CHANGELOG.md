@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-05-19
+
+### Added
+
+- **Published to [MCP Registry](https://registry.modelcontextprotocol.io)** as `io.github.adelaidasofia/whatsapp-mcp` v0.1.1. PyPI path. Discovery-surface live for all MCP-aware clients.
+- **PyPI package `adelaidasofia-whatsapp-mcp` v0.1.1** published via OIDC trusted-publisher. Description shortened to fit the registry's 100-char limit (v0.1.0 failed validation on the long-form description).
+- **Scrubber CI gate** (`.github/workflows/scrubber-eval.yml`) running a 73-case eval corpus on every PR + push + weekly cron. Backs the security claim in SECURITY.md item 5 with actual enforcement.
+- **whatsmeow upgrade-review workflow** (`.github/workflows/whatsmeow-upgrade-review.yml`) that intercepts any PR moving the whatsmeow pin, posts the upstream commit log as a PR comment, and applies a `whatsmeow-diff-review-required` label that must be manually cleared before merge.
+
+## [0.1.0] - 2026-05-19
+
+### Added
+
+- **`.mcpb` bundle** built by the Mycelium MCP publishing pipeline and released as a GitHub artifact at [releases/v0.1.0](../../releases/tag/v0.1.0). One-click install in Claude Desktop / Cursor via the MCPB format.
+- **Initial PyPI release** of `adelaidasofia-whatsapp-mcp` v0.1.0 (superseded by 0.1.1 for the registry's description-length constraint).
+- **`server.json` registry manifest** with full 9-env-var schema covering bridge host/port, vault CRM path, Whisper backend selection, scrubber toggle, audit log toggle, and SQLCipher encryption toggle.
+
 ## [Unreleased]
 
 ### Fixed
