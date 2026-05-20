@@ -48,6 +48,32 @@ This MCP reads and writes your personal WhatsApp. Treat it as equivalent to your
 
 8. **No webhooks by default.** Set `WHATSAPP_WEBHOOK_URL` to enable; off by default.
 
+   **Webhook integrity contract (planned, must ship with the feature).**
+   `WHATSAPP_WEBHOOK_URL` is documented but not yet wired. When webhook
+   delivery lands, the implementation MUST ship these three controls in the
+   same commit, not as follow-ups:
+
+   1. **HMAC signature on every delivery.** Each POST carries an
+      `X-Webhook-Signature: sha256=<hex>` header where the body is signed
+      with `WHATSAPP_WEBHOOK_SECRET`. Receivers MUST verify before
+      processing. Without it, the endpoint is exposed to anyone who learns
+      the URL.
+
+   2. **Per-delivery idempotency key.** Each POST carries an
+      `X-Idempotency-Key` stable for the same logical event. Receivers
+      MUST deduplicate on this key with a finite-window cache (atomic
+      SET-NX on a token store, etc.) so network-level retries don't
+      double-execute side effects.
+
+   3. **Retry queue with exponential backoff.** Failed deliveries are
+      queued locally and retried with backoff; the bridge does not block
+      on webhook delivery. A persistently-failing endpoint surfaces in
+      `audit.log` and eventually drops the delivery rather than blocking
+      the bridge.
+
+   Documented here BEFORE implementation so the feature can't ship without
+   them.
+
 9. **Session key in Keychain, not in plaintext.** The WhatsApp session credentials are stored in macOS Keychain. Never written to a dotfile, never committed.
 
 10. **MIT license + threat model.** Publishing as public GitHub repo with explicit threat model so contributors and forkers know the security expectations upfront.
