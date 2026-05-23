@@ -1,5 +1,20 @@
 # whatsapp-mcp
 
+
+<!-- mycelium-badges:start -->
+
+<p>
+  <a href="https://github.com/adelaidasofia/whatsapp-mcp/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/adelaidasofia/whatsapp-mcp?color=blue"></a>
+  <a href="https://github.com/adelaidasofia/whatsapp-mcp/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/adelaidasofia/whatsapp-mcp?color=eab308"></a>
+  <a href="https://github.com/adelaidasofia/whatsapp-mcp/commits/main"><img alt="Last commit" src="https://img.shields.io/github/last-commit/adelaidasofia/whatsapp-mcp"></a>
+  <a href="https://github.com/adelaidasofia/whatsapp-mcp/issues"><img alt="Open issues" src="https://img.shields.io/github/issues/adelaidasofia/whatsapp-mcp"></a>
+  <a href="https://pypi.org/project/adelaidasofia-whatsapp-mcp/"><img alt="PyPI version" src="https://img.shields.io/pypi/v/adelaidasofia-whatsapp-mcp?color=blue&label=pypi"></a>
+  <a href="https://pypi.org/project/adelaidasofia-whatsapp-mcp/"><img alt="PyPI downloads" src="https://img.shields.io/pypi/dm/adelaidasofia-whatsapp-mcp?color=blue&label=downloads"></a>
+  <a href="https://myceliumai.co"><img alt="Built by Mycelium AI" src="https://img.shields.io/badge/built_by-Mycelium_AI-15B89A"></a>
+</p>
+
+<!-- mycelium-badges:end -->
+
 <!-- mcp-name: io.github.adelaidasofia/whatsapp-mcp -->
 
 A WhatsApp MCP server for Claude, built directly on [whatsmeow](https://github.com/tulir/whatsmeow). Encrypted at rest, prompt-injection-scrubbed, draft-and-confirm on every send, full audit trail, daily CI security gates. Actively maintained.
