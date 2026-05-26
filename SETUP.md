@@ -73,6 +73,8 @@ brew install whisper-cpp
 
 The MCP detects the `whisper-cli` binary in `$PATH`. Override with `WHATSAPP_WHISPER_BIN_PATH` in `.env`.
 
+The bridge also shells out to `ffmpeg` to normalize voice notes before whisper. It's detected in `$PATH` by default; override with `WHATSAPP_FFMPEG_BIN_PATH` when running under a non-interactive runner (launchd, systemd, supervisord, cron, Docker without `PATH` propagation) whose stripped `PATH` excludes Homebrew. See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) → "Voice notes silently fail under launchd / systemd / supervisord / cron / Docker" for symptoms + Homebrew/Linux absolute-path values.
+
 To use the OpenAI API backend instead (opt-in, sends audio to OpenAI):
 
 ```
