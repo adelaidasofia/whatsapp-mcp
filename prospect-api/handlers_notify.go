@@ -12,27 +12,27 @@ import (
 	"time"
 )
 
-// NotifyRequest is the public surface for /api/notify-adelaida.
+// NotifyRequest is the public surface for /api/notify-owner.
 type NotifyRequest struct {
 	Message             string `json:"message"`
 	Urgency             string `json:"urgency"`
 	DeeplinkToInboxFile string `json:"deeplinkToInboxFile,omitempty"`
 }
 
-// NotifyResponse is the response for /api/notify-adelaida.
+// NotifyResponse is the response for /api/notify-owner.
 type NotifyResponse struct {
 	Delivered   bool   `json:"delivered"`
 	DeliveredAt string `json:"deliveredAt,omitempty"` // ISO8601
 	LatencyMs   int64  `json:"latencyMs"`
 }
 
-// handleNotifyAdelaida serves POST /api/notify-adelaida.
+// handleNotifyOwner serves POST /api/notify-owner.
 //
 // Checks quiet hours and the shared WhatsApp ping budget (10/hr) before
 // sending. When either blocks the send, the message is queued in
 // pending_pings and delivered: false is returned — no error, the caller
 // should treat it as gracefully queued.
-func (s *Server) handleNotifyAdelaida(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleNotifyOwner(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	var req NotifyRequest
 	if err := readJSONBody(r, &req, 4096); err != nil {
@@ -55,7 +55,7 @@ func (s *Server) handleNotifyAdelaida(w http.ResponseWriter, r *http.Request) {
 
 	qh, err := newQuietHoursChecker(s.cfg)
 	if err != nil {
-		log.Printf("notify-adelaida: quiet hours init: %v", err)
+		log.Printf("notify-owner: quiet hours init: %v", err)
 		writeError(w, http.StatusInternalServerError, ErrInternal, "quiet hours config error: "+err.Error(), true)
 		return
 	}
@@ -64,13 +64,13 @@ func (s *Server) handleNotifyAdelaida(w http.ResponseWriter, r *http.Request) {
 	if !qh.ShouldSendNow(req.Urgency, now) {
 		deliverAt := qh.NextWakeTime(now)
 		if err := EnqueuePing(s.presetDB, req.Message, req.Urgency, req.DeeplinkToInboxFile, deliverAt); err != nil {
-			log.Printf("notify-adelaida: enqueue: %v", err)
+			log.Printf("notify-owner: enqueue: %v", err)
 			writeError(w, http.StatusInternalServerError, ErrInternal, "enqueue failed: "+err.Error(), true)
 			return
 		}
 		resp := NotifyResponse{Delivered: false, LatencyMs: time.Since(start).Milliseconds()}
 		s.audit(r.Context(), auditEntry{
-			endpoint:   "/api/notify-adelaida",
+			endpoint:   "/api/notify-owner",
 			params:     map[string]any{"urgency": req.Urgency, "queued": true},
 			result:     "queued-quiet-hours",
 			durationMs: resp.LatencyMs,
@@ -80,9 +80,9 @@ func (s *Server) handleNotifyAdelaida(w http.ResponseWriter, r *http.Request) {
 	}
 
 	budget := &waPingBudget{db: s.presetDB, limitPH: s.cfg.WhatsAppPingsPerHour}
-	ok, err := budget.CheckAndRecordPing("/api/notify-adelaida", req.Urgency)
+	ok, err := budget.CheckAndRecordPing("/api/notify-owner", req.Urgency)
 	if err != nil {
-		log.Printf("notify-adelaida: budget check: %v", err)
+		log.Printf("notify-owner: budget check: %v", err)
 		writeError(w, http.StatusInternalServerError, ErrInternal, "budget check failed: "+err.Error(), true)
 		return
 	}
@@ -91,7 +91,7 @@ func (s *Server) handleNotifyAdelaida(w http.ResponseWriter, r *http.Request) {
 		_ = EnqueuePing(s.presetDB, req.Message, req.Urgency, req.DeeplinkToInboxFile, deliverAt)
 		resp := NotifyResponse{Delivered: false, LatencyMs: time.Since(start).Milliseconds()}
 		s.audit(r.Context(), auditEntry{
-			endpoint:   "/api/notify-adelaida",
+			endpoint:   "/api/notify-owner",
 			params:     map[string]any{"urgency": req.Urgency, "queued": true},
 			result:     "queued-budget-exceeded",
 			durationMs: resp.LatencyMs,
@@ -102,7 +102,7 @@ func (s *Server) handleNotifyAdelaida(w http.ResponseWriter, r *http.Request) {
 
 	deliveredAt, err := s.sendViaBridge(req.Message)
 	if err != nil {
-		log.Printf("notify-adelaida: bridge send: %v", err)
+		log.Printf("notify-owner: bridge send: %v", err)
 		writeError(w, http.StatusBadGateway, ErrInternal, "bridge send failed: "+err.Error(), true)
 		return
 	}
@@ -113,7 +113,7 @@ func (s *Server) handleNotifyAdelaida(w http.ResponseWriter, r *http.Request) {
 		LatencyMs:   time.Since(start).Milliseconds(),
 	}
 	s.audit(r.Context(), auditEntry{
-		endpoint:   "/api/notify-adelaida",
+		endpoint:   "/api/notify-owner",
 		params:     map[string]any{"urgency": req.Urgency, "msgLen": len(req.Message)},
 		result:     "delivered",
 		durationMs: resp.LatencyMs,
@@ -123,7 +123,7 @@ func (s *Server) handleNotifyAdelaida(w http.ResponseWriter, r *http.Request) {
 
 // sendViaBridge delivers text to the user's own WhatsApp JID via the bridge
 // two-step flow: POST /api/sends → POST /api/sends/{id}/confirm.
-// Shared by notify-adelaida and relay-note.
+// Shared by notify-owner and relay-note.
 func (s *Server) sendViaBridge(text string) (string, error) {
 	selfJID, err := s.resolveSelfJID()
 	if err != nil {

@@ -31,7 +31,7 @@ type RelayNoteResponse struct {
 // handleRelayNote serves POST /api/relay-note.
 //
 // Writes an inbox file, optionally updates the CRM (whitelist-enforced),
-// and calls notify-adelaida for normal/high urgency (subject to the shared
+// and calls notify-owner for normal/high urgency (subject to the shared
 // WhatsApp ping budget).
 func (s *Server) handleRelayNote(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
@@ -154,7 +154,7 @@ func (s *Server) handleRelayNote(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Notify for normal/high urgency via notify-adelaida internals.
+	// Notify for normal/high urgency via notify-owner internals.
 	waPinged := false
 	if req.Urgency == "normal" || req.Urgency == "high" {
 		pingMsg := fmt.Sprintf("[%s] %s — %s", strings.ToUpper(req.Urgency), req.GuestName, req.OneLineSummary)

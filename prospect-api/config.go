@@ -44,7 +44,7 @@ type Config struct {
 	// Negotiator playbook path. Required for get-negotiator-terms (Sprint 10).
 	NegotiatorPlaybookPath string
 
-	// whatsapp-bridge HTTP base URL (used by notify-adelaida and relay-note for sends).
+	// whatsapp-bridge HTTP base URL (used by notify-owner and relay-note for sends).
 	BridgeBaseURL string
 
 	// Auth tokens.
@@ -53,7 +53,7 @@ type Config struct {
 
 	// Rate limits.
 	GlobalRateLimitPerMin int // 60 default per spec
-	WhatsAppPingsPerHour  int // 10 default; shared budget across notify-adelaida + relay-note
+	WhatsAppPingsPerHour  int // 10 default; shared budget across notify-owner + relay-note
 
 	// Audit log.
 	AuditLogPath string

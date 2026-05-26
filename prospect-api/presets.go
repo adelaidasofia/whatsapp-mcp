@@ -10,7 +10,7 @@ import (
 	"github.com/google/uuid"
 )
 
-// Preset is a pre-warm record Adelaida vouches for a guest.
+// Preset is a pre-warm record the owner vouches for a guest.
 // When the guest arrives at the concierge, /api/check-preset finds this record
 // and the concierge skips the intro flow.
 type Preset struct {

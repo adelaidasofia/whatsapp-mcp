@@ -10,7 +10,7 @@
 //
 // Phase B (subsequent commits, Sprints 7-10):
 //   - POST /api/get-negotiator-terms
-//   - POST /api/notify-adelaida
+//   - POST /api/notify-owner
 //   - POST /api/relay-note
 //   - POST /api/morning-digest
 //
