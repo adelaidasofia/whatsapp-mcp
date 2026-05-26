@@ -66,7 +66,7 @@ See `SECURITY-PROSPECT.md`. Highlights:
   CRM read/write whitelist, preset + audit DB, two-tier rate limit, server-side
   identity verification on pull-context.
 - Phase B (Sprints 7–10, subsequent commits): `/api/get-negotiator-terms`,
-  `/api/notify-adelaida`, `/api/relay-note`, `/api/morning-digest`.
+  `/api/notify-owner`, `/api/relay-note`, `/api/morning-digest`.
 
 ## Build + run
 
