@@ -1,6 +1,6 @@
 # prospect-api Setup
 
-This service is the public-facing surface that Adelaida's AI Concierge (or any
+This service is the public-facing surface that an AI Concierge (or any
 other consenting consumer) calls to recognize prospects, retrieve verified
 context, and pre-warm guests.
 
@@ -83,8 +83,8 @@ All endpoints take JSON, return JSON, and require `Authorization: Bearer <token>
   silently dropped. Default-safe: only blank fields filled unless
   `forceOverwrite: true`.
 
-- `POST /api/check-preset` — bearer token. Match arriving guest to an
-  Adelaida-vouched preset. Single-use; consuming the match marks the preset
+- `POST /api/check-preset` — bearer token. Match arriving guest to a
+  pre-warmed preset. Single-use; consuming the match marks the preset
   consumed.
 
 - `POST /api/preset` — **admin token** (separate from bearer). Pre-warm a

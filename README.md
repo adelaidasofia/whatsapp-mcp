@@ -180,4 +180,4 @@ WhatsApp is a trademark of Meta Platforms, Inc. This project is an independent o
 
 ---
 
-Built by Adelaida Diaz-Roa. Full install or team version at [diazroa.com](https://diazroa.com).
+Built by Mycelium AI. MIT license.
