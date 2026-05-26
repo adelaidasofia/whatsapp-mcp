@@ -82,7 +82,9 @@ the local-only `whatsapp-bridge`.
 - 60 req/min per token (sliding window) on every endpoint.
 - 5 req/min per phone on lookup (anti-enumeration).
 - Future: shared 10/hour WhatsApp ping budget across `relay-note` and
-  `notify-adelaida` (Sprint 7+8 in Phase B).
+  `notify-owner` (Sprint 7+8 in Phase B). Note: as of 2026-05-03 the budget
+  + quiet-hours gating is disabled for `/api/notify-owner` specifically;
+  see `PHASE-B.md` Sprint 8 implementation notes for the rationale.
 
 ### 6. Audit log
 

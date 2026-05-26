@@ -1,5 +1,50 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed (BREAKING)
+
+- Renamed `/api/notify-adelaida` → `/api/notify-owner` (PR #14). External
+  callers and anchor links to the old name must update.
+
+### Changed
+
+- `/api/notify-owner`: quiet-hours and shared per-hour ping budget gating
+  disabled (PR #15). The concierge real-time activity stream is the
+  primary delivery surface; every guest action delivers immediately.
+  Budget tracking still recorded for observability, non-blocking. Other
+  endpoints (`/api/relay-note`, digest scheduler) keep the original
+  quiet-hours + budget behavior — the exemption is scoped to the
+  dedicated notify endpoint only.
+
+- `sendViaBridge` draft schema corrected (PR #15): `send_type` +
+  `recipient_jid` + `text` (was `jid` + `message`, which 400'd silently
+  and stranded the queue).
+
+- `resolveSelfJID` reads `device_jid` from `/api/status` and strips the
+  trailing `:NN` device-resource suffix before returning the bare JID
+  (PR #15). Required for WhatsApp's "message yourself" flow.
+
+### Added
+
+- `/api/update-crm`: new `mode` parameter (PR #15). `additive` (default)
+  preserves the existing privacy fence — writes only blank fields.
+  `replace_primary` rotates the existing primary email/phone into the
+  historical `emails:` / `phones:` array and sets the new value as
+  primary. Other fields stay additive regardless of mode. Adds optional
+  `guestName` field for audit context and a `Replaced` array in the
+  response listing rotation events.
+
+- `CRMRecord.frontmatterParseErr` fail-closed guard (PR #15). When
+  `yaml.Unmarshal` errors on a CRM file's frontmatter during read,
+  `UpdateCRM` refuses to write rather than re-marshaling an empty or
+  partial map onto a malformed file (which silently nuked every field
+  below the parse error in the old path).
+
+- Sidecar JSONL audit log for primary rotations at
+  `~/.claude/whatsapp-mcp/prospect-api/replace-audit.log` (PR #15),
+  independent of the SQLite `audit_log` table.
+
 ## [0.1.0] — Phase A
 
 Initial scaffold of the prospect-api sibling service.

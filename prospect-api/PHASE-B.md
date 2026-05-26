@@ -14,7 +14,7 @@ The dependency chain runs **10 → 8 → 7 → 9**:
 
 1. **Sprint 10** (`get-negotiator-terms`) — must exist before relay-note,
    because relay-note calls it for negotiable categories.
-2. **Sprint 8** (`notify-adelaida`) — must exist before relay-note, because
+2. **Sprint 8** (`notify-owner`) — must exist before relay-note, because
    relay-note pings via this endpoint when urgency ≥ normal.
 3. **Sprint 7** (`relay-note`) — depends on 10 + 8.
 4. **Sprint 9** (`morning-digest`) — independent of the others; build last.
@@ -54,7 +54,7 @@ The dependency chain runs **10 → 8 → 7 → 9**:
   ```
 - **Side effects:**
   - Writes an inbox file (format below).
-  - For urgency `normal` or `high`: calls `notify-adelaida` internally
+  - For urgency `normal` or `high`: calls `notify-owner` internally
     (subject to the shared WhatsApp ping budget).
   - For urgency `low`: writes the inbox file silently, no ping.
   - Optionally updates the CRM via the existing whitelist path. NEVER
@@ -89,7 +89,7 @@ The dependency chain runs **10 → 8 → 7 → 9**:
      (see Sprint 10). Empty body initially; the concierge appends asker
      response and final disposition over time.
 
-### Sprint 8 — `POST /api/notify-adelaida`
+### Sprint 8 — `POST /api/notify-owner`
 
 - **Auth:** Bearer.
 - **Request:**
@@ -115,7 +115,7 @@ The dependency chain runs **10 → 8 → 7 → 9**:
   the user's own number (configurable via `PROSPECT_SELF_JID` env;
   read from the bridge's `/api/status` if unset).
 - **Shared WhatsApp ping budget:** 10 pings per hour TOTAL across
-  `notify-adelaida` and `relay-note`. Implemented via a sliding window
+  `notify-owner` and `relay-note`. Implemented via a sliding window
   counter in the `wa_pings` table (already declared in `db.go`). Both
   endpoints insert into `wa_pings` after a successful send. Before
   sending, both check `SELECT COUNT(*) FROM wa_pings WHERE ts > now-3600`
@@ -132,6 +132,24 @@ The dependency chain runs **10 → 8 → 7 → 9**:
     otherwise queue with `deliver_at = next start-of-quiet-end`.
   - The vault inbox note (written by relay-note) is unaffected by quiet
     hours; only the WhatsApp ping is delayed.
+
+**Implementation notes (post-ship):**
+
+- Renamed from `/api/notify-adelaida` to `/api/notify-owner` in PR #14
+  (BREAKING). Anchor links to the old name will not resolve.
+- Quiet-hours and shared-budget gating are **disabled** for
+  `/api/notify-owner` as of 2026-05-03 (PR #15). The concierge real-time
+  activity stream is the primary delivery surface; every guest action
+  delivers immediately, no overnight queueing. Budget rows are still
+  written to `wa_pings` for observability but are not blocking.
+  `relay-note` and any future endpoints that ping the owner retain the
+  original quiet-hours + budget behavior — the exemption is scoped to
+  the dedicated notify endpoint only.
+- Bridge `/api/sends` draft schema corrected in PR #15:
+  `send_type` + `recipient_jid` + `text` (was `jid` + `message`, which
+  silently 400'd and stranded the queue). `resolveSelfJID` reads
+  `device_jid` from `/api/status` and strips the trailing `:NN`
+  device-resource suffix.
 
 ### Sprint 9 — `POST /api/morning-digest`
 
@@ -294,8 +312,8 @@ four are shipped, run an end-to-end test:
 2. relay-note calls `get-negotiator-terms`, gets the speaking
    counter-conditions, includes them in the inbox file's
    "Negotiation log" body section.
-3. relay-note calls `notify-adelaida` with a one-line summary.
-4. notify-adelaida checks the shared budget, dispatches via the
+3. relay-note calls `notify-owner` with a one-line summary.
+4. notify-owner checks the shared budget, dispatches via the
    whatsapp-bridge.
 5. The inbox file lands at the expected path.
 6. The user's WhatsApp shows the ping.
