@@ -75,8 +75,8 @@ func (s *Server) registerRoutes() {
 	// Phase B endpoints (Sprints 7-10).
 	s.mux.HandleFunc("POST /api/get-negotiator-terms",
 		withClientIP(s.authBearer(s.rateLimit(s.handleGetNegotiatorTerms))))
-	s.mux.HandleFunc("POST /api/notify-adelaida",
-		withClientIP(s.authBearer(s.rateLimit(s.handleNotifyAdelaida))))
+	s.mux.HandleFunc("POST /api/notify-owner",
+		withClientIP(s.authBearer(s.rateLimit(s.handleNotifyOwner))))
 	s.mux.HandleFunc("POST /api/relay-note",
 		withClientIP(s.authBearer(s.rateLimit(s.handleRelayNote))))
 	s.mux.HandleFunc("POST /api/morning-digest",

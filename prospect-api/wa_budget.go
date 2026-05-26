@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// waPingBudget enforces the shared 10-pings-per-hour cap across notify-adelaida
+// waPingBudget enforces the shared 10-pings-per-hour cap across notify-owner
 // and relay-note. Both endpoints call CheckAndRecordPing before sending.
 //
 // Implementation: sliding-window COUNT(*) over wa_pings WHERE ts > now-3600.
