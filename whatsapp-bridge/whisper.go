@@ -131,7 +131,7 @@ func (t *Transcriber) process(ctx context.Context, workerID int, j transcription
 		return
 	}
 
-	wavPath, err := convertToWav(ctx, oggPath, workDir)
+	wavPath, err := t.convertToWav(ctx, oggPath, workDir)
 	if err != nil {
 		log.Printf("transcriber[%d]: ffmpeg convert failed for %s: %v", workerID, j.MessageID, err)
 		return
@@ -186,6 +186,16 @@ func (t *Transcriber) validateLocalCpp() error {
 	if _, err := os.Stat(t.cfg.WhisperModelPath); err != nil {
 		return fmt.Errorf("model file not found at %s: %w", t.cfg.WhisperModelPath, err)
 	}
+	// ffmpeg is required for every voice note (ogg → 16 kHz mono WAV before
+	// whisper-cpp). Surfaced at startup instead of failing silently per-job:
+	// non-interactive runners (launchd, systemd, supervisord, cron, Docker
+	// without ENV) inherit a stripped PATH and `exec.LookPath("ffmpeg")` fails
+	// even when Homebrew has ffmpeg installed. Set WHATSAPP_FFMPEG_BIN_PATH
+	// to an absolute path (mirrors WHATSAPP_WHISPER_BIN_PATH).
+	ffmpeg := t.ffmpegBin()
+	if _, err := exec.LookPath(ffmpeg); err != nil {
+		return fmt.Errorf("ffmpeg binary %q not found in PATH (install via `brew install ffmpeg` or set WHATSAPP_FFMPEG_BIN_PATH to an absolute path)", ffmpeg)
+	}
 	return nil
 }
 
@@ -194,6 +204,15 @@ func (t *Transcriber) whisperBin() string {
 		return t.cfg.WhisperBinPath
 	}
 	return "whisper-cli"
+}
+
+// ffmpegBin returns the ffmpeg executable to invoke for voice-note conversion.
+// Mirrors whisperBin: env-override → bare name (resolved via PATH).
+func (t *Transcriber) ffmpegBin() string {
+	if t.cfg.FFmpegBinPath != "" {
+		return t.cfg.FFmpegBinPath
+	}
+	return "ffmpeg"
 }
 
 // transcribeLocalCpp invokes whisper-cli and reads the resulting .json transcript file.
@@ -255,8 +274,11 @@ func (t *Transcriber) transcribeOpenAI(_ context.Context, _ string) (string, err
 // --- ffmpeg helper ----------------------------------------------------------
 
 // convertToWav normalizes any audio to 16 kHz mono 16-bit PCM WAV, the format
-// whisper.cpp is tuned for. Returns the output path.
-func convertToWav(ctx context.Context, inputPath, workDir string) (string, error) {
+// whisper.cpp is tuned for. Returns the output path. The ffmpeg binary is
+// resolved via t.ffmpegBin() so non-interactive runners (launchd, systemd,
+// supervisord, cron) can set WHATSAPP_FFMPEG_BIN_PATH to an absolute path
+// when the inherited PATH does not include the Homebrew/system ffmpeg dir.
+func (t *Transcriber) convertToWav(ctx context.Context, inputPath, workDir string) (string, error) {
 	outPath := filepath.Join(workDir, "audio.wav")
 	args := []string{
 		"-y",
@@ -268,7 +290,7 @@ func convertToWav(ctx context.Context, inputPath, workDir string) (string, error
 		"-c:a", "pcm_s16le",
 		outPath,
 	}
-	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+	cmd := exec.CommandContext(ctx, t.ffmpegBin(), args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("ffmpeg: %w (stderr: %s)", err, strings.TrimSpace(string(out)))

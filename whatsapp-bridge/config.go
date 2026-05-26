@@ -30,6 +30,7 @@ type Config struct {
 	WhisperBinPath   string
 	WhisperModelPath string
 	WhisperAPIKey    string
+	FFmpegBinPath    string
 
 	ScrubPromptInjection bool
 	AuditLog             bool
@@ -75,6 +76,7 @@ func LoadConfig() (*Config, error) {
 		WhisperBinPath:       getenv("WHATSAPP_WHISPER_BIN_PATH", ""),
 		WhisperModelPath:     expandPath(getenv("WHATSAPP_WHISPER_MODEL_PATH", ""), home),
 		WhisperAPIKey:        getenv("WHATSAPP_WHISPER_API_KEY", ""),
+		FFmpegBinPath:        getenv("WHATSAPP_FFMPEG_BIN_PATH", ""),
 		ScrubPromptInjection: getenvBool("WHATSAPP_SCRUB_PROMPT_INJECTION", true),
 		AuditLog:             getenvBool("WHATSAPP_AUDIT_LOG", true),
 		AuditLogPath:         expandPath(getenv("WHATSAPP_AUDIT_LOG_PATH", filepath.Join(defaultRoot, "audit.log")), home),

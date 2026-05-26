@@ -54,6 +54,18 @@ If history still looks split, run `/healthcheck` and inspect the `alias_coverage
 - For the Whisper model: download manually from the [whisper.cpp model repo](https://huggingface.co/ggerganov/whisper.cpp/tree/main) into `models/`. Default expected file is `models/ggml-large-v3.bin`.
 - For FFmpeg on macOS: `brew install ffmpeg`. On Linux: `sudo apt-get install ffmpeg`.
 
+## Voice notes silently fail under launchd / systemd / supervisord / cron / Docker
+
+**Symptom.** Bridge starts cleanly. Interactive `bash` invocations transcribe voice notes fine. When the same bridge runs under launchd / systemd / supervisord / cron / Docker, every voice note logs `ffmpeg convert failed for <id>: ffmpeg: exec: "ffmpeg": executable file not found in $PATH` and the message ships with no transcript.
+
+**Cause.** Non-interactive runners inherit a stripped `PATH` (launchd's default is `/usr/bin:/bin:/usr/sbin:/sbin`) that excludes `/opt/homebrew/bin` and `/usr/local/bin`. Go's `exec.Command("ffmpeg", ...)` resolves the binary via `$PATH` so the bare-name lookup fails even when Homebrew has ffmpeg installed at `/opt/homebrew/bin/ffmpeg`. `whisper-cli` resolution is unaffected because it accepts an absolute-path override via `WHATSAPP_WHISPER_BIN_PATH`; the same gap previously existed for ffmpeg.
+
+**Fix.** Choose one:
+- **Absolute path (recommended for non-interactive runners).** Set `WHATSAPP_FFMPEG_BIN_PATH` in the service environment to the absolute path. On Apple Silicon Homebrew: `WHATSAPP_FFMPEG_BIN_PATH=/opt/homebrew/bin/ffmpeg`. On Intel Homebrew: `WHATSAPP_FFMPEG_BIN_PATH=/usr/local/bin/ffmpeg`. On Linux: `WHATSAPP_FFMPEG_BIN_PATH=/usr/bin/ffmpeg` (output of `command -v ffmpeg`).
+- **Extend PATH in the wrapper.** For a bash launchd runner script, export the full PATH before `exec` the bridge: `export PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"`.
+
+The bridge now validates ffmpeg reachability at startup (`validateLocalCpp`), so a missing ffmpeg fails the bridge fast with a clear error instead of failing silently per voice-note job.
+
 ## SQLCipher Keychain key lost — DB unreadable
 
 **Symptom.** Bridge fails to start with `ping db (wrong key?)` after a Keychain reset, OS reinstall, or user-folder migration.
