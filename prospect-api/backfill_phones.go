@@ -328,7 +328,7 @@ func applyOnePhone(crm *CRMStore, c backfillCandidate) int {
 		// E.164 normalize: stored phones are digits only in messages; prepend + for CRM.
 		phone = "+" + phone
 	}
-	written, err := crm.UpdateCRM(c.CRMFilePath, CRMUpdates{Phone: &phone}, false)
+	written, _, err := crm.UpdateCRM(c.CRMFilePath, CRMUpdates{Phone: &phone}, false, UpdateModeAdditive)
 	if err != nil {
 		log.Printf("apply: update %s: %v", c.CRMFilePath, err)
 		return 0

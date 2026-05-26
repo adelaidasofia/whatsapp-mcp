@@ -146,7 +146,7 @@ func (s *Server) handleRelayNote(w http.ResponseWriter, r *http.Request) {
 			p := req.GuestPhone
 			updates.Phone = &p
 		}
-		written, err := s.crm.UpdateCRM(crmRecord.FilePath, updates, false)
+		written, _, err := s.crm.UpdateCRM(crmRecord.FilePath, updates, false, UpdateModeAdditive)
 		if err != nil {
 			log.Printf("relay-note: crm update: %v", err)
 		} else {

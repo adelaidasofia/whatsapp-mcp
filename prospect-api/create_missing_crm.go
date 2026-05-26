@@ -688,7 +688,7 @@ func RunCreateMissingCRM(ctx context.Context, cfg *Config, messageDB *sql.DB, cr
 				if d := act.Contact.lastInteractionDate(); d != "" {
 					updates.LastInteraction = &d
 				}
-				written, err := crm.UpdateCRM(act.CRMMatchFilePath, updates, false)
+				written, _, err := crm.UpdateCRM(act.CRMMatchFilePath, updates, false, UpdateModeAdditive)
 				if err != nil {
 					log.Printf("backfill %s → %s: %v", phone, act.CRMMatchFile, err)
 					backfillErrors++

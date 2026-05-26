@@ -17,6 +17,8 @@ audit.log.*
 whatsapp-bridge/whatsapp-bridge
 whatsapp-bridge/bin/
 whatsapp-bridge/vendor/
+prospect-api/prospect-api
+prospect-api/bin/
 
 # Python
 __pycache__/
@@ -54,5 +56,6 @@ bridge-stderr.log
 prospect-api/BRIDGE-SPEC-DELTA-*.md
 prospect-api/Negotiator Playbook.md
 prospect-api/Negotiator Playbook *.md
+prospect-api/named-tunnel-cutover.sh
 # Generated MCP bundle (uploaded to GitHub Releases, not tracked in git)
 *.mcpb
