@@ -53,51 +53,22 @@ func (s *Server) handleNotifyOwner(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	qh, err := newQuietHoursChecker(s.cfg)
-	if err != nil {
-		log.Printf("notify-owner: quiet hours init: %v", err)
-		writeError(w, http.StatusInternalServerError, ErrInternal, "quiet hours config error: "+err.Error(), true)
-		return
-	}
-
-	now := time.Now()
-	if !qh.ShouldSendNow(req.Urgency, now) {
-		deliverAt := qh.NextWakeTime(now)
-		if err := EnqueuePing(s.presetDB, req.Message, req.Urgency, req.DeeplinkToInboxFile, deliverAt); err != nil {
-			log.Printf("notify-owner: enqueue: %v", err)
-			writeError(w, http.StatusInternalServerError, ErrInternal, "enqueue failed: "+err.Error(), true)
-			return
-		}
-		resp := NotifyResponse{Delivered: false, LatencyMs: time.Since(start).Milliseconds()}
-		s.audit(r.Context(), auditEntry{
-			endpoint:   "/api/notify-owner",
-			params:     map[string]any{"urgency": req.Urgency, "queued": true},
-			result:     "queued-quiet-hours",
-			durationMs: resp.LatencyMs,
-		})
-		writeJSON(w, http.StatusOK, resp)
-		return
-	}
+	// Quiet hours AND budget intentionally DISABLED for /api/notify-owner
+	// (codified 2026-05-03 by the owner: "I don't want quiet hours, send right
+	// away always" + "always the best of the best, never put off for later
+	// what we can do now"). The concierge real-time activity stream is the
+	// primary delivery surface for this endpoint — every guest action lands
+	// in WhatsApp as it happens, no rate-limit, no overnight queueing.
+	// Other prospect-api endpoints that ping the owner (digest scheduler,
+	// etc.) keep their own quiet-hours and budget behavior — this exemption
+	// is scoped to /api/notify-owner only. Budget tracking is still
+	// recorded for observability (so we can see traffic shape over time)
+	// but the response no longer gates on it.
+	_ = start // keep `start` reachable for latency calc below
 
 	budget := &waPingBudget{db: s.presetDB, limitPH: s.cfg.WhatsAppPingsPerHour}
-	ok, err := budget.CheckAndRecordPing("/api/notify-owner", req.Urgency)
-	if err != nil {
-		log.Printf("notify-owner: budget check: %v", err)
-		writeError(w, http.StatusInternalServerError, ErrInternal, "budget check failed: "+err.Error(), true)
-		return
-	}
-	if !ok {
-		deliverAt := now.Add(time.Hour).Truncate(time.Hour)
-		_ = EnqueuePing(s.presetDB, req.Message, req.Urgency, req.DeeplinkToInboxFile, deliverAt)
-		resp := NotifyResponse{Delivered: false, LatencyMs: time.Since(start).Milliseconds()}
-		s.audit(r.Context(), auditEntry{
-			endpoint:   "/api/notify-owner",
-			params:     map[string]any{"urgency": req.Urgency, "queued": true},
-			result:     "queued-budget-exceeded",
-			durationMs: resp.LatencyMs,
-		})
-		writeJSON(w, http.StatusOK, resp)
-		return
+	if _, err := budget.CheckAndRecordPing("/api/notify-owner", req.Urgency); err != nil {
+		log.Printf("notify-owner: budget record (non-blocking): %v", err)
 	}
 
 	deliveredAt, err := s.sendViaBridge(req.Message)
@@ -130,9 +101,16 @@ func (s *Server) sendViaBridge(text string) (string, error) {
 		return "", fmt.Errorf("resolve self JID: %w", err)
 	}
 
+	// WhatsApp bridge /api/sends draft schema (whatsapp-bridge/sends.go
+	// `createDraftRequest`): requires `send_type` ("text" | "reply_quote"
+	// | "reaction"), `recipient_jid`, and `text` for text sends. The
+	// prospect-api v1 schema was off in three field names — fixed 2026-05-03
+	// after the queue stuck on successive 400s ("jid" → "recipient_jid",
+	// "message" → "text", missing "send_type": "text").
 	draftPayload, _ := json.Marshal(map[string]string{
-		"jid":     selfJID,
-		"message": text,
+		"send_type":     "text",
+		"recipient_jid": selfJID,
+		"text":          text,
 	})
 	draftBody, err := s.bridgeRequest("POST", s.cfg.BridgeBaseURL+"/api/sends", draftPayload)
 	if err != nil {
@@ -155,6 +133,13 @@ func (s *Server) sendViaBridge(text string) (string, error) {
 
 // resolveSelfJID returns the user's own WhatsApp JID. Reads PROSPECT_SELF_JID
 // from environment first; falls back to /api/status on the bridge.
+//
+// Bridge /api/status returns the full device JID under `device_jid`, e.g.
+// "12145180889:58@s.whatsapp.net". The trailing `:NN` is a device-specific
+// resource ID that breaks WhatsApp's "message yourself" feature — strip it
+// to the bare JID before returning. Codified 2026-05-03 after the notify
+// pipeline shipped and queued pings were stuck on the wrong JSON field
+// name (was `jid`, actual field is `device_jid`).
 func (s *Server) resolveSelfJID() (string, error) {
 	if jid := os.Getenv("PROSPECT_SELF_JID"); jid != "" {
 		return jid, nil
@@ -164,12 +149,20 @@ func (s *Server) resolveSelfJID() (string, error) {
 		return "", fmt.Errorf("bridge status: %w", err)
 	}
 	var status struct {
-		JID string `json:"jid"`
+		DeviceJID string `json:"device_jid"`
 	}
-	if err := json.Unmarshal(statusBody, &status); err != nil || status.JID == "" {
-		return "", fmt.Errorf("bridge status jid missing (body: %s)", string(statusBody))
+	if err := json.Unmarshal(statusBody, &status); err != nil || status.DeviceJID == "" {
+		return "", fmt.Errorf("bridge status device_jid missing (body: %s)", string(statusBody))
 	}
-	return status.JID, nil
+	// Strip device-resource suffix (the part after ":") to get the bare
+	// JID that "message yourself" expects.
+	jid := status.DeviceJID
+	if at := strings.Index(jid, "@"); at != -1 {
+		if colon := strings.Index(jid[:at], ":"); colon != -1 {
+			jid = jid[:colon] + jid[at:]
+		}
+	}
+	return jid, nil
 }
 
 // bridgeRequest sends an authenticated HTTP request to the whatsapp-bridge and
