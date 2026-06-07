@@ -1,0 +1,36 @@
+name: shellcheck
+
+# shellcheck static analysis over every tracked *.sh — the portability / quoting /
+# correctness class that `bash -n` cannot catch. whatsapp-mcp ships setup scripts
+# (scripts/check_prerequisites.sh) users run on macOS AND Linux when bringing up the
+# bridge, so a GNU-vs-BSD or quoting bug breaks setup silently. scripts/shellcheck.sh
+# is the SINGLE source of truth — `make shellcheck` runs the SAME script locally so
+# the laptop gate and CI cannot drift. Severity is error + warning (info/style
+# excluded) to match the real ship/hold boundary. No untrusted user input is
+# referenced in any run: step.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  shellcheck:
+    name: shellcheck (.sh, -S warning)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - name: ensure shellcheck present
+        run: command -v shellcheck >/dev/null || { sudo apt-get update && sudo apt-get install -y shellcheck; }
+      - name: run the canonical shellcheck gate
+        run: bash scripts/shellcheck.sh
