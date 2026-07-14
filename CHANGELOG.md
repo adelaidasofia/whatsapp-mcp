@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- `scripts/check_prerequisites.sh` no longer hard-fails on `ffmpeg` or the `sqlcipher` CLI: transcription is off by default (ffmpeg is only needed for `local-cpp`), and the bridge compiles its own SQLCipher (the CLI was never a runtime requirement — the checker itself was a leftover stuck-point). Both downgraded to warnings with accurate guidance, matching `check_prerequisites.ps1`.
+- The bridge logs one line at startup when transcription is off, so users upgrading from the old `local-cpp` default see the behavior change instead of losing transcripts silently.
+- README manual-install block aligned with v0.2.0 reality: prebuilt binaries first, FFmpeg/whisper listed as optional, pairing-code alternative mentioned.
+
+### Removed
+
+- Tracked `whatsapp-mcp.mcpb` at the repo root — it was a stale v0.1.x build that nothing referenced; the canonical bundle is the release asset (`releases/latest/download/whatsapp-mcp.mcpb`), rebuilt per release.
+
+## [0.2.0] - 2026-07-13
+
 ### Added
 
 - **Windows support, end to end (MYC-3033).** Native Windows Credential Manager storage for the SQLCipher key (direct advapi32 syscalls, no new dependency) with a real round-trip test on the windows CI runner; the long-documented `WHATSAPP_DB_KEY` env override is now actually implemented (it previously existed only in error messages and docs); Windows-safe terminal QR rendering (ANSI block fallback outside Windows Terminal, drawn through go-colorable so legacy conhost translates it); `scripts/check_prerequisites.ps1`; SETUP.md rewritten with per-OS commands (PowerShell/winget/MSYS2 UCRT64, correct `.exe` paths, `%USERPROFILE%` layouts); `.mcpb` manifest `platform_overrides` launches via `python` on win32 instead of the usually-absent `python3`; the install-ping hook falls back `python3 → py -3 → python`.
