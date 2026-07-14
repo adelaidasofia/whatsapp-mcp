@@ -7,7 +7,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 )
@@ -40,6 +43,13 @@ func NewServer(cfg *Config, db *sql.DB, bridge *Bridge, backfiller *TranscriptBa
 func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /healthcheck", s.handleHealthcheck)
 	s.mux.HandleFunc("GET /api/status", s.handleStatus)
+
+	// Headless auth surface: lets a supervisor (Mycelium Studio, a wrapper
+	// script, curl) drive first-run pairing and post-logout recovery without
+	// scraping terminal QR art. All additive; the terminal QR keeps working.
+	s.mux.HandleFunc("GET /api/auth/qr", s.handleAuthQR)
+	s.mux.HandleFunc("POST /api/auth/pair-phone", s.handlePairPhone)
+	s.mux.HandleFunc("POST /api/auth/reconnect", s.handleAuthReconnect)
 
 	s.mux.HandleFunc("GET /api/chats", s.handleListChats)
 	s.mux.HandleFunc("GET /api/messages", s.handleListMessages)
@@ -107,11 +117,30 @@ func (s *Server) handleRequestHistory(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) ListenAndServe(ctx context.Context) error {
-	err := s.server.ListenAndServe()
+	ln, err := net.Listen("tcp", s.server.Addr)
+	if err != nil {
+		return err
+	}
+	// Announce the bound port for supervisors. With WHATSAPP_BRIDGE_PORT=0
+	// the OS picks a free port (multi-instance installs); the one greppable
+	// stdout line + the sidecar file are how they learn it.
+	port := ln.Addr().(*net.TCPAddr).Port
+	log.Printf("BRIDGE_LISTENING port=%d", port)
+	s.writePortFile(port)
+	err = s.server.Serve(ln)
 	if err == http.ErrServerClosed {
 		return nil
 	}
 	return err
+}
+
+// writePortFile drops the bound port next to the database so a supervisor
+// can discover it without parsing stdout. Best-effort; never fatal.
+func (s *Server) writePortFile(port int) {
+	path := filepath.Join(filepath.Dir(s.cfg.DBPath), "bridge.port")
+	if err := os.WriteFile(path, []byte(strconv.Itoa(port)), 0o600); err != nil {
+		log.Printf("port file write failed (non-fatal): %v", err)
+	}
 }
 
 func (s *Server) Shutdown() error {
@@ -217,20 +246,104 @@ type statusResponse struct {
 	VaultCRMEnabled   bool   `json:"vault_crm_enabled"`
 	CaptureCalls      bool   `json:"capture_calls"`
 	AutoDownloadMedia bool   `json:"auto_download_media"`
+
+	// Auth lifecycle (additive; see auth.go). auth_state values:
+	// unauthenticated | qr_pending | pairing_pending | paired | logged_out | timed_out
+	AuthState          string `json:"auth_state"`
+	QRExpiresAt        int64  `json:"qr_expires_at,omitempty"`
+	PairingCodePending bool   `json:"pairing_code_pending,omitempty"`
+	LoggedOutReason    string `json:"logged_out_reason,omitempty"`
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	connected, authed, deviceJID, lastSync := s.bridge.Status()
-	writeJSON(w, http.StatusOK, statusResponse{
-		Connected:         connected,
-		Authenticated:     authed,
-		DeviceJID:         deviceJID,
-		LastSyncTime:      lastSync,
-		WhisperBackend:    s.cfg.WhisperBackend,
-		VaultCRMEnabled:   s.cfg.VaultCRMPath != "",
-		CaptureCalls:      s.cfg.CaptureCalls,
-		AutoDownloadMedia: s.cfg.AutoDownloadMedia,
+	snap := s.bridge.AuthSnapshot()
+	resp := statusResponse{
+		Connected:          connected,
+		Authenticated:      authed,
+		DeviceJID:          deviceJID,
+		LastSyncTime:       lastSync,
+		WhisperBackend:     s.cfg.WhisperBackend,
+		VaultCRMEnabled:    s.cfg.VaultCRMPath != "",
+		CaptureCalls:       s.cfg.CaptureCalls,
+		AutoDownloadMedia:  s.cfg.AutoDownloadMedia,
+		AuthState:          string(snap.State),
+		PairingCodePending: snap.PairingCode != "",
+		LoggedOutReason:    snap.LoggedOutReason,
+	}
+	if !snap.QRExpiresAt.IsZero() && snap.QRCode != "" {
+		resp.QRExpiresAt = snap.QRExpiresAt.Unix()
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// bridgeStateBrief rides along on read responses so a consumer can tell
+// live data from a stale cache: the read endpoints serve SQLite even when
+// the WhatsApp session is logged out, which used to be indistinguishable
+// from a healthy sync.
+type bridgeStateBrief struct {
+	Connected     bool   `json:"connected"`
+	Authenticated bool   `json:"authenticated"`
+	AuthState     string `json:"auth_state"`
+}
+
+func (s *Server) currentBridgeState() *bridgeStateBrief {
+	connected, authed, _, _ := s.bridge.Status()
+	snap := s.bridge.AuthSnapshot()
+	return &bridgeStateBrief{Connected: connected, Authenticated: authed, AuthState: string(snap.State)}
+}
+
+func (s *Server) handleAuthQR(w http.ResponseWriter, r *http.Request) {
+	snap := s.bridge.AuthSnapshot()
+	if snap.QRCode == "" {
+		writeJSON(w, http.StatusConflict, errorResponse{
+			Error:   "no_active_qr_code",
+			Details: fmt.Sprintf("auth_state is %q; POST /api/auth/reconnect to start pairing", snap.State),
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"qr_code":    snap.QRCode,
+		"expires_at": snap.QRExpiresAt.Unix(),
+		"state":      string(snap.State),
 	})
+}
+
+func (s *Server) handlePairPhone(w http.ResponseWriter, r *http.Request) {
+	type req struct {
+		PhoneNumber string `json:"phone_number"`
+	}
+	var body req
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<12)).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid JSON body"})
+		return
+	}
+	if body.PhoneNumber == "" {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "phone_number required", Details: "international format, e.g. +15551234567"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	code, err := s.bridge.RequestPairingCode(ctx, body.PhoneNumber)
+	if err != nil {
+		writeJSON(w, http.StatusConflict, errorResponse{Error: "pairing_code_unavailable", Details: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"pairing_code": code,
+		"formatted":    FormatPairingCode(code),
+		"state":        string(AuthStatePairingPending),
+		"hint":         "On the phone: WhatsApp > Settings > Linked Devices > Link a Device > 'Link with phone number instead', then type the code. Works on Android and iOS.",
+	})
+}
+
+func (s *Server) handleAuthReconnect(w http.ResponseWriter, r *http.Request) {
+	snap, err := s.bridge.Reconnect(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, errorResponse{Error: "reconnect_failed", Details: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"auth_state": string(snap.State)})
 }
 
 type chatRow struct {
@@ -243,8 +356,9 @@ type chatRow struct {
 }
 
 type chatListResponse struct {
-	Chats []chatRow `json:"chats"`
-	Count int       `json:"count"`
+	Chats       []chatRow         `json:"chats"`
+	Count       int               `json:"count"`
+	BridgeState *bridgeStateBrief `json:"_bridge_state,omitempty"`
 }
 
 func (s *Server) handleListChats(w http.ResponseWriter, r *http.Request) {
@@ -281,6 +395,7 @@ func (s *Server) handleListChats(w http.ResponseWriter, r *http.Request) {
 		out.Chats = append(out.Chats, c)
 	}
 	out.Count = len(out.Chats)
+	out.BridgeState = s.currentBridgeState()
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -298,10 +413,11 @@ type messageRow struct {
 }
 
 type messageListResponse struct {
-	Messages    []messageRow `json:"messages"`
-	Count       int          `json:"count"`
-	Chat        *chatRow     `json:"chat,omitempty"`
-	MergedJIDs  []string     `json:"merged_jids,omitempty"`
+	Messages    []messageRow      `json:"messages"`
+	Count       int               `json:"count"`
+	Chat        *chatRow          `json:"chat,omitempty"`
+	MergedJIDs  []string          `json:"merged_jids,omitempty"`
+	BridgeState *bridgeStateBrief `json:"_bridge_state,omitempty"`
 }
 
 func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
@@ -379,6 +495,7 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 	if len(allJIDs) > 1 {
 		out.MergedJIDs = allJIDs
 	}
+	out.BridgeState = s.currentBridgeState()
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -393,8 +510,9 @@ type contactRow struct {
 }
 
 type contactListResponse struct {
-	Contacts []contactRow `json:"contacts"`
-	Count    int          `json:"count"`
+	Contacts    []contactRow      `json:"contacts"`
+	Count       int               `json:"count"`
+	BridgeState *bridgeStateBrief `json:"_bridge_state,omitempty"`
 }
 
 func (s *Server) handleSearchContacts(w http.ResponseWriter, r *http.Request) {
@@ -480,6 +598,7 @@ func (s *Server) handleSearchContacts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	out.Count = len(out.Contacts)
+	out.BridgeState = s.currentBridgeState()
 	writeJSON(w, http.StatusOK, out)
 }
 

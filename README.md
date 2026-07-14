@@ -26,7 +26,7 @@ The most-starred WhatsApp MCP (`lharries/whatsapp-mcp`, 5.6K stars) is the archi
 | | Canonical | This implementation |
 |---|---|---|
 | Last shipped | July 2025 | Active |
-| DB encryption | Plain SQLite | SQLCipher with key in macOS Keychain |
+| DB encryption | Plain SQLite | SQLCipher with key in the platform secret store (macOS Keychain / Windows Credential Manager / libsecret) |
 | Prompt-injection scrubber | None | Every inbound message |
 | Send safety | Fires immediately | Mandatory `confirm_send` between draft and delivery |
 | Audit log | None | Every tool call, 30-day retention |
@@ -54,7 +54,7 @@ Everything runs locally on your machine. No cloud sync. No telemetry. Optional O
 
 Two components, both local:
 
-- **`whatsapp-bridge/`** (Go). Binds to 127.0.0.1 only. Wraps `whatsmeow` for the WhatsApp Web multidevice protocol. Owns SQLite persistence with SQLCipher encryption. Handles QR and pairing-code auth, media up/download, session recovery from `StreamReplaced` conflicts, call history capture. Exposes a REST API the Python MCP layer consumes.
+- **`whatsapp-bridge/`** (Go). Binds to 127.0.0.1 only. Wraps `whatsmeow` for the WhatsApp Web multidevice protocol. Owns SQLite persistence with SQLCipher encryption. Handles QR and pairing-code auth (live-refreshing terminal QR with Windows-safe rendering, plus a headless auth API — `GET /api/auth/qr`, `POST /api/auth/pair-phone`, `POST /api/auth/reconnect` — so a GUI or supervisor can drive pairing without a terminal), media up/download, session recovery from `StreamReplaced` conflicts, call history capture. Exposes a REST API the Python MCP layer consumes.
 - **`whatsapp-mcp-server/`** (Python, FastMCP). Consumes the Go bridge REST API. Exposes 11 MCP tools to Claude: full read surface (chats, messages, contacts), accent-insensitive search, presence (typing, online, mark-read), and text-send + reactions + reply-quotes with mandatory `confirm_send`. Runs via `uv` and stdio transport.
 
 ## Install
@@ -93,12 +93,13 @@ Key variables:
 | `WHATSAPP_DB_PATH` | `$HOME/.claude/whatsapp-mcp/store/messages.db` | Encrypted SQLite database |
 | `WHATSAPP_MEDIA_PATH` | `$HOME/.claude/whatsapp-mcp/media/` | Media file storage |
 | `WHATSAPP_VAULT_CRM_PATH` | empty | Absolute path to your vault CRM folder for auto-injection (e.g., Obsidian `👤 CRM/`). When unset, CRM injection is disabled. |
-| `WHATSAPP_WHISPER_BACKEND` | `local-cpp` | `local-cpp` (private) or `openai-api` (opt-in) |
+| `WHATSAPP_WHISPER_BACKEND` | `off` | `off` (zero-config boot), `local-cpp` (private, needs a whisper model), or `openai-api` (opt-in) |
 | `WHATSAPP_WHISPER_API_KEY` | empty | Required only when backend is `openai-api` |
 | `WHATSAPP_WHISPER_MODEL` | `large-v3` | whisper.cpp model name |
 | `WHATSAPP_SCRUB_PROMPT_INJECTION` | `true` | Strip known prompt-injection patterns from incoming messages before Claude sees them |
 | `WHATSAPP_AUDIT_LOG` | `true` | Log every tool call to `audit.log` |
-| `WHATSAPP_ENCRYPT_DB` | `true` | Enable SQLCipher DB encryption with key from macOS Keychain |
+| `WHATSAPP_ENCRYPT_DB` | `true` | Enable SQLCipher DB encryption; key in the platform secret store (macOS Keychain / Windows Credential Manager / libsecret) |
+| `WHATSAPP_DB_KEY` | empty | Explicit 64-hex-char SQLCipher key override for headless/CI/custom secret managers (skips the platform store) |
 
 ## Security
 
@@ -107,7 +108,7 @@ This MCP is the highest-trust component in your Claude stack because every Whats
 Short version:
 
 - Bridge binds to `127.0.0.1` only, never `0.0.0.0`
-- SQLite encrypted at rest with SQLCipher; key stored in macOS Keychain
+- SQLite encrypted at rest with SQLCipher; key stored in the platform secret store (macOS Keychain / Windows Credential Manager / libsecret), with an explicit `WHATSAPP_DB_KEY` escape hatch
 - Every tool call logged to `audit.log` with 30-day retention
 - Send tools require an explicit `confirm_send` step between draft and delivery
 - Incoming message text passes through a prompt-injection scrubber before Claude sees it
@@ -118,7 +119,7 @@ Short version:
 
 v0.1.0, actively maintained.
 
-Shipped: QR + pairing-code auth, full read surface (chats, messages, contacts), accent-insensitive NFD-normalized search, LID alias resolution with backfill migration for legacy threads, Baileys-store import for one-shot history migration, vault-format markdown export, local `whisper.cpp` voice transcription, presence (typing, online, mark-read), text-send with mandatory `confirm_send`, reactions, reply-quotes, prompt-injection scrubber, SQLCipher-encrypted persistence with macOS Keychain key handling, audit log, CI security gates.
+Shipped: live-refreshing QR (in-place redraw on rotation, Windows-safe rendering, auto fresh batch on expiry) + pairing-code auth (typed 8-char code, Android + iOS) + headless auth API for supervisors, full read surface (chats, messages, contacts), accent-insensitive NFD-normalized search, LID alias resolution with backfill migration for legacy threads, Baileys-store import for one-shot history migration, vault-format markdown export, local `whisper.cpp` voice transcription, presence (typing, online, mark-read), text-send with mandatory `confirm_send`, reactions, reply-quotes, prompt-injection scrubber, SQLCipher-encrypted persistence with macOS Keychain key handling, audit log, CI security gates.
 
 Not yet shipped: media-send (image, document), audio-message-send (FFmpeg-Opus path), group broadcast helpers.
 

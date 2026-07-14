@@ -15,6 +15,8 @@ Known operational pain points and how to recover. Each entry: symptom → cause 
 - Update WhatsApp on your phone to the latest version.
 - Put your phone on the same network as the bridge for the pairing step (you can switch back after).
 - If you previously paired this device, delete the `store/` directory before re-running the bridge. `store/` contains the persistent multidevice session; pairing skips when one already exists.
+- The QR refreshes in place every ~20 s and the bridge auto-requests a fresh batch when one expires — always scan the code currently on screen. (`pair: timeout` no longer kills the process.)
+- **Windows: QR renders as garbage characters.** Legacy consoles mis-render the compact half-block glyphs under OEM codepages; the bridge already falls back to ANSI block rendering outside Windows Terminal. If it still looks wrong, use [Windows Terminal](https://aka.ms/terminal) — or skip the QR entirely: `.\bin\whatsapp-bridge.exe --pair-phone +15551234567` prints a typed code (phone side: WhatsApp › Linked Devices › Link a Device › "Link with phone number instead").
 
 ## "StreamReplaced" disconnect / bridge logs out
 
@@ -44,13 +46,14 @@ If history still looks split, run `/healthcheck` and inspect the `alias_coverage
 **Symptom.** A voice note arrives, `list_messages` shows the message but the `voice_note_transcript` field is empty.
 
 **Cause.** One of:
+0. Transcription is simply off — `WHATSAPP_WHISPER_BACKEND` defaults to `off` so fresh installs boot with zero downloads. Set it to `local-cpp` (plus a model) or `openai-api` (plus a key) to enable. Media keys are persisted either way, so recent voice notes backfill automatically once you enable a backend.
 1. `whisper.cpp` model missing (`models/ggml-large-v3.bin` not downloaded).
 2. FFmpeg not in `PATH` (whisper needs it to decode WhatsApp's `.ogg` Opus encoding).
 3. The bridge ran out of disk space and aborted the transcription.
 4. `WHATSAPP_WHISPER_BACKEND=openai-api` set but `WHATSAPP_WHISPER_API_KEY` missing.
 
 **Fix.**
-- `bash scripts/check_prerequisites.sh` runs all the checks (Go, Python, FFmpeg, SQLCipher, uv, whisper.cpp). It will tell you exactly which one is missing.
+- `bash scripts/check_prerequisites.sh` runs all the checks (Go, Python, FFmpeg, SQLCipher, uv, whisper.cpp). Windows: `powershell -ExecutionPolicy ByPass -File scripts\check_prerequisites.ps1`. It will tell you exactly which one is missing.
 - For the Whisper model: download manually from the [whisper.cpp model repo](https://huggingface.co/ggerganov/whisper.cpp/tree/main) into `models/`. Default expected file is `models/ggml-large-v3.bin`.
 - For FFmpeg on macOS: `brew install ffmpeg`. On Linux: `sudo apt-get install ffmpeg`.
 
@@ -63,19 +66,29 @@ If history still looks split, run `/healthcheck` and inspect the `alias_coverage
 **Fix.** Choose one:
 - **Absolute path (recommended for non-interactive runners).** Set `WHATSAPP_FFMPEG_BIN_PATH` in the service environment to the absolute path. On Apple Silicon Homebrew: `WHATSAPP_FFMPEG_BIN_PATH=/opt/homebrew/bin/ffmpeg`. On Intel Homebrew: `WHATSAPP_FFMPEG_BIN_PATH=/usr/local/bin/ffmpeg`. On Linux: `WHATSAPP_FFMPEG_BIN_PATH=/usr/bin/ffmpeg` (output of `command -v ffmpeg`).
 - **Extend PATH in the wrapper.** For a bash launchd runner script, export the full PATH before `exec` the bridge: `export PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"`.
+- **Windows equivalent.** Task Scheduler tasks ("Run whether user is logged on or not") and services get the same stripped-environment behavior — set `WHATSAPP_FFMPEG_BIN_PATH` to the absolute `ffmpeg.exe` path there too.
 
 The bridge now validates ffmpeg reachability at startup (`validateLocalCpp`), so a missing ffmpeg fails the bridge fast with a clear error instead of failing silently per voice-note job.
 
-## SQLCipher Keychain key lost — DB unreadable
+## SQLCipher key lost — DB unreadable
 
-**Symptom.** Bridge fails to start with `ping db (wrong key?)` after a Keychain reset, OS reinstall, or user-folder migration.
+**Symptom.** Bridge fails to start with `ping db (wrong key?)` after a secret-store reset, OS reinstall, or user-folder migration.
 
-**Cause.** The SQLite database is encrypted at rest with a key stored in the macOS Keychain (`service=whatsapp-mcp`, `account=default`). If the Keychain entry is lost, the database is unrecoverable.
+**Cause.** The SQLite database is encrypted at rest with a key stored in the platform secret store: macOS Keychain (`service=whatsapp-mcp`, `account=default`), Windows Credential Manager (target `whatsapp-mcp:default`), or Linux libsecret. If that entry is lost, the database is unrecoverable.
 
 **Fix.**
-- The encrypted database is unrecoverable without the key. This is by design — the threat model assumes a stolen DB file should be unreadable without the live Keychain entry.
+- The encrypted database is unrecoverable without the key. This is by design — the threat model assumes a stolen DB file should be unreadable without the live secret-store entry.
 - Recovery: rename `store/messages.db` (or delete it), re-pair from scratch via QR, and let WhatsApp backfill history. The bridge captures `history_sync` events for ~6 months of recent traffic on a freshly-paired device.
-- Prevention: back up the Keychain item via `Keychain Access.app` → search "whatsapp-mcp" → File → Export Items. Stash that file in a secure location (1Password, encrypted USB, encrypted backup).
+- Prevention (macOS): back up the Keychain item via `Keychain Access.app` → search "whatsapp-mcp" → File → Export Items; stash the export on an encrypted USB drive or in an encrypted backup.
+- Prevention (any OS): set `WHATSAPP_DB_KEY` explicitly (`openssl rand -hex 32`) and keep that value in the secure store you already trust — the bridge then never touches the platform secret store.
+
+## Bridge exits immediately on Windows: "keychain storage not yet implemented"
+
+**Symptom.** On versions before v0.2.0, the bridge exits at startup on Windows with `DB key: keychain storage not yet implemented for windows; set WHATSAPP_DB_KEY directly`.
+
+**Cause.** Windows Credential Manager support didn't exist yet — and the `WHATSAPP_DB_KEY` fallback named in that error message was documented but never wired, so there was no working path at all.
+
+**Fix.** Upgrade to v0.2.0+: the key now provisions natively in Windows Credential Manager (no extra install), and the `WHATSAPP_DB_KEY` override (64 hex chars) genuinely works on every OS.
 
 ## macOS Keychain permission prompt loops on every bridge start
 

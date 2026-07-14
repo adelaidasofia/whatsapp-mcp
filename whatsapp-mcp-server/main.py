@@ -61,6 +61,16 @@ AUDIT_LOG_PATH = os.environ.get(
 
 # --- Logging ----------------------------------------------------------------
 
+# Windows consoles default to a legacy codepage (cp1252) under the pinned
+# Python range, so a non-ASCII contact name or Spanish transcript in a log
+# line raises UnicodeEncodeError inside logging and the line is lost. Force
+# UTF-8 on stderr before the first handler binds to it.
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:  # noqa: BLE001 — logging setup must never block startup
+        pass
+
 logging.basicConfig(
     stream=sys.stderr,
     level=logging.INFO,
@@ -252,17 +262,45 @@ def lookup_crm_context(phone: str | None, display_name: str | None) -> CRMContex
 # --- Tool implementations (v0.1.0 stubs, real wiring in commit 2) -----------
 
 
+def _bridge_error(e: httpx.HTTPStatusError) -> RuntimeError:
+    """Surface the Go bridge's structured errorResponse to the model.
+
+    The bridge writes {"error": ..., "details": ...} on every failure;
+    re-raising the bare httpx exception discarded that body, so every
+    failure mode (unauthenticated, disconnected, bad args) reached Claude
+    as an opaque status-code string.
+    """
+    err = ""
+    details = ""
+    try:
+        body = e.response.json()
+        err = body.get("error") or ""
+        details = body.get("details") or ""
+    except Exception:  # noqa: BLE001 — non-JSON error body
+        err = (e.response.text or "")[:200]
+    msg = f"bridge {e.response.status_code}: {err or e.response.reason_phrase}"
+    if details:
+        msg += f" — {details}"
+    return RuntimeError(msg)
+
+
 async def _bridge_get(path: str, params: dict[str, Any] | None = None) -> Any:
     assert _http is not None, "http client not initialized"
     r = await _http.get(path, params=params)
-    r.raise_for_status()
+    try:
+        r.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        raise _bridge_error(e) from e
     return r.json()
 
 
 async def _bridge_post(path: str, body: dict[str, Any]) -> Any:
     assert _http is not None, "http client not initialized"
     r = await _http.post(path, json=body)
-    r.raise_for_status()
+    try:
+        r.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        raise _bridge_error(e) from e
     return r.json()
 
 
@@ -270,6 +308,12 @@ async def _bridge_post(path: str, body: dict[str, Any]) -> Any:
 async def healthcheck() -> dict[str, Any]:
     """Check the Go bridge is running and authenticated.
     Returns status, schema version, and feature flags.
+
+    status_detail.auth_state explains pairing: "qr_pending" → the user must
+    scan the QR (or POST /api/auth/pair-phone on the bridge for a typed
+    code); "logged_out" → WhatsApp revoked the session and the bridge is
+    already re-entering pairing; "paired" → healthy. Read tools also attach
+    a _bridge_state envelope so cached data is distinguishable from live.
     """
     start = time.time()
     try:

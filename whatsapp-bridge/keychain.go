@@ -10,12 +10,15 @@ import (
 )
 
 // GetOrCreateDBKey returns a hex-encoded 256-bit key for SQLCipher.
-// On first run, a random key is generated and stored in macOS Keychain
-// (or the platform-equivalent secret store). On subsequent runs, the existing key is returned.
-// The user is prompted by the OS when the Keychain is first accessed.
+// On first run, a random key is generated and stored in the platform secret
+// store. On subsequent runs, the existing key is returned. The user is
+// prompted by the OS when the store is first accessed (macOS).
 //
-// Linux: uses `secret-tool` from libsecret if present; otherwise falls back to WHATSAPP_DB_KEY env var.
-// Windows: uses Credential Manager via `cmdkey` (implementation pending; fallback to env var for v0.1.0).
+// macOS: Keychain via `security`. Linux: libsecret via `secret-tool`.
+// Windows: Credential Manager via advapi32 (keychain_windows.go).
+//
+// An explicit WHATSAPP_DB_KEY env var overrides all of these — main.go checks
+// it BEFORE calling here (the escape hatch for headless/CI/custom setups).
 //
 // The key is never logged, never written to disk outside the platform secret store,
 // never committed to the repo.
@@ -25,9 +28,10 @@ func GetOrCreateDBKey(service, account string) (string, error) {
 		return getOrCreateDBKeyMacOS(service, account)
 	case "linux":
 		return getOrCreateDBKeyLinux(service, account)
+	case "windows":
+		return getOrCreateDBKeyWindows(service, account)
 	default:
-		// Windows and others: fallback path. Documented in SECURITY.md.
-		return "", fmt.Errorf("keychain storage not yet implemented for %s; set WHATSAPP_DB_KEY directly", runtime.GOOS)
+		return "", fmt.Errorf("no secret store for %s; set WHATSAPP_DB_KEY (64 hex chars) directly", runtime.GOOS)
 	}
 }
 

@@ -9,9 +9,12 @@ toolchain go1.26.3
 
 require (
 	github.com/google/uuid v1.6.0
+	github.com/mattn/go-colorable v0.1.14
+	github.com/mattn/go-isatty v0.0.20
 	github.com/mdp/qrterminal/v3 v3.2.1
 	github.com/mutecomm/go-sqlcipher/v4 v4.4.2
 	go.mau.fi/whatsmeow v0.0.0-20260421083005-5b8886176ff7
+	golang.org/x/sys v0.43.0
 	golang.org/x/text v0.36.0
 	google.golang.org/protobuf v1.36.11
 )
@@ -21,8 +24,6 @@ require (
 	github.com/beeper/argo-go v1.1.2 // indirect
 	github.com/coder/websocket v1.8.14 // indirect
 	github.com/elliotchance/orderedmap/v3 v3.1.0 // indirect
-	github.com/mattn/go-colorable v0.1.14 // indirect
-	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/petermattis/goid v0.0.0-20260330135022-df67b199bc81 // indirect
 	github.com/rs/zerolog v1.35.0 // indirect
 	github.com/vektah/gqlparser/v2 v2.5.27 // indirect
@@ -32,7 +33,6 @@ require (
 	golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f // indirect
 	golang.org/x/net v0.53.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/sys v0.43.0 // indirect
 	golang.org/x/term v0.42.0 // indirect
 	rsc.io/qr v0.2.0 // indirect
 )

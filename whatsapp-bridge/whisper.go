@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -69,6 +70,12 @@ func (t *Transcriber) Close() {
 // Enqueue schedules a transcription. Non-blocking; drops the job if the queue
 // is full and logs a warning so the caller knows.
 func (t *Transcriber) Enqueue(j transcriptionJob) {
+	if t.cfg.WhisperBackend == "off" {
+		// Transcription disabled. Media keys are still persisted at receive
+		// time (Lesson 21), so enabling a backend later + the backfill sweep
+		// recovers recent voice notes.
+		return
+	}
 	select {
 	case t.jobs <- j:
 	default:
@@ -101,6 +108,8 @@ func (t *Transcriber) process(ctx context.Context, workerID int, j transcription
 			log.Printf("transcriber[%d]: openai-api backend requires WHATSAPP_WHISPER_API_KEY", workerID)
 			return
 		}
+	case "off":
+		return
 	default:
 		log.Printf("transcriber[%d]: unknown backend %q", workerID, t.cfg.WhisperBackend)
 		return
@@ -178,7 +187,7 @@ func (t *Transcriber) process(ctx context.Context, workerID int, j transcription
 func (t *Transcriber) validateLocalCpp() error {
 	bin := t.whisperBin()
 	if _, err := exec.LookPath(bin); err != nil {
-		return fmt.Errorf("whisper binary %q not found in PATH (install via `brew install whisper-cpp` or set WHATSAPP_WHISPER_BIN_PATH)", bin)
+		return fmt.Errorf("whisper binary %q not found in PATH (%s, or set WHATSAPP_WHISPER_BIN_PATH)", bin, whisperInstallHint())
 	}
 	if t.cfg.WhisperModelPath == "" {
 		return errors.New("WHATSAPP_WHISPER_MODEL_PATH is required for local-cpp backend")
@@ -194,9 +203,37 @@ func (t *Transcriber) validateLocalCpp() error {
 	// to an absolute path (mirrors WHATSAPP_WHISPER_BIN_PATH).
 	ffmpeg := t.ffmpegBin()
 	if _, err := exec.LookPath(ffmpeg); err != nil {
-		return fmt.Errorf("ffmpeg binary %q not found in PATH (install via `brew install ffmpeg` or set WHATSAPP_FFMPEG_BIN_PATH to an absolute path)", ffmpeg)
+		return fmt.Errorf("ffmpeg binary %q not found in PATH (%s, or set WHATSAPP_FFMPEG_BIN_PATH to an absolute path)", ffmpeg, ffmpegInstallHint())
 	}
 	return nil
+}
+
+// Per-OS install guidance for runtime error messages; the old strings were
+// Homebrew-only, which reads as a dead end on Windows/Linux.
+func whisperInstallHint() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "install via `brew install whisper-cpp`"
+	case "linux":
+		return "build whisper.cpp from source or install your distro's whisper-cpp package"
+	case "windows":
+		return "whisper.cpp has no supported Windows package; use WHATSAPP_WHISPER_BACKEND=openai-api or leave transcription off"
+	default:
+		return "install whisper.cpp"
+	}
+}
+
+func ffmpegInstallHint() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "install via `brew install ffmpeg`"
+	case "linux":
+		return "install via `apt-get install ffmpeg` (or your distro's equivalent)"
+	case "windows":
+		return "install via `winget install ffmpeg`"
+	default:
+		return "install ffmpeg"
+	}
 }
 
 func (t *Transcriber) whisperBin() string {
