@@ -5,6 +5,7 @@ import (
 	"embed"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -84,7 +85,13 @@ func applyMigrations(db *sql.DB) error {
 		if v >= 2 && applied[v] {
 			continue
 		}
-		sqlBytes, err := migrationsFS.ReadFile(filepath.Join("migrations", name))
+		// embed.FS keys are forward-slash only on every OS (io/fs contract).
+		// filepath.Join uses "\" on Windows, which makes ReadFile fail on a
+		// fresh Windows install and the bridge never migrates its DB. Use
+		// path.Join here on purpose, even though the rest of this file uses
+		// filepath for real on-disk paths. Regression guard: db_test.go, with
+		// teeth on the windows-latest leg of tests.yml.
+		sqlBytes, err := migrationsFS.ReadFile(path.Join("migrations", name))
 		if err != nil {
 			return fmt.Errorf("read migration %s: %w", name, err)
 		}
