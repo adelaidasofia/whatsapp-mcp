@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"flag"
 	"log"
 	"os"
@@ -33,10 +34,16 @@ func main() {
 		"When set with --export-to-vault, also exports group chats (default exports direct chats only, matching Baileys behavior).")
 	exportMinMessages := flag.Int("export-min-messages", 0,
 		"With --export-to-vault: only export chats with at least this many messages (default 0 = export everything; recommended 5 to skip drive-by contacts).")
+	pairPhone := flag.String("pair-phone", "",
+		"Pair by typed code instead of QR scanning: your own phone number in international format (e.g. +15551234567). The 8-char code prints here; on the phone: WhatsApp > Settings > Linked Devices > Link a Device > 'Link with phone number instead'. Works on Android and iOS.")
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
 	log.Println("whatsapp-mcp bridge starting")
+
+	// SETUP.md tells users to `cp .env.example .env`; actually honor it.
+	// Process env always wins over the file.
+	loadDotEnv()
 
 	cfg, err := LoadConfig()
 	if err != nil {
@@ -47,11 +54,24 @@ func main() {
 
 	var dbKey string
 	if cfg.EncryptDB {
-		dbKey, err = GetOrCreateDBKey(cfg.KeychainService, cfg.KeychainAccount)
-		if err != nil {
-			log.Fatalf("DB key: %v", err)
+		if cfg.DBKey != "" {
+			// Explicit override (headless/CI/custom secret manager). This was
+			// documented for a long time but never actually implemented.
+			if len(cfg.DBKey) != 64 {
+				log.Fatalf("WHATSAPP_DB_KEY must be 64 hex chars (32 bytes); got %d chars", len(cfg.DBKey))
+			}
+			if _, err := hex.DecodeString(cfg.DBKey); err != nil {
+				log.Fatalf("WHATSAPP_DB_KEY is not valid hex: %v", err)
+			}
+			dbKey = cfg.DBKey
+			log.Println("DB key: explicit WHATSAPP_DB_KEY override")
+		} else {
+			dbKey, err = GetOrCreateDBKey(cfg.KeychainService, cfg.KeychainAccount)
+			if err != nil {
+				log.Fatalf("DB key: %v", err)
+			}
+			log.Println("DB key resolved from platform secret store")
 		}
-		log.Println("DB key resolved from platform secret store")
 	}
 
 	db, err := OpenDB(cfg, dbKey)
@@ -108,10 +128,8 @@ func main() {
 		log.Fatalf("bridge init: %v", err)
 	}
 	defer bridge.Disconnect()
-
-	// Connect triggers QR flow on first run or reconnect on subsequent runs.
-	if err := bridge.Connect(ctx); err != nil {
-		log.Fatalf("bridge connect: %v", err)
+	if *pairPhone != "" {
+		bridge.SetPairPhoneOnStart(*pairPhone)
 	}
 
 	// Self-healing voice-note transcript backfill. Periodically re-enqueues
@@ -154,6 +172,16 @@ func main() {
 		bridge.Disconnect()
 		if err := server.Shutdown(); err != nil {
 			log.Printf("server shutdown: %v", err)
+		}
+	}()
+
+	// Authentication runs in the background so the HTTP API is live DURING
+	// first-run pairing — a supervisor drives /api/auth/* exactly then, and
+	// the terminal QR loop re-requests fresh codes on timeout instead of
+	// killing the process (auth.go). Auth errors no longer take the API down.
+	go func() {
+		if err := bridge.RunAuth(ctx); err != nil && ctx.Err() == nil {
+			log.Printf("auth: %v — HTTP API stays up; POST /api/auth/reconnect to retry", err)
 		}
 	}()
 

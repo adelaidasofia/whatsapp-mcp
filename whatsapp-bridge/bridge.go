@@ -11,8 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mdp/qrterminal/v3"
-
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
@@ -31,11 +29,25 @@ type Bridge struct {
 	client      *whatsmeow.Client
 	transcriber *Transcriber
 
+	// rootCtx is the process-lifetime context, kept so event handlers can
+	// restart the login loop (e.g. after a WhatsApp-side logout) without
+	// holding a request-scoped ctx.
+	rootCtx context.Context
+
 	mu            sync.RWMutex
 	connected     bool
 	authenticated bool
 	deviceJID     string
 	lastSyncTime  time.Time
+
+	// Auth lifecycle surfaced over /api/status + /api/auth/* (see auth.go).
+	authState        AuthState
+	currentQR        string
+	qrExpiresAt      time.Time
+	pairingCode      string
+	loggedOutReason  string
+	loginRunning     bool
+	pairPhoneOnStart string // --pair-phone flag: request a typed code on first QR event
 }
 
 // NewBridge builds the whatsmeow client, prepares its session store, and registers event handlers.
@@ -73,58 +85,16 @@ func NewBridge(ctx context.Context, cfg *Config, db *sql.DB, dbKey string, trans
 		db:          db,
 		client:      client,
 		transcriber: transcriber,
+		rootCtx:     ctx,
+		authState:   AuthStateUnauthenticated,
 	}
 	client.AddEventHandler(b.handleEvent)
 	return b, nil
 }
 
-// Connect establishes the WhatsApp connection. On first run (no stored device), it prints
-// a terminal QR code for the user to scan with their phone. On subsequent runs it reconnects
-// using the persisted device identity.
-func (b *Bridge) Connect(ctx context.Context) error {
-	if b.client.Store.ID == nil {
-		// First run: pairing required.
-		qrChan, err := b.client.GetQRChannel(ctx)
-		if err != nil {
-			return fmt.Errorf("qr channel: %w", err)
-		}
-		if err := b.client.Connect(); err != nil {
-			return fmt.Errorf("connect for pairing: %w", err)
-		}
-		log.Println("waiting for QR code scan from phone (WhatsApp > Settings > Linked Devices > Link a Device)")
-		for evt := range qrChan {
-			switch evt.Event {
-			case "code":
-				fmt.Println()
-				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-				fmt.Println()
-				log.Println("QR code printed above; scan it with your phone")
-			case "success":
-				log.Println("pairing success")
-			case "timeout":
-				return fmt.Errorf("qr pairing timed out; restart the bridge to get a fresh code")
-			default:
-				log.Printf("pairing event: %s", evt.Event)
-			}
-		}
-	} else {
-		// Returning user: reconnect with persisted identity.
-		if err := b.client.Connect(); err != nil {
-			return fmt.Errorf("reconnect: %w", err)
-		}
-	}
-
-	b.mu.Lock()
-	b.connected = true
-	b.authenticated = b.client.Store.ID != nil
-	if b.client.Store.ID != nil {
-		b.deviceJID = b.client.Store.ID.String()
-	}
-	b.mu.Unlock()
-
-	log.Printf("bridge connected; device=%s", b.DeviceJID())
-	return nil
-}
+// Authentication (QR loop, pairing codes, re-login) lives in auth.go —
+// main() runs RunAuth in a goroutine so the HTTP API is available during
+// first-run pairing.
 
 func (b *Bridge) Disconnect() {
 	if b.client != nil {
@@ -180,6 +150,9 @@ func (b *Bridge) handleEvent(raw interface{}) {
 	case *events.Connected:
 		b.mu.Lock()
 		b.connected = true
+		if b.authenticated {
+			b.authState = AuthStatePaired
+		}
 		b.mu.Unlock()
 		log.Println("whatsmeow: connected")
 	case *events.Disconnected:
@@ -191,11 +164,31 @@ func (b *Bridge) handleEvent(raw interface{}) {
 		b.mu.Lock()
 		b.connected = false
 		b.authenticated = false
+		b.authState = AuthStateLoggedOut
+		b.loggedOutReason = fmt.Sprintf("%v", evt.Reason)
+		b.currentQR = ""
+		b.pairingCode = ""
 		b.mu.Unlock()
-		log.Printf("whatsmeow: logged out; reason=%s (re-pair by restarting the bridge)", evt.Reason)
+		log.Printf("whatsmeow: logged out; reason=%v — starting a fresh pairing flow (scan the new QR, or POST /api/auth/pair-phone)", evt.Reason)
+		// Re-enter pairing without a process restart. whatsmeow clears the
+		// device store on logout; the small delay lets that settle.
+		go func() {
+			select {
+			case <-b.rootCtx.Done():
+				return
+			case <-time.After(2 * time.Second):
+			}
+			if err := b.loginLoop(b.rootCtx); err != nil && b.rootCtx.Err() == nil {
+				log.Printf("re-login after logout failed: %v (POST /api/auth/reconnect to retry)", err)
+			}
+		}()
 	case *events.PairSuccess:
 		b.mu.Lock()
 		b.authenticated = true
+		b.authState = AuthStatePaired
+		b.currentQR = ""
+		b.pairingCode = ""
+		b.loggedOutReason = ""
 		if evt.ID.String() != "" {
 			b.deviceJID = evt.ID.String()
 		}

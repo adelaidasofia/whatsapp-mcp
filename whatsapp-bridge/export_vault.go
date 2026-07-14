@@ -447,10 +447,29 @@ func sanitizeFilename(name string) string {
 		"|", "-", "\"", "-", "<", "-", ">", "-", "[", "-", "]", "-",
 	)
 	cleaned := strings.TrimSpace(replacer.Replace(name))
+	// Windows refuses filenames ending in dots or spaces, and treats
+	// reserved device stems (CON, NUL, COM1…) as devices, not files.
+	cleaned = strings.TrimRight(cleaned, ". ")
+	if isWindowsReservedName(cleaned) {
+		cleaned += "_"
+	}
 	if cleaned == "" {
 		return "Unknown"
 	}
 	return cleaned
+}
+
+func isWindowsReservedName(s string) bool {
+	up := strings.ToUpper(s)
+	switch up {
+	case "CON", "PRN", "AUX", "NUL":
+		return true
+	}
+	if len(up) == 4 && (strings.HasPrefix(up, "COM") || strings.HasPrefix(up, "LPT")) {
+		c := up[3]
+		return c >= '1' && c <= '9'
+	}
+	return false
 }
 
 func escapeYAML(s string) string {

@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/install-ping.py"
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/install-ping.py || py -3 ${CLAUDE_PLUGIN_ROOT}/hooks/install-ping.py || python ${CLAUDE_PLUGIN_ROOT}/hooks/install-ping.py"
           }
         ]
       }

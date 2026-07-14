@@ -19,6 +19,10 @@ type Config struct {
 	BackupPath  string
 	EncryptDB   bool
 
+	// DBKey is an explicit SQLCipher key (64 hex chars) from WHATSAPP_DB_KEY.
+	// When set it overrides the platform secret store on every OS. Never logged.
+	DBKey string
+
 	KeychainService string
 	KeychainAccount string
 
@@ -67,10 +71,15 @@ func LoadConfig() (*Config, error) {
 		MediaPath:            expandPath(getenv("WHATSAPP_MEDIA_PATH", filepath.Join(defaultRoot, "media")), home),
 		BackupPath:           expandPath(getenv("WHATSAPP_BACKUP_PATH", filepath.Join(defaultRoot, "store", "backups")), home),
 		EncryptDB:            getenvBool("WHATSAPP_ENCRYPT_DB", true),
+		DBKey:                getenv("WHATSAPP_DB_KEY", ""),
 		KeychainService:      getenv("WHATSAPP_KEYCHAIN_SERVICE", "whatsapp-mcp"),
 		KeychainAccount:      getenv("WHATSAPP_KEYCHAIN_ACCOUNT", "default"),
 		VaultCRMPath:         expandPath(getenv("WHATSAPP_VAULT_CRM_PATH", ""), home),
-		WhisperBackend:       getenv("WHATSAPP_WHISPER_BACKEND", "local-cpp"),
+		// "off" by default so a fresh install boots with zero config. The
+		// old default (local-cpp) demanded a ~3 GB whisper model at startup
+		// — Config.Validate refused to boot without it, stranding every new
+		// install. Transcription stays fail-loud once explicitly enabled.
+		WhisperBackend:       getenv("WHATSAPP_WHISPER_BACKEND", "off"),
 		WhisperModel:         getenv("WHATSAPP_WHISPER_MODEL", "large-v3"),
 		WhisperLanguage:      getenv("WHATSAPP_WHISPER_LANGUAGE", "es"),
 		WhisperBinPath:       getenv("WHATSAPP_WHISPER_BIN_PATH", ""),
@@ -101,11 +110,14 @@ func (c *Config) Validate() error {
 	if !isLoopback(c.BridgeHost) {
 		return fmt.Errorf("WHATSAPP_BRIDGE_HOST=%q is not a loopback address; only 127.0.0.1 or ::1 allowed", c.BridgeHost)
 	}
-	if c.BridgePort < 1 || c.BridgePort > 65535 {
+	// Port 0 = OS-assigned; the bound port is announced via a
+	// "BRIDGE_LISTENING port=N" stdout line + a bridge.port sidecar file so
+	// a supervisor running several isolated instances can discover it.
+	if c.BridgePort < 0 || c.BridgePort > 65535 {
 		return fmt.Errorf("WHATSAPP_BRIDGE_PORT=%d out of range", c.BridgePort)
 	}
-	if c.WhisperBackend != "local-cpp" && c.WhisperBackend != "openai-api" {
-		return fmt.Errorf("WHATSAPP_WHISPER_BACKEND=%q must be 'local-cpp' or 'openai-api'", c.WhisperBackend)
+	if c.WhisperBackend != "off" && c.WhisperBackend != "local-cpp" && c.WhisperBackend != "openai-api" {
+		return fmt.Errorf("WHATSAPP_WHISPER_BACKEND=%q must be 'off', 'local-cpp' or 'openai-api'", c.WhisperBackend)
 	}
 	if c.WhisperBackend == "openai-api" && c.WhisperAPIKey == "" {
 		return fmt.Errorf("WHATSAPP_WHISPER_BACKEND=openai-api requires WHATSAPP_WHISPER_API_KEY to be set")

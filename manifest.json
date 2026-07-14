@@ -31,7 +31,15 @@
       "args": [
         "${__dirname}/whatsapp-mcp-server/main.py"
       ],
-      "env": {}
+      "env": {},
+      "platform_overrides": {
+        "win32": {
+          "command": "python",
+          "args": [
+            "${__dirname}/whatsapp-mcp-server/main.py"
+          ]
+        }
+      }
     }
   },
   "tools_generated": true,
