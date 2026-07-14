@@ -52,28 +52,32 @@ else
   ok "fastmcp $FM_VERSION (system)"
 fi
 
-# FFmpeg
+# FFmpeg (optional: only needed when WHATSAPP_WHISPER_BACKEND=local-cpp;
+# transcription defaults to off since v0.2.0)
 if ! command -v ffmpeg >/dev/null 2>&1; then
-  fail "ffmpeg not found. Install via 'brew install ffmpeg'. Required for voice-note audio conversion."
+  warn "ffmpeg not found. Only needed for voice-note transcription (WHATSAPP_WHISPER_BACKEND=local-cpp). Install via 'brew install ffmpeg' when you enable it."
+else
+  FFMPEG_VERSION=$(ffmpeg -version 2>&1 | head -1 | awk '{print $3}')
+  ok "ffmpeg $FFMPEG_VERSION"
 fi
-FFMPEG_VERSION=$(ffmpeg -version 2>&1 | head -1 | awk '{print $3}')
-ok "ffmpeg $FFMPEG_VERSION"
 
-# SQLCipher
+# SQLCipher CLI (optional: the bridge compiles its own SQLCipher via
+# go-sqlcipher; the CLI is only a convenience for inspecting the DB by hand)
 if ! command -v sqlcipher >/dev/null 2>&1; then
-  fail "sqlcipher CLI not found. Install via 'brew install sqlcipher'. Required for encrypted database at rest."
+  warn "sqlcipher CLI not found (optional — the bridge bundles SQLCipher itself; the CLI just lets you inspect the encrypted DB manually)."
+else
+  SC_VERSION=$(sqlcipher --version 2>&1 | head -1 | awk '{print $1}')
+  ok "sqlcipher $SC_VERSION"
 fi
-SC_VERSION=$(sqlcipher --version 2>&1 | head -1 | awk '{print $1}')
-ok "sqlcipher $SC_VERSION"
 
-# whisper.cpp (optional at setup, required at runtime if WHATSAPP_WHISPER_BACKEND=local-cpp)
+# whisper.cpp (optional: only needed when WHATSAPP_WHISPER_BACKEND=local-cpp)
 if command -v whisper-cli >/dev/null 2>&1; then
   WC_VERSION=$(whisper-cli --help 2>&1 | head -1 | awk '{print $NF}' || echo "unknown")
   ok "whisper-cli ($WC_VERSION)"
 elif command -v whisper-cpp >/dev/null 2>&1; then
   ok "whisper-cpp present"
 else
-  warn "whisper.cpp not found. Install via 'brew install whisper-cpp' if you plan to use the default local Whisper backend. Skippable if you use openai-api backend."
+  warn "whisper.cpp not found. Only needed if you enable WHATSAPP_WHISPER_BACKEND=local-cpp (off by default). Install via 'brew install whisper-cpp' then."
 fi
 
 # gh (optional, only for contributors)

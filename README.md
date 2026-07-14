@@ -67,17 +67,19 @@ Open Claude Code, paste:
 This installs the Python MCP server side. The Go bridge still needs the one-time QR pairing flow with your phone — see the legacy install block below for those steps.
 
 <details>
-<summary>Legacy install (manual, full Go bridge + QR pairing)</summary>
+<summary>Manual install (full Go bridge + QR pairing)</summary>
 
-See [SETUP.md](SETUP.md) for step-by-step install. In short:
+See [SETUP.md](SETUP.md) for step-by-step install per OS. In short:
 
-1. Prereqs: Go 1.24+, Python 3.11+, FFmpeg, uv
-2. Clone this repo
-3. Run `scripts/check_prerequisites.sh`
-4. Start the bridge: `cd whatsapp-bridge && go run .`
-5. Scan the QR code with WhatsApp on your phone (Settings, Linked Devices, Link a Device)
+1. Grab a prebuilt bridge binary from [Releases](../../releases/latest) (Windows/macOS/Linux — no compiler needed), or build from source (Go 1.24+ and a C toolchain)
+2. Python 3.11+ and `uv` for the MCP server layer
+3. Clone this repo; verify with `scripts/check_prerequisites.sh` (Windows: `scripts\check_prerequisites.ps1`)
+4. Start the bridge: `./bin/whatsapp-bridge` (Windows: `.\bin\whatsapp-bridge.exe`)
+5. Scan the QR (it refreshes in place — always scan the one on screen), or pair by typed code with `--pair-phone +15551234567`
 6. Register the MCP in your Claude Code `.mcp.json`
 7. Restart Claude Code
+
+FFmpeg and whisper.cpp are only needed if you enable voice-note transcription (off by default).
 
 </details>
 

@@ -52,6 +52,12 @@ func main() {
 	log.Printf("config loaded: bind=%s:%d db=%s crm=%s whisper=%s",
 		cfg.BridgeHost, cfg.BridgePort, cfg.DBPath, truncateForLog(cfg.VaultCRMPath), cfg.WhisperBackend)
 
+	// One-time visibility for the v0.2.0 default flip: users who relied on
+	// the old local-cpp default would otherwise lose transcription silently.
+	if cfg.WhisperBackend == "off" {
+		log.Println("voice-note transcription is OFF (WHATSAPP_WHISPER_BACKEND=off, default since v0.2.0); set local-cpp or openai-api to enable — media keys are still stored, so recent notes backfill once enabled")
+	}
+
 	var dbKey string
 	if cfg.EncryptDB {
 		if cfg.DBKey != "" {
