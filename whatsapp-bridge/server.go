@@ -54,6 +54,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/chats", s.handleListChats)
 	s.mux.HandleFunc("GET /api/messages", s.handleListMessages)
 	s.mux.HandleFunc("GET /api/contacts/search", s.handleSearchContacts)
+	s.mux.HandleFunc("GET /api/groups", s.handleListGroups)
 
 	s.mux.HandleFunc("POST /api/sends", s.handleCreateDraft)
 	s.mux.HandleFunc("POST /api/sends/{draft_id}/confirm", s.handleConfirmSend)
