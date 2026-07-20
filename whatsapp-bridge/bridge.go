@@ -210,6 +210,23 @@ func (b *Bridge) handleEvent(raw interface{}) {
 	}
 }
 
+// seedChatName returns the name to seed a chat row with on its first-ever
+// message. Never seeds a DIRECT chat's name when the message is our own
+// (IsFromMe) — seeding it with our own display name sticks forever, since
+// the INSERT's ON CONFLICT clause never updates "name" on later messages.
+// Every chat poisoned this way then collides on the same identity downstream
+// (anything that keys off the chat's display name). Blanking it here makes
+// the chat wait for the other party's first message, exactly like a chat
+// with no messages yet. Groups are left alone: unlike directs, a group's
+// first message is routinely from the device owner, and doing this would
+// blank far more group names than it fixes.
+func seedChatName(senderDisplay, chatType string, isFromMe bool) string {
+	if isFromMe && chatType == "direct" {
+		return ""
+	}
+	return senderDisplay
+}
+
 // onMessage persists an incoming or outgoing message.
 // The original content text is stored as-is; the prompt-injection-scrubbed representation
 // is stored in scrubbed_text (plus flags in scrub_flags_json) for Claude to consume.
@@ -228,6 +245,8 @@ func (b *Bridge) onMessage(evt *events.Message) {
 		senderDisplay = evt.Info.Sender.User
 	}
 
+	chatName := seedChatName(senderDisplay, chatTypeFromJID(evt.Info.Chat), evt.Info.IsFromMe)
+
 	// Upsert chat row (minimal; full chat sync happens via HistorySync).
 	_, err := b.db.Exec(`
 		INSERT INTO chats (jid, chat_type, name, normalized_name, created_at, updated_at, last_message_id, last_message_time, last_message_preview)
@@ -237,7 +256,7 @@ func (b *Bridge) onMessage(evt *events.Message) {
 			last_message_time = excluded.last_message_time,
 			last_message_preview = excluded.last_message_preview,
 			updated_at = excluded.updated_at
-	`, chatJID, chatTypeFromJID(evt.Info.Chat), senderDisplay, Normalize(senderDisplay),
+	`, chatJID, chatTypeFromJID(evt.Info.Chat), chatName, Normalize(chatName),
 		ts, ts, id, ts, truncate(content, 120))
 	if err != nil {
 		log.Printf("onMessage: chat upsert failed: %v", err)
