@@ -11,11 +11,23 @@ name: whatsmeow-upgrade-review
 # Reviewer responsibility: read the diff, then either (a) add the
 # whatsmeow-diff-reviewed label to authorize merge, or (b) request changes.
 #
+# Pin parsing lives in .github/scripts/whatsmeow-pin.sh, NOT inline here, so it
+# can be unit tested. .github/scripts/whatsmeow-pin.test.sh asserts both
+# directions and runs as the `pin-parser-selftest` job below. Rationale: the
+# original inline implementation returned empty for EVERY input (its regex began
+# with a dash, so grep parsed it as an option bundle), which tripped the
+# indeterminate fail-safe on every go.mod PR. A gate that fires on everything is
+# a gate reviewers learn to ignore.
+#
 # Security note: all untrusted inputs (base ref, head sha, PR number, repo
 # full-name) are passed via env: bindings and consumed via "$VAR" inside the
 # shell scripts. No direct ${{ }} interpolation inside run: blocks. This is
 # the SAFE pattern documented at
 # https://github.blog/security/vulnerability-research/how-to-catch-github-actions-workflow-injections-before-attackers-do/
+#
+# go.mod content is itself PR-controlled, so values parsed out of it are NOT
+# written verbatim to GITHUB_OUTPUT: `changed` is whitelisted against a fixed
+# set and the SHAs are validated as exactly 12 hex chars before export.
 
 on:
   pull_request:
@@ -23,6 +35,9 @@ on:
     paths:
       - 'whatsapp-bridge/go.mod'
       - 'whatsapp-bridge/go.sum'
+      - '.github/scripts/whatsmeow-pin.sh'
+      - '.github/scripts/whatsmeow-pin.test.sh'
+      - '.github/workflows/whatsmeow-upgrade-review.yml'
 
 permissions:
   contents: read
@@ -30,8 +45,20 @@ permissions:
   issues: write
 
 jobs:
+  # The gate's own logic is gated. If the parser regresses, this job goes red
+  # rather than the gate silently reverting to flag-everything (or, worse,
+  # flag-nothing).
+  pin-parser-selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+      - name: Negative + positive controls for the pin parser
+        run: bash .github/scripts/whatsmeow-pin.test.sh
+
   diff-review:
     runs-on: ubuntu-latest
+    needs: pin-parser-selftest
     env:
       UPSTREAM_REPO: tulir/whatsmeow
     steps:
@@ -44,39 +71,50 @@ jobs:
         id: pins
         env:
           BASE_REF: ${{ github.event.pull_request.base.ref }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -e
           git fetch origin "$BASE_REF"
-          OLD_MOD=$(git show "origin/${BASE_REF}:whatsapp-bridge/go.mod" 2>/dev/null || echo "")
-          NEW_MOD=$(cat whatsapp-bridge/go.mod)
+          git show "origin/${BASE_REF}:whatsapp-bridge/go.mod" > /tmp/old-go.mod 2>/dev/null \
+            || : > /tmp/old-go.mod
+          cp whatsapp-bridge/go.mod /tmp/new-go.mod
 
-          # whatsmeow pseudo-version format: v0.0.0-YYYYMMDDHHMMSS-<12-char-sha>
-          extract_sha() {
-            echo "$1" | grep -E '^[[:space:]]*go\.mau\.fi/whatsmeow' | head -n1 \
-              | grep -oE '-[0-9a-f]{12}([[:space:]]|$)' | head -n1 \
-              | tr -d ' \n-'
-          }
+          bash .github/scripts/whatsmeow-pin.sh /tmp/old-go.mod /tmp/new-go.mod > /tmp/pins.txt
+          echo "--- parser output ---"
+          cat /tmp/pins.txt
 
-          OLD_SHA=$(extract_sha "$OLD_MOD")
-          NEW_SHA=$(extract_sha "$NEW_MOD")
+          get() { grep "^$1=" /tmp/pins.txt | head -n1 | cut -d= -f2-; }
+          CHANGED=$(get changed)
+          OLD_SHA=$(get old_sha)
+          NEW_SHA=$(get new_sha)
 
-          echo "old_sha=$OLD_SHA" >> "$GITHUB_OUTPUT"
-          echo "new_sha=$NEW_SHA" >> "$GITHUB_OUTPUT"
+          # Whitelist the classification. Anything unexpected fails safe toward
+          # human review rather than toward silent merge.
+          case "$CHANGED" in
+            yes|no|indeterminate) ;;
+            *) CHANGED=indeterminate ;;
+          esac
 
-          if [ -z "$OLD_SHA" ] || [ -z "$NEW_SHA" ]; then
-            echo "changed=indeterminate" >> "$GITHUB_OUTPUT"
-            echo "::warning::Could not extract whatsmeow pins (old=$OLD_SHA new=$NEW_SHA). Treating as needs-review."
-          elif [ "$OLD_SHA" = "$NEW_SHA" ]; then
-            echo "changed=no" >> "$GITHUB_OUTPUT"
-            echo "whatsmeow pin unchanged ($OLD_SHA). Nothing to review."
-          else
-            echo "changed=yes" >> "$GITHUB_OUTPUT"
-            echo "whatsmeow pin moved: $OLD_SHA -> $NEW_SHA"
-          fi
+          # Validate SHA shape before export; empty is legitimate (a semver-tag
+          # pin has no commit SHA) and the log step degrades accordingly.
+          printf '%s' "$OLD_SHA" | grep -qE '^[0-9a-f]{12}$' || OLD_SHA=""
+          printf '%s' "$NEW_SHA" | grep -qE '^[0-9a-f]{12}$' || NEW_SHA=""
+
+          {
+            echo "changed=$CHANGED"
+            echo "old_sha=$OLD_SHA"
+            echo "new_sha=$NEW_SHA"
+          } >> "$GITHUB_OUTPUT"
+
+          case "$CHANGED" in
+            indeterminate) echo "::warning::Could not parse the whatsmeow pin on one or both sides. Treating as needs-review." ;;
+            no)  echo "whatsmeow pin unchanged. Nothing to review." ;;
+            yes) echo "whatsmeow pin moved, or a replace directive targeting it changed." ;;
+          esac
 
       - name: Fetch upstream commit log
-        if: steps.pins.outputs.changed == 'yes'
+        # Both SHAs required: a semver-tag move or a replace-directive change is
+        # still `changed=yes` but has no pseudo-version commit range to diff.
+        if: steps.pins.outputs.changed == 'yes' && steps.pins.outputs.old_sha != '' && steps.pins.outputs.new_sha != ''
         id: upstream
         env:
           OLD_SHA: ${{ steps.pins.outputs.old_sha }}
@@ -124,16 +162,22 @@ jobs:
           {
             echo "## whatsmeow upgrade detected"
             echo ""
-            echo "- **Old pin:** \`${OLD_SHA}\`"
-            echo "- **New pin:** \`${NEW_SHA}\`"
-            echo "- **Commits between:** ${COMMIT_COUNT}"
-            echo "- **Upstream:** https://github.com/tulir/whatsmeow/compare/${OLD_SHA}...${NEW_SHA}"
+            echo "- **Old pin sha:** \`${OLD_SHA:-n/a}\`"
+            echo "- **New pin sha:** \`${NEW_SHA:-n/a}\`"
+            if [ -n "${OLD_SHA}" ] && [ -n "${NEW_SHA}" ]; then
+              echo "- **Commits between:** ${COMMIT_COUNT:-unknown}"
+              echo "- **Upstream:** https://github.com/tulir/whatsmeow/compare/${OLD_SHA}...${NEW_SHA}"
+            else
+              echo "- **Note:** no pseudo-version commit range available (semver-tag pin, or a \`replace\` directive changed). Review the go.mod diff directly."
+            fi
             echo ""
-            echo "### Commit log"
-            echo ""
-            echo '```'
-            cat /tmp/upstream-log-truncated.txt
-            echo '```'
+            if [ -f /tmp/upstream-log-truncated.txt ]; then
+              echo "### Commit log"
+              echo ""
+              echo '```'
+              cat /tmp/upstream-log-truncated.txt
+              echo '```'
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Post PR comment + apply review-required label
@@ -150,19 +194,29 @@ jobs:
           {
             echo "## whatsmeow upgrade detected"
             echo ""
-            echo "Pin moved \`${OLD_SHA}\` -> \`${NEW_SHA}\` (${COMMIT_COUNT} commits)."
+            if [ -n "${OLD_SHA}" ] && [ -n "${NEW_SHA}" ]; then
+              echo "Pin moved \`${OLD_SHA}\` -> \`${NEW_SHA}\` (${COMMIT_COUNT:-unknown} commits)."
+              echo ""
+              echo "Compare: https://github.com/tulir/whatsmeow/compare/${OLD_SHA}...${NEW_SHA}"
+            else
+              echo "The whatsmeow pin changed in a form with no pseudo-version commit range:"
+              echo "a semver-tag move, or a \`replace\` directive targeting the module."
+              echo ""
+              echo "A \`replace\` can point whatsmeow at arbitrary code while the require line"
+              echo "stays byte-identical, so review the \`go.mod\` diff directly."
+            fi
             echo ""
-            echo "Compare: https://github.com/tulir/whatsmeow/compare/${OLD_SHA}...${NEW_SHA}"
-            echo ""
-            echo "<details>"
-            echo "<summary>Commit log</summary>"
-            echo ""
-            echo '```'
-            cat /tmp/upstream-log-truncated.txt
-            echo '```'
-            echo ""
-            echo "</details>"
-            echo ""
+            if [ -f /tmp/upstream-log-truncated.txt ]; then
+              echo "<details>"
+              echo "<summary>Commit log</summary>"
+              echo ""
+              echo '```'
+              cat /tmp/upstream-log-truncated.txt
+              echo '```'
+              echo ""
+              echo "</details>"
+              echo ""
+            fi
             echo "Per SECURITY.md item 6, this requires manual diff review."
             echo "Reviewer: read the changes above, then add label \`whatsmeow-diff-reviewed\` to authorize merge."
           } > /tmp/pr-comment.md
