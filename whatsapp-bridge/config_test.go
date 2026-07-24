@@ -59,3 +59,19 @@ func TestConfigReadsExplicitDBKey(t *testing.T) {
 		t.Fatalf("DBKey not threaded through config (len=%d)", len(cfg.DBKey))
 	}
 }
+
+func TestSplitNormalizedCSV(t *testing.T) {
+	got := splitNormalizedCSV(" Mamá, Pablo Tucu ,, FAVORITOS ")
+	want := []string{"mama", "pablo tucu", "favoritos"}
+	if len(got) != len(want) {
+		t.Fatalf("len = %d, want %d (%v)", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+	if r := splitNormalizedCSV(""); r != nil {
+		t.Errorf("empty input should give nil, got %v", r)
+	}
+}

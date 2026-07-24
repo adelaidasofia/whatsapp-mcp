@@ -40,6 +40,7 @@ type Transcriber struct {
 
 type transcriptionJob struct {
 	MessageID string
+	ChatJID   string // chat the voice note belongs to; used by the exclusion filter
 	// AudioDownloader is a closure returning the decrypted audio bytes.
 	// Passed by the bridge so the Transcriber does not need to import whatsmeow.
 	AudioDownloader func(ctx context.Context) ([]byte, error)
@@ -76,11 +77,37 @@ func (t *Transcriber) Enqueue(j transcriptionJob) {
 		// recovers recent voice notes.
 		return
 	}
+	if t.chatExcluded(j.ChatJID) {
+		// Privacy filter: personal chats listed in WHATSAPP_WHISPER_EXCLUDE_CHATS
+		// are never transcribed. Single chokepoint — covers both the live
+		// receive path and the backfill sweep.
+		log.Printf("transcriber: chat %s excluded by WHATSAPP_WHISPER_EXCLUDE_CHATS; skipping %s", j.ChatJID, j.MessageID)
+		return
+	}
 	select {
 	case t.jobs <- j:
 	default:
 		log.Printf("transcriber queue full; dropping job for message %s (increase queue or reduce traffic)", j.MessageID)
 	}
+}
+
+// chatExcluded reports whether the chat matches any WHATSAPP_WHISPER_EXCLUDE_CHATS
+// pattern. Patterns are normalized substrings compared against the chat JID and
+// the chat's stored name/normalized_name (accent-insensitive, so "Mamá" and
+// "mama" both match).
+func (t *Transcriber) chatExcluded(chatJID string) bool {
+	if len(t.cfg.WhisperExcludeChats) == 0 || chatJID == "" {
+		return false
+	}
+	var name, normName string
+	_ = t.db.QueryRow(`SELECT COALESCE(name,''), COALESCE(normalized_name,'') FROM chats WHERE jid = ?`, chatJID).Scan(&name, &normName)
+	hay := strings.ToLower(chatJID + " " + Normalize(name) + " " + normName)
+	for _, pat := range t.cfg.WhisperExcludeChats {
+		if strings.Contains(hay, pat) {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *Transcriber) worker(id int) {
