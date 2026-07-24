@@ -182,13 +182,24 @@ func (s *Server) undecodedStats(ctx context.Context) (total int, byType map[stri
 	// counter cannot drift from what the writer stores.
 	markerLike := unsupportedPrefix + "%"
 
+	// EVERY count is scoped to `type = 'system'`, which is where both writers
+	// put these rows (extractContent / baileysExtractContent) and which
+	// `idx_messages_type` (migrations/001) indexes. A bare `content_text LIKE`
+	// cannot use any index and scans the whole message store: measured at 16s
+	// on the founder's real store, turning /healthcheck into a timeout. The
+	// type predicate narrows to a small subset first. Both counts share one
+	// pass so the subset is visited once, not twice.
 	if err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM messages WHERE content_text LIKE ?`, markerLike).Scan(&total); err != nil {
-		log.Printf("healthcheck: undecoded total query failed: %v", err)
+		`SELECT
+		   COALESCE(SUM(CASE WHEN content_text LIKE ? THEN 1 ELSE 0 END), 0),
+		   COALESCE(SUM(CASE WHEN COALESCE(content_text, '') = '' THEN 1 ELSE 0 END), 0)
+		 FROM messages WHERE type = 'system'`, markerLike).Scan(&total, &legacyEmpty); err != nil {
+		log.Printf("healthcheck: undecoded counts query failed: %v", err)
 	}
 
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT COALESCE(content_text, ''), COUNT(*) FROM messages WHERE content_text LIKE ? GROUP BY content_text`,
+		`SELECT COALESCE(content_text, ''), COUNT(*) FROM messages
+		 WHERE type = 'system' AND content_text LIKE ? GROUP BY content_text`,
 		markerLike)
 	if err != nil {
 		log.Printf("healthcheck: undecoded by-type query failed: %v", err)
@@ -212,11 +223,6 @@ func (s *Server) undecodedStats(ctx context.Context) (total int, byType map[stri
 		if err := rows.Err(); err != nil {
 			log.Printf("healthcheck: undecoded by-type iteration failed: %v", err)
 		}
-	}
-
-	if err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM messages WHERE type = 'system' AND COALESCE(content_text, '') = ''`).Scan(&legacyEmpty); err != nil {
-		log.Printf("healthcheck: legacy empty-system query failed: %v", err)
 	}
 
 	return total, byType, legacyEmpty
