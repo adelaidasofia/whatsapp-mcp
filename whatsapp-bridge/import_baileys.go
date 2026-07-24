@@ -291,10 +291,12 @@ func baileysExtractContent(m map[string]any) (string, string) {
 	}
 	if raw := unsupportedBaileysType(m); raw != "" {
 		// Fail LOUD (MYC-3284): a Baileys message carrying an undecoded content
-		// field is imported as a distinct "unsupported" row naming the raw type,
-		// never a silent empty "system" row. Metadata-only / empty stays system.
-		log.Printf("baileysExtractContent: undecoded imported message type %q — kept as type=unsupported (no text captured)", raw)
-		return "[unsupported: " + raw + "]", "unsupported"
+		// field is imported with an explicit marker naming the raw type, never a
+		// silent empty row. Metadata-only / empty stays a plain "system".
+		// The marker rides in content_text — see extractContent for why the
+		// `type` column cannot carry it (CHECK constraint, migrations/001).
+		log.Printf("baileysExtractContent: undecoded imported message type %q — stored with an explicit unsupported marker (no text captured)", raw)
+		return unsupportedMarker(raw), "system"
 	}
 	return "", "system"
 }

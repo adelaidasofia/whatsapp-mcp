@@ -20,19 +20,19 @@ import (
 //
 // Output layout (one file per direct chat; groups are skipped by default):
 //
-//    <outputDir>/<Contact Name>.md      when push_name is known
-//    <outputDir>/+<phone>.md            when only phone is known
+//	<outputDir>/<Contact Name>.md      when push_name is known
+//	<outputDir>/+<phone>.md            when only phone is known
 //
 // YAML frontmatter:
 //
-//    type: whatsapp-chat
-//    contact: "<display>"
-//    phone: "+<phone>"
-//    jid: "<jid>"
-//    message_count: <N>
-//    first_message: YYYY-MM-DD
-//    last_message: YYYY-MM-DD
-//    last_sync: YYYY-MM-DD (date of export)
+//	type: whatsapp-chat
+//	contact: "<display>"
+//	phone: "+<phone>"
+//	jid: "<jid>"
+//	message_count: <N>
+//	first_message: YYYY-MM-DD
+//	last_message: YYYY-MM-DD
+//	last_sync: YYYY-MM-DD (date of export)
 //
 // Body: `## YYYY-MM-DD` section per date, `**HH:MM AM** You: <text>` per message.
 //
@@ -282,7 +282,17 @@ func exportOneChat(db *sql.DB, outputDir, jid, chatType, name string, participan
 		case "reaction":
 			text = fmt.Sprintf("[Reaction: %s]", m.text)
 		default:
-			text = m.text
+			// MYC-3284 — a message the bridge could not decode carries an
+			// explicit marker in its text (it is stored under an allowed type,
+			// see extractContent). Render it the way [Voice note] marks an
+			// unrecoverable voice note: the reader sees THAT a message exists,
+			// who sent it and when (the line format supplies both), and why it
+			// could not be read. Never a blank, never silently omitted.
+			if raw := unsupportedRawType(m.text); raw != "" {
+				text = fmt.Sprintf("[Unsupported message: %s]", raw)
+			} else {
+				text = m.text
+			}
 		}
 		if text == "" {
 			continue
