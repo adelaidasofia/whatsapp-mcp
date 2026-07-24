@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"strings"
 	"time"
 )
@@ -25,12 +26,12 @@ type baileysContact struct {
 }
 
 type baileysMessage struct {
-	Key              baileysKey       `json:"key"`
-	Message          map[string]any   `json:"message,omitempty"`
-	MessageTimestamp any              `json:"messageTimestamp,omitempty"`
-	PushName         string           `json:"pushName,omitempty"`
-	MessageStubType  any              `json:"messageStubType,omitempty"`
-	Status           any              `json:"status,omitempty"`
+	Key              baileysKey     `json:"key"`
+	Message          map[string]any `json:"message,omitempty"`
+	MessageTimestamp any            `json:"messageTimestamp,omitempty"`
+	PushName         string         `json:"pushName,omitempty"`
+	MessageStubType  any            `json:"messageStubType,omitempty"`
+	Status           any            `json:"status,omitempty"`
 }
 
 type baileysKey struct {
@@ -288,7 +289,32 @@ func baileysExtractContent(m map[string]any) (string, string) {
 		name, _ := poll["name"].(string)
 		return name, "text"
 	}
+	if raw := unsupportedBaileysType(m); raw != "" {
+		// Fail LOUD (MYC-3284): a Baileys message carrying an undecoded content
+		// field is imported as a distinct "unsupported" row naming the raw type,
+		// never a silent empty "system" row. Metadata-only / empty stays system.
+		log.Printf("baileysExtractContent: undecoded imported message type %q — kept as type=unsupported (no text captured)", raw)
+		return "[unsupported: " + raw + "]", "unsupported"
+	}
 	return "", "system"
+}
+
+// unsupportedBaileysType names the populated content key(s) of a Baileys message
+// object baileysExtractContent does not decode (MYC-3284 sibling of
+// unsupportedMessageType). messageContextInfo rides alongside real content, so
+// it is skipped; no other key ⇒ genuinely textless ⇒ "" (caller keeps "system").
+func unsupportedBaileysType(m map[string]any) string {
+	var names []string
+	for k := range m {
+		if k != "messageContextInfo" {
+			names = append(names, k)
+		}
+	}
+	if len(names) == 0 {
+		return ""
+	}
+	sort.Strings(names)
+	return strings.Join(names, ",")
 }
 
 // chatTypeFromServerSuffix maps baileys JID suffixes to our chat_type enum.
