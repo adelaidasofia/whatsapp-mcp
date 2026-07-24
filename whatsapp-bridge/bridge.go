@@ -453,11 +453,31 @@ func unsupportedRawType(text string) string {
 	return text[len(unsupportedPrefix) : len(text)-len(unsupportedSuffix)]
 }
 
+// carrierFields are message fields that provably carry NO user-visible text,
+// so a message containing only these is genuinely textless — not something the
+// bridge failed to read. Marking them "unsupported" is technically honest but
+// practically wrong: it writes a placeholder line into the member's chat files
+// for cryptographic plumbing they never sent and cannot see. Measured on the
+// live bridge after MYC-3284 shipped: 6 of the first 8 markers were
+// senderKeyDistributionMessage (Signal-protocol group key distribution, which
+// rides on its own when a group's keys rotate).
+//
+// This list is deliberately SHORT and admits only fields whose textlessness is
+// certain. An UNKNOWN field still fails loud — that safety property is the
+// whole point of MYC-3284 and is not weakened here. Anything uncertain (e.g.
+// pinInChatMessage, a real member action) keeps its marker until it is properly
+// decoded, so it stays visible rather than quietly disappearing.
+var carrierFields = map[string]bool{
+	// Rides alongside real content on many message types.
+	"messageContextInfo": true,
+	// Signal-protocol group sender-key distribution. No user payload, ever.
+	"senderKeyDistributionMessage": true,
+}
+
 // unsupportedMessageType names the populated content field(s) of a message
 // extractContent does not decode, so an undecodable-but-populated message is
-// stored as a distinct, queryable "unsupported" row instead of silently
-// collapsing to an empty "system" row (MYC-3284). messageContextInfo rides
-// alongside real content on many message types, so it is skipped; a message
+// stored with a distinct, queryable marker instead of silently collapsing to an
+// empty "system" row (MYC-3284). Fields in carrierFields are skipped; a message
 // with no other populated field is genuinely textless and returns "" (the
 // caller keeps its existing "system" classification). Deterministic (sorted)
 // so the stored value and the WARN are stable.
@@ -471,7 +491,7 @@ func unsupportedMessageType(m proto.Message) string {
 	}
 	var names []string
 	r.Range(func(fd protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
-		if name := string(fd.Name()); name != "messageContextInfo" {
+		if name := string(fd.Name()); !carrierFields[name] {
 			names = append(names, name)
 		}
 		return true

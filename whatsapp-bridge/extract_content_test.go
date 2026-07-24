@@ -13,12 +13,12 @@ import (
 // never silently collapse to an empty row that reads as "no text". This test
 // fails if the catch-all regresses to the silent drop.
 func TestExtractContent_UndecodableTypeFailsLoud(t *testing.T) {
-	// senderKeyDistributionMessage is a real whatsmeow type extractContent does
-	// not decode — it stands in for any unhandled type (poll, event, view-once,
-	// protocol, …) the switch does not name.
+	// pollCreationMessage is a real whatsmeow type extractContent does not
+	// decode AND which genuinely carries user content — it stands in for any
+	// unhandled content type (poll, event, view-once, edited, …).
 	evt := &events.Message{
 		Message: &waE2E.Message{
-			SenderKeyDistributionMessage: &waE2E.SenderKeyDistributionMessage{},
+			PollCreationMessage: &waE2E.PollCreationMessage{},
 		},
 	}
 	text, msgType := extractContent(evt)
@@ -26,8 +26,39 @@ func TestExtractContent_UndecodableTypeFailsLoud(t *testing.T) {
 	if text == "" {
 		t.Fatalf("MYC-3284 regression: undecodable message silently dropped as an empty %q row", msgType)
 	}
-	if unsupportedRawType(text) != "senderKeyDistributionMessage" {
+	if unsupportedRawType(text) != "pollCreationMessage" {
 		t.Fatalf("undecodable message must carry a marker naming the raw proto type; got content %q", text)
+	}
+}
+
+// A message carrying ONLY cryptographic/protocol plumbing has no user-visible
+// text, so it must stay a plain empty "system" row — NOT a placeholder line in
+// the member's chat file. Measured live: senderKeyDistributionMessage was 6 of
+// the first 8 markers written to the vault. The fail-loud property is intact:
+// see the test above, where an unknown CONTENT type still gets its marker.
+func TestExtractContent_ProtocolCarrierStaysSilent(t *testing.T) {
+	text, msgType := extractContent(&events.Message{
+		Message: &waE2E.Message{
+			SenderKeyDistributionMessage: &waE2E.SenderKeyDistributionMessage{},
+			MessageContextInfo:           &waE2E.MessageContextInfo{},
+		},
+	})
+	if text != "" || msgType != "system" {
+		t.Fatalf("protocol-only message must stay a silent empty system row, got (%q, %q)", text, msgType)
+	}
+}
+
+// ...but a carrier field riding ALONGSIDE an undecoded content field must not
+// mask it: the content field is still named.
+func TestExtractContent_CarrierDoesNotMaskRealContent(t *testing.T) {
+	text, _ := extractContent(&events.Message{
+		Message: &waE2E.Message{
+			SenderKeyDistributionMessage: &waE2E.SenderKeyDistributionMessage{},
+			EventMessage:                 &waE2E.EventMessage{},
+		},
+	})
+	if unsupportedRawType(text) != "eventMessage" {
+		t.Fatalf("carrier field must not mask a real undecoded content type; got %q", text)
 	}
 }
 
