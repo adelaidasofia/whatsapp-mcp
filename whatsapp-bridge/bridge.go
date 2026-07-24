@@ -411,16 +411,46 @@ func extractContent(evt *events.Message) (text, msgType string) {
 		return m.GetReactionMessage().GetText(), "reaction"
 	default:
 		// Fail LOUD (MYC-3284): a message that carries an undecoded CONTENT
-		// field is kept as a distinct, queryable "unsupported" row that NAMES
-		// the real proto type, never a silent empty "system" row that reads as
-		// "no text". A genuinely content-free message (metadata only) has no
-		// name and keeps its existing "system" classification unchanged.
+		// field keeps a NON-EMPTY marker naming the real proto type, so it is
+		// never a silent empty row that reads as "no text". A genuinely
+		// content-free message (metadata only) stays a plain empty "system".
+		//
+		// The marker rides in content_text, NOT in a new `type` value: the
+		// messages.type column has a CHECK constraint (migrations/001) that
+		// admits a fixed set, and SQLite cannot widen a CHECK without a full
+		// table rebuild — a disproportionate risk to a live message store just
+		// to relabel a rare row. The marker is what every reader keys on
+		// (unsupportedRawType), and it is queryable:
+		//   SELECT * FROM messages WHERE content_text LIKE '[unsupported: %'
 		if raw := unsupportedMessageType(m); raw != "" {
-			log.Printf("extractContent: undecoded WhatsApp message type %q — kept as type=unsupported (no text captured; add a decoder if it carries user text)", raw)
-			return "[unsupported: " + raw + "]", "unsupported"
+			log.Printf("extractContent: undecoded WhatsApp message type %q — stored with an explicit unsupported marker (no text captured; add a decoder if it carries user text)", raw)
+			return unsupportedMarker(raw), "system"
 		}
 		return "", "system"
 	}
+}
+
+// The content_text marker stored for an undecodable message. ONE declaration
+// shared by the writers (extractContent, baileysExtractContent) and every
+// reader (vault export, the /healthcheck by-type counts), so what is written
+// and what is parsed back can never drift (MYC-3284).
+const (
+	unsupportedPrefix = "[unsupported: "
+	unsupportedSuffix = "]"
+)
+
+// unsupportedMarker renders the content_text stored for an undecodable message.
+func unsupportedMarker(rawType string) string {
+	return unsupportedPrefix + rawType + unsupportedSuffix
+}
+
+// unsupportedRawType recovers the raw type from a stored marker, or "" when the
+// text is not one (a decoded message, or a legacy pre-MYC-3284 row).
+func unsupportedRawType(text string) string {
+	if !strings.HasPrefix(text, unsupportedPrefix) || !strings.HasSuffix(text, unsupportedSuffix) {
+		return ""
+	}
+	return text[len(unsupportedPrefix) : len(text)-len(unsupportedSuffix)]
 }
 
 // unsupportedMessageType names the populated content field(s) of a message

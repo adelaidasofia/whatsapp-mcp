@@ -160,6 +160,66 @@ type healthcheckResponse struct {
 	Timestamp      int64          `json:"timestamp"`
 	Transcription  map[string]any `json:"transcription,omitempty"`
 	AliasCoverage  AliasCoverage  `json:"alias_coverage"`
+	// MYC-3284 — what the bridge could not read, made measurable.
+	UndecodedTotal    int            `json:"undecoded_total"`
+	UndecodedByType   map[string]int `json:"undecoded_by_type"`
+	LegacyEmptySystem int            `json:"legacy_empty_system"`
+}
+
+// undecodedStats counts what the bridge could not read (MYC-3284), so the loss
+// is MEASURABLE instead of discovered by accident:
+//   - total / byType: messages stored with the explicit unsupported marker,
+//     keyed by the raw proto type recovered from it.
+//   - legacyEmpty: PRE-floor rows that were silently dropped to an empty
+//     "system" row and are still in the store. This is exactly the size of the
+//     remaining backfill, so it can be driven to zero instead of guessed at.
+//
+// A failed count is logged and reported as zero: the healthcheck must still
+// answer, and a logged error is not a silent one.
+func (s *Server) undecodedStats(ctx context.Context) (total int, byType map[string]int, legacyEmpty int) {
+	byType = map[string]int{}
+	// Keyed off the shared marker constant, never a copied literal, so the
+	// counter cannot drift from what the writer stores.
+	markerLike := unsupportedPrefix + "%"
+
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM messages WHERE content_text LIKE ?`, markerLike).Scan(&total); err != nil {
+		log.Printf("healthcheck: undecoded total query failed: %v", err)
+	}
+
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT COALESCE(content_text, ''), COUNT(*) FROM messages WHERE content_text LIKE ? GROUP BY content_text`,
+		markerLike)
+	if err != nil {
+		log.Printf("healthcheck: undecoded by-type query failed: %v", err)
+	} else {
+		defer rows.Close()
+		for rows.Next() {
+			var marker string
+			var n int
+			if err := rows.Scan(&marker, &n); err != nil {
+				log.Printf("healthcheck: undecoded by-type scan failed: %v", err)
+				continue
+			}
+			raw := unsupportedRawType(marker)
+			if raw == "" {
+				// A malformed marker still counts — reported as "unknown"
+				// rather than dropped, which is the bug this ticket is about.
+				raw = "unknown"
+			}
+			byType[raw] += n
+		}
+		if err := rows.Err(); err != nil {
+			log.Printf("healthcheck: undecoded by-type iteration failed: %v", err)
+		}
+	}
+
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM messages WHERE type = 'system' AND COALESCE(content_text, '') = ''`).Scan(&legacyEmpty); err != nil {
+		log.Printf("healthcheck: legacy empty-system query failed: %v", err)
+	}
+
+	return total, byType, legacyEmpty
 }
 
 func (s *Server) handleHealthcheck(w http.ResponseWriter, r *http.Request) {
@@ -207,14 +267,19 @@ func (s *Server) handleHealthcheck(w http.ResponseWriter, r *http.Request) {
 		log.Printf("healthcheck: alias coverage query failed: %v", covErr)
 	}
 
+	undecodedTotal, undecodedByType, legacyEmpty := s.undecodedStats(r.Context())
+
 	writeJSON(w, http.StatusOK, healthcheckResponse{
-		Status:        "ok",
-		Version:       "0.3.0",
-		DBEncrypted:   s.cfg.EncryptDB,
-		SchemaVer:     schemaVer,
-		Timestamp:     time.Now().Unix(),
-		Transcription: tx,
-		AliasCoverage: cov,
+		Status:            "ok",
+		Version:           "0.3.0",
+		DBEncrypted:       s.cfg.EncryptDB,
+		SchemaVer:         schemaVer,
+		Timestamp:         time.Now().Unix(),
+		Transcription:     tx,
+		AliasCoverage:     cov,
+		UndecodedTotal:    undecodedTotal,
+		UndecodedByType:   undecodedByType,
+		LegacyEmptySystem: legacyEmpty,
 	})
 }
 
