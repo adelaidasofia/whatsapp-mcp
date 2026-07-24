@@ -103,7 +103,7 @@ func (b *TranscriptBackfiller) SweepOnce(ctx context.Context) (int, error) {
 	cutoff := time.Now().Add(-time.Duration(b.windowDays) * 24 * time.Hour).Unix()
 
 	rows, err := b.db.QueryContext(ctx, `
-		SELECT id, media_key, media_direct_path, media_url, media_enc_sha256, media_sha256, media_file_length, media_key_timestamp
+		SELECT id, chat_jid, media_key, media_direct_path, media_url, media_enc_sha256, media_sha256, media_file_length, media_key_timestamp
 		FROM messages
 		WHERE type IN ('voice', 'audio')
 		  AND voice_note_transcript IS NULL
@@ -115,20 +115,39 @@ func (b *TranscriptBackfiller) SweepOnce(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("query pending: %w", err)
 	}
-	defer rows.Close()
+
+	// Buffer every candidate row and CLOSE the result set before doing any
+	// other DB work. The pool runs SetMaxOpenConns(1): while `rows` is open
+	// it owns the only connection, so a nested query from inside the loop
+	// (chatExcluded's chats lookup) waits forever for a connection this same
+	// goroutine holds — a self-deadlock that wedged every read until restart.
+	type pendingRow struct {
+		id, chatJID                     string
+		mediaKey, mediaEncSha, mediaSha []byte
+		directPath, mediaURL            sql.NullString
+		fileLength, mediaKeyTimestamp   sql.NullInt64
+	}
+	var pending []pendingRow
+	for rows.Next() {
+		var p pendingRow
+		if err := rows.Scan(&p.id, &p.chatJID, &p.mediaKey, &p.directPath, &p.mediaURL, &p.mediaEncSha, &p.mediaSha, &p.fileLength, &p.mediaKeyTimestamp); err != nil {
+			log.Printf("backfiller: row scan failed: %v", err)
+			continue
+		}
+		pending = append(pending, p)
+	}
+	iterErr := rows.Err()
+	rows.Close()
+	if iterErr != nil {
+		return 0, fmt.Errorf("rows iter: %w", iterErr)
+	}
 
 	enqueued := 0
-	swept := 0
-	for rows.Next() {
-		swept++
-		var (
-			id                                       string
-			mediaKey, mediaEncSha, mediaSha          []byte
-			directPath, mediaURL                     sql.NullString
-			fileLength, mediaKeyTimestamp            sql.NullInt64
-		)
-		if err := rows.Scan(&id, &mediaKey, &directPath, &mediaURL, &mediaEncSha, &mediaSha, &fileLength, &mediaKeyTimestamp); err != nil {
-			log.Printf("backfiller: row scan failed: %v", err)
+	for _, p := range pending {
+		// Excluded chats: skip quietly here (this sweep re-visits the same
+		// NULL-transcript rows every interval; logging the skip each time
+		// would flood the log). Enqueue keeps its own guard as safety net.
+		if b.transcriber.chatExcluded(p.chatJID) {
 			continue
 		}
 
@@ -136,31 +155,32 @@ func (b *TranscriptBackfiller) SweepOnce(ctx context.Context) (int, error) {
 		// can consume. URL or DirectPath alone is enough for the CDN fetch;
 		// the encryption fields decrypt the response.
 		audio := &waE2E.AudioMessage{
-			MediaKey:      mediaKey,
-			FileEncSHA256: mediaEncSha,
-			FileSHA256:    mediaSha,
+			MediaKey:      p.mediaKey,
+			FileEncSHA256: p.mediaEncSha,
+			FileSHA256:    p.mediaSha,
 		}
-		if directPath.Valid {
-			s := directPath.String
+		if p.directPath.Valid {
+			s := p.directPath.String
 			audio.DirectPath = &s
 		}
-		if mediaURL.Valid {
-			s := mediaURL.String
+		if p.mediaURL.Valid {
+			s := p.mediaURL.String
 			audio.URL = &s
 		}
-		if fileLength.Valid {
-			fl := uint64(fileLength.Int64)
+		if p.fileLength.Valid {
+			fl := uint64(p.fileLength.Int64)
 			audio.FileLength = &fl
 		}
-		if mediaKeyTimestamp.Valid {
-			mkt := mediaKeyTimestamp.Int64
+		if p.mediaKeyTimestamp.Valid {
+			mkt := p.mediaKeyTimestamp.Int64
 			audio.MediaKeyTimestamp = &mkt
 		}
 
 		client := b.client
-		messageID := id
+		messageID := p.id
 		b.transcriber.Enqueue(transcriptionJob{
 			MessageID: messageID,
+			ChatJID:   p.chatJID,
 			MimeType:  "audio/ogg; codecs=opus",
 			AudioDownloader: func(ctx context.Context) ([]byte, error) {
 				return client.Download(ctx, audio)
@@ -168,9 +188,7 @@ func (b *TranscriptBackfiller) SweepOnce(ctx context.Context) (int, error) {
 		})
 		enqueued++
 	}
-	if err := rows.Err(); err != nil {
-		return enqueued, fmt.Errorf("rows iter: %w", err)
-	}
+	swept := len(pending)
 
 	b.totalSwept.Add(int64(swept))
 	if enqueued > 0 {

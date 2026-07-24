@@ -322,6 +322,7 @@ func (b *Bridge) onMessage(evt *events.Message) {
 			client := b.client
 			b.transcriber.Enqueue(transcriptionJob{
 				MessageID: id,
+				ChatJID:   chatJID,
 				MimeType:  audio.GetMimetype(),
 				AudioDownloader: func(ctx context.Context) ([]byte, error) {
 					return client.Download(ctx, audioMsg)
