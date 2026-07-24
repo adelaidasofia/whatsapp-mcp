@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +17,8 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 // Bridge wraps a whatsmeow.Client and writes WhatsApp events into our SQLite database.
@@ -407,8 +410,47 @@ func extractContent(evt *events.Message) (text, msgType string) {
 	case m.GetReactionMessage() != nil:
 		return m.GetReactionMessage().GetText(), "reaction"
 	default:
+		// Fail LOUD (MYC-3284): a message that carries an undecoded CONTENT
+		// field is kept as a distinct, queryable "unsupported" row that NAMES
+		// the real proto type, never a silent empty "system" row that reads as
+		// "no text". A genuinely content-free message (metadata only) has no
+		// name and keeps its existing "system" classification unchanged.
+		if raw := unsupportedMessageType(m); raw != "" {
+			log.Printf("extractContent: undecoded WhatsApp message type %q — kept as type=unsupported (no text captured; add a decoder if it carries user text)", raw)
+			return "[unsupported: " + raw + "]", "unsupported"
+		}
 		return "", "system"
 	}
+}
+
+// unsupportedMessageType names the populated content field(s) of a message
+// extractContent does not decode, so an undecodable-but-populated message is
+// stored as a distinct, queryable "unsupported" row instead of silently
+// collapsing to an empty "system" row (MYC-3284). messageContextInfo rides
+// alongside real content on many message types, so it is skipped; a message
+// with no other populated field is genuinely textless and returns "" (the
+// caller keeps its existing "system" classification). Deterministic (sorted)
+// so the stored value and the WARN are stable.
+func unsupportedMessageType(m proto.Message) string {
+	if m == nil {
+		return ""
+	}
+	r := m.ProtoReflect()
+	if !r.IsValid() {
+		return ""
+	}
+	var names []string
+	r.Range(func(fd protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+		if name := string(fd.Name()); name != "messageContextInfo" {
+			names = append(names, name)
+		}
+		return true
+	})
+	if len(names) == 0 {
+		return ""
+	}
+	sort.Strings(names)
+	return strings.Join(names, ",")
 }
 
 func truncate(s string, n int) string {
