@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -384,7 +385,17 @@ func chatTypeFromJID(j types.JID) string {
 }
 
 func extractContent(evt *events.Message) (text, msgType string) {
-	m := evt.Message
+	return extractContentFromProto(evt.Message)
+}
+
+// extractContentFromProto is the proto-level content extractor shared by the
+// live receive path (extractContent) and the history-sync backfill
+// (processHistorySyncEvent). Both reach the same *waE2E.Message, so a
+// backfilled row is classified identically to a live one.
+func extractContentFromProto(m *waE2E.Message) (text, msgType string) {
+	if m == nil {
+		return "", "system"
+	}
 	switch {
 	case m.GetConversation() != "":
 		return m.GetConversation(), "text"

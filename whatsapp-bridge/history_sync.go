@@ -88,12 +88,61 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 		return
 	}
 
+	// Our own JID, used to attribute is_from_me=1 messages to a sender. Empty
+	// only if somehow unpaired mid-sync; then from-me rows get an empty sender.
+	var ownJID string
+	if id := b.client.Store.ID; id != nil {
+		ownJID = id.ToNonAD().String()
+	}
+
+	inserted := 0
 	updated := 0
 	scanned := 0
 	mediaSeen := 0
 	for _, conv := range convs {
-		log.Printf("history_sync: conversation %s has %d messages", conv.GetID(), len(conv.GetMessages()))
-		for _, hsMsg := range conv.GetMessages() {
+		chatJID := conv.GetID()
+		msgs := conv.GetMessages()
+		log.Printf("history_sync: conversation %s has %d messages", chatJID, len(msgs))
+		if chatJID == "" {
+			continue
+		}
+
+		// Newest message in this conversation, used to seed the chat row's
+		// sort key + preview without regressing a live chat's fresher values.
+		var convMaxTS int64
+		var convPreview string
+		for _, hsMsg := range msgs {
+			wm := hsMsg.GetMessage()
+			if wm == nil {
+				continue
+			}
+			if ts := int64(wm.GetMessageTimestamp()); ts >= convMaxTS {
+				convMaxTS = ts
+				c, _ := extractContentFromProto(wm.GetMessage())
+				convPreview = truncate(c, 120)
+			}
+		}
+
+		// Ensure the chat row exists BEFORE inserting messages: messages.chat_jid
+		// has a FOREIGN KEY to chats(jid) and the message DB runs with foreign_keys
+		// ON, so a missing parent row would fail every insert. MAX() guards keep a
+		// live chat's newer last_message_time from being clobbered by history.
+		chatName := conv.GetName()
+		if _, err := b.db.Exec(`
+			INSERT INTO chats (jid, chat_type, name, normalized_name, last_message_time, last_message_preview, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(jid) DO UPDATE SET
+				name              = COALESCE(chats.name, excluded.name),
+				normalized_name   = COALESCE(chats.normalized_name, excluded.normalized_name),
+				last_message_time = MAX(COALESCE(chats.last_message_time, 0), excluded.last_message_time),
+				updated_at        = excluded.updated_at
+		`, chatJID, chatTypeFromJIDString(chatJID), nullIfEmpty(chatName), nullIfEmpty(Normalize(chatName)),
+			convMaxTS, nullIfEmpty(convPreview), convMaxTS, convMaxTS); err != nil {
+			log.Printf("history_sync: chat upsert %s failed: %v", chatJID, err)
+			continue
+		}
+
+		for _, hsMsg := range msgs {
 			scanned++
 			wm := hsMsg.GetMessage()
 			if wm == nil {
@@ -103,17 +152,58 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 			if key == nil || key.GetID() == "" {
 				continue
 			}
+
+			content, msgType := extractContentFromProto(wm.GetMessage())
+			ts := int64(wm.GetMessageTimestamp())
+			fromMe := key.GetFromMe()
+
+			senderJID := chatJID
+			switch {
+			case fromMe:
+				senderJID = ownJID
+			case key.GetParticipant() != "":
+				senderJID = key.GetParticipant()
+			}
+			senderDisplay := wm.GetPushName()
+			if senderDisplay == "" {
+				senderDisplay = senderJID
+			}
+
+			normalized := Normalize(content)
+			scrubbed, flags := Scrub(content)
+			mfields, _ := extractFromMessage(wm.GetMessage())
+
+			// Insert the historical message. ON CONFLICT(id) DO NOTHING makes
+			// overlapping history chunks (and re-pairing) idempotent, and leaves
+			// any live-received row untouched. Columns mirror onMessage exactly,
+			// so a backfilled row is indistinguishable from a live one.
+			res, err := b.db.Exec(`
+				INSERT INTO messages (id, chat_jid, sender_jid, sender_display, timestamp, type, content_text, content_normalized, is_from_me, scrubbed_text, scrub_flags_json,
+					media_key, media_direct_path, media_url, media_enc_sha256, media_sha256, media_file_length, media_key_timestamp, media_mime)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				ON CONFLICT(id) DO NOTHING
+			`, key.GetID(), chatJID, senderJID, senderDisplay, ts, msgType, content, normalized,
+				boolToInt(fromMe), scrubbed, ScrubFlagsJSON(flags),
+				mfields.MediaKey, mfields.MediaDirectPath, mfields.MediaURL,
+				mfields.MediaEncSHA, mfields.MediaSHA, mfields.MediaFileLength,
+				mfields.MediaKeyTimestamp, mfields.MediaMime)
+			if err != nil {
+				log.Printf("history_sync: insert %s failed: %v", key.GetID(), err)
+				continue
+			}
+			if n, _ := res.RowsAffected(); n > 0 {
+				inserted += int(n)
+			}
+
+			// For rows that already existed with NULL media keys (pre-patch live
+			// receives), still backfill the media fields via COALESCE — the
+			// file's original purpose. A no-op for the row we just inserted.
 			fields, ok := extractFromMessage(wm.GetMessage())
 			if !ok || len(fields.MediaKey) == 0 {
 				continue
 			}
 			mediaSeen++
-
-			// Only fill in fields that are currently NULL. This protects
-			// rows where the live receive path already captured them
-			// (post-patch messages). It also makes overlapping HistorySync
-			// chunks idempotent.
-			res, err := b.db.Exec(`
+			ures, err := b.db.Exec(`
 				UPDATE messages
 				   SET media_key            = COALESCE(media_key, ?),
 				       media_direct_path    = COALESCE(media_direct_path, ?),
@@ -134,12 +224,32 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 				log.Printf("history_sync: update %s failed: %v", key.GetID(), err)
 				continue
 			}
-			n, _ := res.RowsAffected()
+			n, _ := ures.RowsAffected()
 			updated += int(n)
 		}
 	}
-	log.Printf("history_sync: scanned %d msgs across %d conversations (progress=%d), saw %d media-bearing, backfilled %d rows",
-		scanned, len(convs), chunk.GetProgress(), mediaSeen, updated)
+	log.Printf("history_sync: scanned %d msgs across %d conversations (progress=%d), inserted %d new, saw %d media-bearing, backfilled %d media rows",
+		scanned, len(convs), chunk.GetProgress(), inserted, mediaSeen, updated)
+}
+
+// chatTypeFromJIDString parses a raw JID string and returns the chats.chat_type
+// value. Falls back to "direct" when the JID cannot be parsed, so the CHECK
+// constraint on chats.chat_type is always satisfied.
+func chatTypeFromJIDString(jid string) string {
+	j, err := types.ParseJID(jid)
+	if err != nil {
+		return "direct"
+	}
+	return chatTypeFromJID(j)
+}
+
+// nullIfEmpty maps "" to a NULL so nullable TEXT columns stay NULL rather than
+// storing empty strings (keeps COALESCE-based upserts meaningful).
+func nullIfEmpty(s string) interface{} {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 // RequestChatHistory triggers WhatsApp to deliver `count` messages immediately
