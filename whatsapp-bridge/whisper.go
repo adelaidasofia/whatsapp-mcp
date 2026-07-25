@@ -33,9 +33,9 @@ type Transcriber struct {
 	cfg *Config
 	db  *sql.DB
 
-	jobs   chan transcriptionJob
+	jobs    chan transcriptionJob
 	workers int
-	wg     sync.WaitGroup
+	wg      sync.WaitGroup
 }
 
 type transcriptionJob struct {
@@ -95,12 +95,22 @@ func (t *Transcriber) Enqueue(j transcriptionJob) {
 // pattern. Patterns are normalized substrings compared against the chat JID and
 // the chat's stored name/normalized_name (accent-insensitive, so "Mamá" and
 // "mama" both match).
+// Fails CLOSED: if the chat lookup errors we cannot know whether this chat is
+// on the exclude list, and the member asked for those chats to never be
+// transcribed. Treating "unknown" as excluded costs a transcript; treating it
+// as allowed sends a private voice note through transcription, which is not
+// recoverable once done. sql.ErrNoRows is NOT an error here — a chat row may
+// legitimately not exist yet, and the JID still gets matched below.
 func (t *Transcriber) chatExcluded(chatJID string) bool {
 	if len(t.cfg.WhisperExcludeChats) == 0 || chatJID == "" {
 		return false
 	}
 	var name, normName string
-	_ = t.db.QueryRow(`SELECT COALESCE(name,''), COALESCE(normalized_name,'') FROM chats WHERE jid = ?`, chatJID).Scan(&name, &normName)
+	err := t.db.QueryRow(`SELECT COALESCE(name,''), COALESCE(normalized_name,'') FROM chats WHERE jid = ?`, chatJID).Scan(&name, &normName)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		log.Printf("transcriber: chat lookup for %s failed (%v); treating as EXCLUDED so a private chat is never transcribed on a lookup error", chatJID, err)
+		return true
+	}
 	hay := strings.ToLower(chatJID + " " + Normalize(name) + " " + normName)
 	for _, pat := range t.cfg.WhisperExcludeChats {
 		if strings.Contains(hay, pat) {
