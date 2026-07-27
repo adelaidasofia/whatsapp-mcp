@@ -200,7 +200,18 @@ func (s *Server) handleCreateDraft(w http.ResponseWriter, r *http.Request) {
 		} else if req.AsDocument {
 			kind = "document (" + mediaMIME + ")"
 		}
-		preview = fmt.Sprintf("%s, %s", kind, filepath.Base(filePath))
+		// Show the name the RECIPIENT will see, not the draft_id-based name
+		// the bytes happen to be stored under. The preview exists so the
+		// user can check what they are approving; showing them an internal
+		// identifier instead of the real filename defeats that.
+		shown := req.Filename
+		if shown == "" {
+			shown = filepath.Base(req.FilePath)
+		}
+		if shown == "" || shown == "." {
+			shown = filepath.Base(filePath)
+		}
+		preview = fmt.Sprintf("%s, %s", kind, shown)
 		if req.Caption != "" {
 			preview += " — " + truncate(req.Caption, 120)
 		}
