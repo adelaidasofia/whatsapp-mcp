@@ -126,23 +126,28 @@ func TestMaterializeFromPath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	path, mime, err := materializeOutboundFile(cfg, "draft-1", createDraftRequest{
+	got1, err := materializeOutboundFile(t.Context(), cfg, "draft-1", createDraftRequest{
 		SendType: "file",
 		FilePath: src,
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if mime != "image/png" {
-		t.Fatalf("mime = %q, want image/png", mime)
+	if got1.MIME != "image/png" {
+		t.Fatalf("mime = %q, want image/png", got1.MIME)
+	}
+	// The name the recipient sees comes from the source file, not from the
+	// draft id the bytes are stored under.
+	if got1.Filename != "photo.png" {
+		t.Fatalf("filename = %q, want photo.png", got1.Filename)
 	}
 	// The bytes must be copied into the bridge's own directory, not merely
 	// referenced: the caller is free to delete or overwrite their file
 	// between draft and confirm.
-	if !strings.HasPrefix(path, outboundDir(cfg)) {
-		t.Fatalf("file should live under the outbound dir, got %q", path)
+	if !strings.HasPrefix(got1.Path, outboundDir(cfg)) {
+		t.Fatalf("file should live under the outbound dir, got %q", got1.Path)
 	}
-	got, err := os.ReadFile(path)
+	got, err := os.ReadFile(got1.Path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +158,7 @@ func TestMaterializeFromPath(t *testing.T) {
 
 func TestMaterializeFromBase64(t *testing.T) {
 	cfg := testConfig(t)
-	path, mime, err := materializeOutboundFile(cfg, "draft-2", createDraftRequest{
+	got, err := materializeOutboundFile(t.Context(), cfg, "draft-2", createDraftRequest{
 		SendType:   "file",
 		FileBase64: base64.StdEncoding.EncodeToString(tinyPNG),
 		Filename:   "recibo.png",
@@ -161,11 +166,11 @@ func TestMaterializeFromBase64(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if mime != "image/png" {
-		t.Fatalf("mime = %q, want image/png", mime)
+	if got.MIME != "image/png" {
+		t.Fatalf("mime = %q, want image/png", got.MIME)
 	}
-	if filepath.Ext(path) != ".png" {
-		t.Fatalf("extension should come from the filename, got %q", path)
+	if filepath.Ext(got.Path) != ".png" {
+		t.Fatalf("extension should come from the filename, got %q", got.Path)
 	}
 }
 
@@ -182,14 +187,27 @@ func TestMaterializeRejectsBadInput(t *testing.T) {
 		want string
 	}{
 		{
-			"neither path nor bytes",
+			"no source at all",
 			createDraftRequest{SendType: "file"},
 			"required",
 		},
 		{
 			"both path and bytes",
 			createDraftRequest{SendType: "file", FilePath: existing, FileBase64: "aGk="},
-			"not both",
+			"exactly one",
+		},
+		{
+			"both path and url",
+			createDraftRequest{SendType: "file", FilePath: existing, FileURL: "https://example.com/a.png"},
+			"exactly one",
+		},
+		{
+			"all three sources",
+			createDraftRequest{
+				SendType: "file", FilePath: existing, FileBase64: "aGk=",
+				FileURL: "https://example.com/a.png",
+			},
+			"exactly one",
 		},
 		{
 			"missing file",
@@ -214,7 +232,7 @@ func TestMaterializeRejectsBadInput(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			_, _, err := materializeOutboundFile(cfg, "d", tc.req)
+			_, err := materializeOutboundFile(t.Context(), cfg, "d", tc.req)
 			if err == nil {
 				t.Fatal("expected an error")
 			}
@@ -233,7 +251,7 @@ func TestMaterializeRejectsEmptyFile(t *testing.T) {
 	}
 	// An empty file uploads "successfully" and arrives as an unopenable
 	// attachment, so it is worth failing before the network call.
-	if _, _, err := materializeOutboundFile(cfg, "d", createDraftRequest{
+	if _, err := materializeOutboundFile(t.Context(), cfg, "d", createDraftRequest{
 		SendType: "file", FilePath: empty,
 	}); err == nil {
 		t.Fatal("expected an empty file to be rejected")
@@ -245,7 +263,7 @@ func TestMaterializeEnforcesSizeLimit(t *testing.T) {
 	// Declared as an image so the 16 MiB ceiling applies rather than the
 	// document one, keeping the allocation modest.
 	big := make([]byte, maxImageBytes+1)
-	_, _, err := materializeOutboundFile(cfg, "d", createDraftRequest{
+	_, err := materializeOutboundFile(t.Context(), cfg, "d", createDraftRequest{
 		SendType:   "file",
 		FileBase64: base64.StdEncoding.EncodeToString(big),
 		Filename:   "huge.jpg",

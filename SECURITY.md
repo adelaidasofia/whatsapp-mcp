@@ -45,6 +45,7 @@ This MCP reads and writes your personal WhatsApp. Treat it as equivalent to your
 7. **No telemetry.** Zero external network calls except:
    - WhatsApp's multidevice endpoint (required for the tool to function).
    - OpenAI Whisper API only if `WHATSAPP_WHISPER_BACKEND=openai-api` is explicitly set (default is local `whisper.cpp`).
+   - The host named by `file_url` on a `send_file` / `send_audio` draft, and only when the caller passes one. This is the only call whose destination the caller chooses, which is why it is guarded separately — see decision 11.
 
 8. **No webhooks by default.** Set `WHATSAPP_WEBHOOK_URL` to enable; off by default.
 
@@ -77,6 +78,20 @@ This MCP reads and writes your personal WhatsApp. Treat it as equivalent to your
 9. **Session key in Keychain, not in plaintext.** The WhatsApp session credentials are stored in macOS Keychain. Never written to a dotfile, never committed.
 
 10. **MIT license + threat model.** Publishing as public GitHub repo with explicit threat model so contributors and forkers know the security expectations upfront.
+
+11. **`file_url` downloads are SSRF-guarded.** `send_file` / `send_audio` accept a `file_url` the bridge fetches itself, because a remote client has no filesystem here and `file_base64` cannot carry more than about 100 KB through the model's context. That makes the bridge issue requests to a host the *caller* chose, from inside the user's home network, with the response body ending up in a WhatsApp message. Four controls in `whatsapp-bridge/fetch_url.go` bound it:
+
+    1. **Every redirect hop is revalidated,** via `http.Client.CheckRedirect`, which runs per hop by construction. Validating only the submitted URL would let a `302 → 169.254.169.254` through and put instance-metadata credentials into a chat. Capped at 5 hops.
+
+    2. **The address actually dialed is checked, not the hostname.** A custom `DialContext` resolves the host, refuses it if *any* answer is internal, and then connects to the vetted address rather than re-resolving the name — so a DNS answer cannot change between the check and the connection. Blocked: loopback, `10/8`, `172.16/12`, `192.168/16`, `fc00::/7`, CGNAT `100.64/10`, multicast, unspecified, and `169.254.0.0/16` plus `fe80::/10`. IPv4-mapped IPv6 is unmapped first, so `::ffff:169.254.169.254` is the same address as `169.254.169.254`.
+
+    3. **The size cap is enforced while reading,** with `io.LimitReader(body, max+1)`. `Content-Length` is a claim — absent under chunked encoding, and free to lie — so it is used only as a cheap early rejection.
+
+    4. **`text/html` is refused,** by declared type and by sniffing the body when no type is declared. Google Drive answers `200 OK` with a login page for a file that is not shared publicly; without this the recipient receives that page dressed up as a photo and nothing reports a problem. The error tells the user to share the file as "anyone with the link".
+
+    `https` only, on the initial URL and every hop: an `http` hop can be rewritten in flight, which would undo every check made before it. Drive share links (`/file/d/<id>/view`, `?id=<id>`) are rewritten to `drive.usercontent.google.com/download` first, which is the only Drive form that serves bytes rather than a web page or an antivirus interstitial.
+
+    Enforced by `whatsapp-bridge/fetch_url_test.go`. `TestRedirectToInstanceMetadataIsBlockedAtTheHop` is deliberately the first test in the file: it is the one that breaks silently if someone "simplifies" the redirect handling into following redirects automatically. The test-only address policy permits loopback (the only place an `httptest` server can live) and delegates to the real `blockedIP` for every other address, so a test that expects a refusal is still judged by the production guard.
 
 ## Tool risk-tier classification
 
