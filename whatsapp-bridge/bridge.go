@@ -232,15 +232,33 @@ func (b *Bridge) onMessage(evt *events.Message) {
 	}
 
 	// Upsert chat row (minimal; full chat sync happens via HistorySync).
+	//
+	// The COALESCE on name runs the opposite way round to the one in
+	// history_sync.go, deliberately. There, existing wins: historical data must
+	// not clobber a live name. Here, the incoming value wins when there is one,
+	// because for an incoming direct message the sender IS the counterparty and
+	// their current push name is the freshest label that exists — and because
+	// that is what repairs a row some earlier message named wrongly.
+	//
+	// The two name columns go in as NULL rather than "" when the message is not
+	// entitled to name the chat, so the COALESCE above has something to fall
+	// through on. An empty string would satisfy COALESCE and blank the name.
+	var chatName, chatNameNorm sql.NullString
+	if n := chatNameFromMessage(evt.Info.IsGroup, evt.Info.IsFromMe, evt.Info.PushName); n != "" {
+		chatName = sql.NullString{String: n, Valid: true}
+		chatNameNorm = sql.NullString{String: Normalize(n), Valid: true}
+	}
 	_, err := b.db.Exec(`
 		INSERT INTO chats (jid, chat_type, name, normalized_name, created_at, updated_at, last_message_id, last_message_time, last_message_preview)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(jid) DO UPDATE SET
+			name = COALESCE(excluded.name, chats.name),
+			normalized_name = COALESCE(excluded.normalized_name, chats.normalized_name),
 			last_message_id = excluded.last_message_id,
 			last_message_time = excluded.last_message_time,
 			last_message_preview = excluded.last_message_preview,
 			updated_at = excluded.updated_at
-	`, chatJID, chatTypeFromJID(evt.Info.Chat), senderDisplay, Normalize(senderDisplay),
+	`, chatJID, chatTypeFromJID(evt.Info.Chat), chatName, chatNameNorm,
 		ts, ts, id, ts, truncate(content, 120))
 	if err != nil {
 		log.Printf("onMessage: chat upsert failed: %v", err)
@@ -370,6 +388,33 @@ func (b *Bridge) onCallTerminate(evt *events.CallTerminate) {
 }
 
 // --- Helpers ---------------------------------------------------------------
+
+// chatNameFromMessage returns the name a message is entitled to give its chat,
+// or "" when the message says nothing about what the chat should be called.
+//
+// A sender's name is not a chat's name, and conflating the two is the bug this
+// exists to prevent. Only one case makes them the same: an incoming direct
+// message, where the sender IS the other party. The rest are actively wrong.
+//
+//   - Outgoing message. evt.Info.PushName is the ACCOUNT OWNER's push name, not
+//     the recipient's. Naming the chat from it labels the conversation after the
+//     user themselves, which is how ten distinct @lid chats on this account all
+//     ended up reading as the owner. The recipient's name is simply not in the
+//     event; the contacts table and history sync have it.
+//   - Group message. PushName is whichever participant happened to speak, never
+//     the group subject.
+//
+// An empty push name also yields "", rather than falling back to the sender's
+// JID user part the way sender_display does. For an @lid JID that part is an
+// opaque LID number, and a chat labelled with one is worse than a chat with no
+// label: NULL is a state every other writer knows how to fill, while a wrong
+// name is indistinguishable from a right one.
+func chatNameFromMessage(isGroup, isFromMe bool, pushName string) string {
+	if isGroup || isFromMe {
+		return ""
+	}
+	return strings.TrimSpace(pushName)
+}
 
 func chatTypeFromJID(j types.JID) string {
 	switch j.Server {
