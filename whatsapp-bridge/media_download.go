@@ -100,20 +100,36 @@ func fieldsFrom(m downloadable) mediaFields {
 // extractDownloadableFields pulls the download-relevant fields out of any
 // media-bearing message. Returns ok=false for text/system/reaction/etc.
 func extractDownloadableFields(evt *events.Message) (mediaFields, bool) {
-	if m := evt.Message.GetImageMessage(); m != nil {
-		return fieldsFrom(m), true
+	return extractDownloadableFieldsFromProto(evt.Message)
+}
+
+// extractDownloadableFieldsFromProto is the proto-level extractor shared by the
+// receive path (extractDownloadableFields) and the confirm path in sends.go.
+//
+// The confirm path needs it because a message the bridge sends itself is never
+// echoed back by WhatsApp — the server does not return your own send to the
+// device that originated it. So the only chance to record the media keys for an
+// outbound file is right after Upload, from the protobuf that carries them.
+// Mirrors the extractContent / extractContentFromProto split for the same
+// reason: one classifier, so a sent row and a received row cannot disagree.
+func extractDownloadableFieldsFromProto(m *waE2E.Message) (mediaFields, bool) {
+	if m == nil {
+		return mediaFields{}, false
 	}
-	if m := evt.Message.GetVideoMessage(); m != nil {
-		return fieldsFrom(m), true
+	if x := m.GetImageMessage(); x != nil {
+		return fieldsFrom(x), true
 	}
-	if m := evt.Message.GetDocumentMessage(); m != nil {
-		return fieldsFrom(m), true
+	if x := m.GetVideoMessage(); x != nil {
+		return fieldsFrom(x), true
 	}
-	if m := evt.Message.GetAudioMessage(); m != nil {
-		return fieldsFrom(m), true
+	if x := m.GetDocumentMessage(); x != nil {
+		return fieldsFrom(x), true
 	}
-	if m := evt.Message.GetStickerMessage(); m != nil {
-		return fieldsFrom(m), true
+	if x := m.GetAudioMessage(); x != nil {
+		return fieldsFrom(x), true
+	}
+	if x := m.GetStickerMessage(); x != nil {
+		return fieldsFrom(x), true
 	}
 	return mediaFields{}, false
 }

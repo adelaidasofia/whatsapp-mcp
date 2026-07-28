@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waE2E"
+	"google.golang.org/protobuf/proto"
 )
 
 // A minimal but real PNG. Used where the test needs bytes that content
@@ -273,6 +275,125 @@ func TestMaterializeEnforcesSizeLimit(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "WhatsApp") {
 		t.Fatalf("the error should explain the limit is WhatsApp's: %v", err)
+	}
+}
+
+// --- how a sent message gets archived ---------------------------------------
+
+// TestSentMessageClassification pins the fix for outbound rows being archived
+// as text.
+//
+// The confirm handler used to write the literal 'text' into messages.type, so
+// every image, document and voice note the bridge sent was recorded in the
+// user's own history as a text message. Nothing could correct it afterwards:
+// the insert is ON CONFLICT DO NOTHING, and WhatsApp does not echo a message
+// back to the device that originated it, so that row is the only record that
+// will ever exist. A message sent from the phone came out as type=image while
+// the same message sent through the bridge came out as type=text.
+//
+// The fix classifies the outbound protobuf with the SAME extractor the receive
+// path uses. So what this test asserts is that the two agree by construction —
+// not that some parallel mapping table happens to be correct today.
+func TestSentMessageClassification(t *testing.T) {
+	const url, dpath = "https://mmg.whatsapp.net/d", "/v/t62/f"
+	key, encSHA, sha := []byte("mediakey"), []byte("encsha"), []byte("sha")
+
+	tests := []struct {
+		name      string
+		msg       *waE2E.Message
+		wantType  string
+		wantMedia bool
+	}{
+		{
+			name: "image",
+			msg: &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
+				Mimetype: proto.String("image/png"), URL: proto.String(url), DirectPath: proto.String(dpath),
+				MediaKey: key, FileEncSHA256: encSHA, FileSHA256: sha, FileLength: proto.Uint64(2150029),
+			}},
+			wantType: "image", wantMedia: true,
+		},
+		{
+			name: "video",
+			msg: &waE2E.Message{VideoMessage: &waE2E.VideoMessage{
+				Mimetype: proto.String("video/mp4"), URL: proto.String(url), DirectPath: proto.String(dpath),
+				MediaKey: key, FileEncSHA256: encSHA, FileSHA256: sha,
+			}},
+			wantType: "video", wantMedia: true,
+		},
+		{
+			name: "document",
+			msg: &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{
+				FileName: proto.String("contrato.pdf"), Mimetype: proto.String("application/pdf"),
+				URL: proto.String(url), DirectPath: proto.String(dpath),
+				MediaKey: key, FileEncSHA256: encSHA, FileSHA256: sha,
+			}},
+			wantType: "document", wantMedia: true,
+		},
+		{
+			name: "audio attachment",
+			msg: &waE2E.Message{AudioMessage: &waE2E.AudioMessage{
+				Mimetype: proto.String("audio/mpeg"), PTT: proto.Bool(false),
+				URL: proto.String(url), DirectPath: proto.String(dpath),
+				MediaKey: key, FileEncSHA256: encSHA, FileSHA256: sha,
+			}},
+			wantType: "audio", wantMedia: true,
+		},
+		{
+			// The PTT flag is the only thing separating these two, and it is the
+			// bit send_audio's voice_note parameter exists to set.
+			name: "voice note",
+			msg: &waE2E.Message{AudioMessage: &waE2E.AudioMessage{
+				Mimetype: proto.String("audio/ogg; codecs=opus"), PTT: proto.Bool(true),
+				URL: proto.String(url), DirectPath: proto.String(dpath),
+				MediaKey: key, FileEncSHA256: encSHA, FileSHA256: sha,
+			}},
+			wantType: "voice", wantMedia: true,
+		},
+		{
+			// The one case where 'text' is the right answer.
+			name:     "plain text",
+			msg:      &waE2E.Message{Conversation: proto.String("hola")},
+			wantType: "text", wantMedia: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, gotType := extractContentFromProto(tc.msg)
+			if gotType != tc.wantType {
+				t.Fatalf("type = %q, want %q", gotType, tc.wantType)
+			}
+			if gotType == "text" && tc.wantType != "text" {
+				t.Fatal("this is the regression: media archived as a text message")
+			}
+
+			fields, ok := extractDownloadableFieldsFromProto(tc.msg)
+			if ok != tc.wantMedia {
+				t.Fatalf("media fields present = %v, want %v", ok, tc.wantMedia)
+			}
+			if !tc.wantMedia {
+				return
+			}
+			// Without these the row is a media message with no way to fetch it,
+			// which is what download_media reports as an orphan.
+			if string(fields.MediaKey) != string(key) {
+				t.Fatalf("media key not carried: %q", fields.MediaKey)
+			}
+			if !fields.MediaDirectPath.Valid || fields.MediaDirectPath.String != dpath {
+				t.Fatalf("direct path not carried: %+v", fields.MediaDirectPath)
+			}
+			if !fields.MediaURL.Valid || fields.MediaURL.String != url {
+				t.Fatalf("url not carried: %+v", fields.MediaURL)
+			}
+		})
+	}
+}
+
+func TestExtractDownloadableFieldsFromProtoHandlesNil(t *testing.T) {
+	// The confirm path calls this on whatever buildMediaMessage returned; a nil
+	// message must be a clean "no media", not a panic mid-send.
+	if _, ok := extractDownloadableFieldsFromProto(nil); ok {
+		t.Fatal("nil message should report no media fields")
 	}
 }
 

@@ -431,18 +431,46 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 		sentAt, whatsappID, draftID)
 
 	// Also persist the sent message in messages table so it shows up in chat history.
+	//
+	// The row is classified by the SAME extractor the receive path uses, rather
+	// than by a literal here. The type used to be hardcoded 'text', so every
+	// image, document and voice note the bridge sent was archived as a text
+	// message — and because the insert is ON CONFLICT DO NOTHING, nothing could
+	// ever correct it. WhatsApp does not echo a message back to the device that
+	// sent it, so this row is the only record that will ever exist: whatever it
+	// gets wrong stays wrong.
+	//
+	// extractDownloadableFieldsFromProto reads the upload result back off the
+	// protobuf we just sent, so download_media works on our own sent media
+	// instead of finding a media row with no keys.
 	senderJID := ""
 	if s.bridge.client.Store.ID != nil {
 		senderJID = s.bridge.client.Store.ID.String()
 	}
-	scrubbed, flags := Scrub(contentText)
+	persistText, persistType := extractContentFromProto(msg)
+	mfields, _ := extractDownloadableFieldsFromProto(msg)
+	scrubbed, flags := Scrub(persistText)
 	_, err = s.db.ExecContext(r.Context(), `
-		INSERT INTO messages (id, chat_jid, sender_jid, timestamp, type, content_text, content_normalized, is_from_me, scrubbed_text, scrub_flags_json)
-		VALUES (?, ?, ?, ?, 'text', ?, ?, 1, ?, ?)
+		INSERT INTO messages (id, chat_jid, sender_jid, sender_display, timestamp, type, content_text, content_normalized, is_from_me, scrubbed_text, scrub_flags_json,
+			media_key, media_direct_path, media_url, media_enc_sha256, media_sha256, media_file_length, media_key_timestamp, media_mime)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO NOTHING
-	`, whatsappID, recipientJID, senderJID, sentAt, contentText, Normalize(contentText), scrubbed, ScrubFlagsJSON(flags))
+	`, whatsappID, recipientJID, senderJID, nullString(s.bridge.client.Store.PushName), sentAt, persistType,
+		persistText, Normalize(persistText), scrubbed, ScrubFlagsJSON(flags),
+		mfields.MediaKey, mfields.MediaDirectPath, mfields.MediaURL,
+		mfields.MediaEncSHA, mfields.MediaSHA, mfields.MediaFileLength,
+		mfields.MediaKeyTimestamp, mfields.MediaMime)
 	if err != nil {
 		log.Printf("sent-message persist failed: %v", err)
+	}
+
+	// The draft's bytes have served their purpose: Upload happened above, and a
+	// confirmed draft can never be sent again. Nothing else deletes them —
+	// removeOutboundFile is otherwise only reached by a failed insert or by an
+	// attempt to confirm an already-expired draft — so without this every file
+	// ever sent accumulates in the outbound directory forever.
+	if rmErr := removeOutboundFile(mediaPath); rmErr != nil {
+		log.Printf("draft %s sent; removing %s failed: %v", draftID, mediaPath, rmErr)
 	}
 
 	writeJSON(w, http.StatusOK, confirmResponse{

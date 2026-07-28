@@ -13,8 +13,15 @@
 //     provide. So drafts only ever touch the local disk; Upload runs in
 //     confirm.
 //
-//  2. Nothing here mutates a draft's stored bytes. A draft that expires or is
-//     abandoned leaves a file behind, so expiry sweeps delete it.
+//  2. Nothing here mutates a draft's stored bytes; deletion is the caller's
+//     job, and sends.go does it at three points: a failed draft insert, a
+//     confirm that finds the draft already expired, and a successful send
+//     (where Upload has already happened, so the file is spent).
+//
+//     One gap remains, stated rather than implied: a draft that is created and
+//     then simply abandoned keeps its bytes until someone tries to confirm it.
+//     There is no periodic sweeper. That path leaks one file per abandoned
+//     draft, unlike the send path, which used to leak one per message sent.
 //
 // Voice notes are the one place a plain file is not enough: WhatsApp renders
 // a message as a voice note (PTT) only when the audio is Opus in an Ogg
