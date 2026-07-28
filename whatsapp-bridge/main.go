@@ -165,6 +165,18 @@ func main() {
 			return
 		}
 		log.Printf("jid alias backfill: %d new edges written, %d phone columns repaired", written, repaired)
+
+		// Address-book names, after the alias backfill and deliberately so:
+		// naming a chat walks jid_aliases to reach the row the user actually
+		// sees, so every edge just written is one more chat this can name.
+		// Reversing the order would silently name fewer of them.
+		// See contacts_sync.go.
+		named, renamed, err := SyncContactNames(ctx, db, bridge.Client())
+		if err != nil {
+			log.Printf("contact name sync failed (non-fatal): %v", err)
+			return
+		}
+		log.Printf("contact name sync: %d address-book entries, %d chat(s) named", named, renamed)
 	}()
 
 	server := NewServer(cfg, db, bridge, backfiller)

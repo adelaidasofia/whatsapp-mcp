@@ -320,13 +320,35 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 
 // resolveRecipient looks up a human-readable display for a JID from our contacts table.
 // Returns (display, true) if we found a contact; (jid, false) otherwise.
+// resolveRecipient turns a JID into the label shown in a draft preview, which
+// is the string the user reads before approving a send. Getting it wrong does
+// not corrupt anything, but it removes the only check the two-step flow exists
+// to provide.
+//
+// Two things it used to get wrong, both visible on a real send:
+//
+//   - It looked up the JID exactly, ignoring jid_aliases. A contact row keyed
+//     by @lid and a draft addressed to the phone-number JID are the same human,
+//     and the lookup missed. The preview then echoed the raw JID and reported
+//     recipient_contact_hit=false, while the information sat one join away.
+//   - It never consulted the address book. verified_name and push_name are what
+//     the CONTACT chose; full_name is what the USER chose, and it is the name
+//     they will recognise. Preferring it means the preview says "Mi Amor" where
+//     the user thinks "Mi Amor".
 func (s *Server) resolveRecipient(ctx context.Context, jid string) (string, bool) {
-	var pushName, verifiedName, phone sql.NullString
+	var fullName, pushName, verifiedName, phone sql.NullString
 	err := s.db.QueryRowContext(ctx, `
-		SELECT push_name, verified_name, phone FROM contacts WHERE jid = ?
-	`, jid).Scan(&pushName, &verifiedName, &phone)
+		SELECT full_name, push_name, verified_name, phone
+		FROM contacts
+		WHERE jid = ? OR jid IN (SELECT jid_b FROM jid_aliases WHERE jid_a = ?)
+		ORDER BY (jid = ?) DESC, updated_at DESC
+		LIMIT 1
+	`, jid, jid, jid).Scan(&fullName, &pushName, &verifiedName, &phone)
 	if err != nil {
 		return jid, false
+	}
+	if fullName.Valid && fullName.String != "" {
+		return fullName.String, true
 	}
 	if verifiedName.Valid && verifiedName.String != "" {
 		return verifiedName.String, true
