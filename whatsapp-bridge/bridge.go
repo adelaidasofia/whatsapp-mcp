@@ -38,6 +38,10 @@ type Bridge struct {
 	// holding a request-scoped ctx.
 	rootCtx context.Context
 
+	// walker drives the MYC-3284 backfill's backwards walk through chat
+	// history. See backfill_walk.go.
+	walker *backfillWalker
+
 	mu            sync.RWMutex
 	connected     bool
 	authenticated bool
@@ -91,6 +95,7 @@ func NewBridge(ctx context.Context, cfg *Config, db *sql.DB, dbKey string, trans
 		transcriber: transcriber,
 		rootCtx:     ctx,
 		authState:   AuthStateUnauthenticated,
+		walker:      newBackfillWalker(),
 	}
 	client.AddEventHandler(b.handleEvent)
 	return b, nil

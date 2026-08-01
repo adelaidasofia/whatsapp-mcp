@@ -94,6 +94,12 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 	decoded := 0
 	for _, conv := range convs {
 		log.Printf("history_sync: conversation %s has %d messages", conv.GetID(), len(conv.GetMessages()))
+
+		// Track the OLDEST message in this conversation's chunk. It becomes
+		// the anchor for the next step backwards (backfill_walk.go); without
+		// it the walk would re-request the same window forever.
+		var oldest chunkAnchor
+
 		for _, hsMsg := range conv.GetMessages() {
 			scanned++
 			wm := hsMsg.GetMessage()
@@ -103,6 +109,9 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 			key := wm.GetKey()
 			if key == nil || key.GetID() == "" {
 				continue
+			}
+			if ts := int64(wm.GetMessageTimestamp()); ts > 0 && (oldest.TS == 0 || ts < oldest.TS) {
+				oldest = chunkAnchor{ID: key.GetID(), TS: ts, FromMe: key.GetFromMe()}
 			}
 
 			// Re-decode rows the pre-MYC-3284 decoder stored empty. Runs BEFORE
@@ -149,6 +158,13 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 			n, _ := res.RowsAffected()
 			updated += int(n)
 		}
+
+		// Decide whether this chat keeps walking backwards. Every stop
+		// condition lives in the walker, so delivery just reports where the
+		// chunk ended and obeys the verdict.
+		if conv.GetID() != "" {
+			b.continueWalk(context.Background(), conv.GetID(), oldest)
+		}
 	}
 	log.Printf("history_sync: scanned %d msgs across %d conversations (progress=%d), saw %d media-bearing, backfilled %d media rows, re-decoded %d empty rows",
 		scanned, len(convs), chunk.GetProgress(), mediaSeen, updated, decoded)
@@ -186,6 +202,10 @@ func (b *Bridge) RequestChatHistory(ctx context.Context, chatJID string, count i
 	//
 	// Earlier mistake: anchoring on the OLDEST message asks for pre-history
 	// (messages before the chat started), which always returns zero results.
+	//
+	// Note this reaches only the most recent `count` messages, and re-calling
+	// it returns the SAME window every time. Walking further back is
+	// RequestHistoryBefore's job — see backfill_walk.go.
 	var (
 		msgID    string
 		ts       int64
@@ -207,6 +227,41 @@ func (b *Bridge) RequestChatHistory(ctx context.Context, chatJID string, count i
 		return
 	}
 	anchorID = msgID
+
+	resp, err = b.RequestHistoryBefore(ctx, chatJID, msgID, ts, isFromMe == 1, count)
+	return
+}
+
+// RequestHistoryBefore asks WhatsApp for the `count` messages immediately
+// before an EXPLICIT anchor, rather than before the newest row we hold.
+//
+// This is what makes walking backwards possible. RequestChatHistory always
+// anchors on the newest message, so calling it repeatedly returns the same
+// most-recent window forever — measured live 2026-08-01: a second sweep of 40
+// chats delivered 8 more chunks and recovered 0 additional rows. Feeding the
+// OLDEST message of each delivered chunk back in as the next anchor is what
+// actually advances through a chat's history.
+func (b *Bridge) RequestHistoryBefore(ctx context.Context, chatJID, anchorID string, anchorTS int64, anchorFromMe bool, count int) (resp whatsmeow.SendResponse, err error) {
+	if !b.IsConnected() {
+		err = errors.New("bridge not connected; cannot request history")
+		return
+	}
+	if anchorID == "" {
+		err = errors.New("anchor message id required")
+		return
+	}
+	if count <= 0 {
+		count = 50
+	}
+	if count > 200 {
+		count = 200
+	}
+
+	msgID, ts := anchorID, anchorTS
+	isFromMe := 0
+	if anchorFromMe {
+		isFromMe = 1
+	}
 
 	chat, parseErr := types.ParseJID(chatJID)
 	if parseErr != nil {
@@ -318,7 +373,7 @@ func (b *Bridge) CountEmptySystemRows(ctx context.Context) (int, error) {
 // status@broadcast is excluded: WhatsApp does not answer on-demand history
 // requests for it (verified live — the request sends, no chunk ever arrives),
 // so including it burns request budget for nothing.
-func (b *Bridge) SweepDecodeBackfill(ctx context.Context, maxChats, perChat int) (requested int, skipped int, remaining int, err error) {
+func (b *Bridge) SweepDecodeBackfill(ctx context.Context, maxChats, perChat, walkBudget, maxRounds int) (requested int, skipped int, remaining int, err error) {
 	if !b.IsConnected() {
 		return 0, 0, 0, errors.New("bridge not connected; cannot request history")
 	}
@@ -361,7 +416,28 @@ func (b *Bridge) SweepDecodeBackfill(ctx context.Context, maxChats, perChat int)
 		return 0, 0, remaining, fmt.Errorf("iterate affected chats: %w", rErr)
 	}
 
+	// Re-arm the walker for this sweep: fresh per-chat state and a fresh
+	// global request budget. Also release any chat left pinned by an
+	// unanswered request from a previous sweep.
+	b.walker.sweepStale()
+	b.walker.reset(walkBudget, maxRounds, perChat)
+
 	for _, jid := range targets {
+		// Anchor the FIRST request on the newest message, then register the
+		// chat as walking. begin() returns false when the global budget is
+		// already spent, in which case no request is issued at all.
+		var anchorTS int64
+		if tsErr := b.db.QueryRowContext(ctx,
+			`SELECT timestamp FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT 1`, jid,
+		).Scan(&anchorTS); tsErr != nil {
+			log.Printf("decode backfill: no anchor for %s: %v", jid, tsErr)
+			skipped++
+			continue
+		}
+		if !b.walker.begin(jid, anchorTS, perChat) {
+			skipped++
+			continue
+		}
 		if _, _, reqErr := b.RequestChatHistory(ctx, jid, perChat); reqErr != nil {
 			// One chat failing (left group, deleted, unparseable JID) must not
 			// abort the sweep for the rest.
