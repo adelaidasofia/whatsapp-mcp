@@ -75,6 +75,7 @@ func (s *Server) registerRoutes() {
 	// Recovers historical media for messages received before the
 	// media-key-on-all-types patch.
 	s.mux.HandleFunc("POST /api/admin/request-history", s.handleRequestHistory)
+	s.mux.HandleFunc("POST /api/admin/backfill-decode", s.handleBackfillDecode)
 }
 
 // handleRequestHistory triggers a peer HistorySyncOnDemandRequest for a chat.
@@ -108,12 +109,12 @@ func (s *Server) handleRequestHistory(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"chat_jid":         body.ChatJID,
-		"anchor_message":   anchorID,
-		"requested_count":  body.Count,
-		"sent_message_id":  resp.ID,
-		"sent_at_unix":     resp.Timestamp.Unix(),
-		"hint":             "WhatsApp delivers the response asynchronously over the history-sync stream. Watch ~/Library/Logs/whatsapp-bridge.stdout.log for 'history_sync: backfilled media-key for N rows' lines, then re-run any consumers that need the historical media (e.g. POST /api/media/download for individual receipts).",
+		"chat_jid":        body.ChatJID,
+		"anchor_message":  anchorID,
+		"requested_count": body.Count,
+		"sent_message_id": resp.ID,
+		"sent_at_unix":    resp.Timestamp.Unix(),
+		"hint":            "WhatsApp delivers the response asynchronously over the history-sync stream. Watch ~/Library/Logs/whatsapp-bridge.stdout.log for 'history_sync: backfilled media-key for N rows' lines, then re-run any consumers that need the historical media (e.g. POST /api/media/download for individual receipts).",
 	})
 }
 
@@ -153,13 +154,13 @@ func (s *Server) Shutdown() error {
 // --- handlers --------------------------------------------------------------
 
 type healthcheckResponse struct {
-	Status         string         `json:"status"`
-	Version        string         `json:"version"`
-	DBEncrypted    bool           `json:"db_encrypted"`
-	SchemaVer      int            `json:"schema_version"`
-	Timestamp      int64          `json:"timestamp"`
-	Transcription  map[string]any `json:"transcription,omitempty"`
-	AliasCoverage  AliasCoverage  `json:"alias_coverage"`
+	Status        string         `json:"status"`
+	Version       string         `json:"version"`
+	DBEncrypted   bool           `json:"db_encrypted"`
+	SchemaVer     int            `json:"schema_version"`
+	Timestamp     int64          `json:"timestamp"`
+	Transcription map[string]any `json:"transcription,omitempty"`
+	AliasCoverage AliasCoverage  `json:"alias_coverage"`
 	// MYC-3284 — what the bridge could not read, made measurable.
 	UndecodedTotal    int            `json:"undecoded_total"`
 	UndecodedByType   map[string]int `json:"undecoded_by_type"`
@@ -235,10 +236,10 @@ func (s *Server) handleHealthcheck(w http.ResponseWriter, r *http.Request) {
 	// Transcription health: surface the actual data points an operator
 	// needs to know whether voice notes are flowing through. Hides nothing.
 	tx := map[string]any{
-		"backend":     s.cfg.WhisperBackend,
-		"language":    s.cfg.WhisperLanguage,
-		"model_path":  s.cfg.WhisperModelPath,
-		"bin_path":    s.cfg.WhisperBinPath,
+		"backend":    s.cfg.WhisperBackend,
+		"language":   s.cfg.WhisperLanguage,
+		"model_path": s.cfg.WhisperModelPath,
+		"bin_path":   s.cfg.WhisperBinPath,
 	}
 	var pending int
 	_ = s.db.QueryRowContext(r.Context(),
@@ -419,12 +420,12 @@ func (s *Server) handleAuthReconnect(w http.ResponseWriter, r *http.Request) {
 }
 
 type chatRow struct {
-	JID              string `json:"jid"`
-	ChatType         string `json:"chat_type"`
-	Name             string `json:"name"`
-	LastMessageTime  int64  `json:"last_message_time"`
+	JID                string `json:"jid"`
+	ChatType           string `json:"chat_type"`
+	Name               string `json:"name"`
+	LastMessageTime    int64  `json:"last_message_time"`
 	LastMessagePreview string `json:"last_message_preview"`
-	UnreadCount      int    `json:"unread_count"`
+	UnreadCount        int    `json:"unread_count"`
 }
 
 type chatListResponse struct {
@@ -472,16 +473,16 @@ func (s *Server) handleListChats(w http.ResponseWriter, r *http.Request) {
 }
 
 type messageRow struct {
-	ID             string  `json:"id"`
-	ChatJID        string  `json:"chat_jid"`
-	SenderJID      string  `json:"sender_jid"`
-	SenderDisplay  string  `json:"sender_display"`
-	Timestamp      int64   `json:"timestamp"`
-	Type           string  `json:"type"`
-	ContentText    string  `json:"content_text"`
-	IsFromMe       bool    `json:"is_from_me"`
-	Transcript     *string `json:"voice_note_transcript,omitempty"`
-	QuotedID       string  `json:"quoted_message_id,omitempty"`
+	ID            string  `json:"id"`
+	ChatJID       string  `json:"chat_jid"`
+	SenderJID     string  `json:"sender_jid"`
+	SenderDisplay string  `json:"sender_display"`
+	Timestamp     int64   `json:"timestamp"`
+	Type          string  `json:"type"`
+	ContentText   string  `json:"content_text"`
+	IsFromMe      bool    `json:"is_from_me"`
+	Transcript    *string `json:"voice_note_transcript,omitempty"`
+	QuotedID      string  `json:"quoted_message_id,omitempty"`
 }
 
 type messageListResponse struct {
@@ -572,13 +573,13 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 }
 
 type contactRow struct {
-	JID            string   `json:"jid"`
-	LID            string   `json:"lid,omitempty"`
-	Phone          string   `json:"phone,omitempty"`
-	PushName       string   `json:"push_name"`
-	VerifiedName   string   `json:"verified_name,omitempty"`
-	IsBusiness     bool     `json:"is_business"`
-	Aliases        []string `json:"aliases,omitempty"` // other JIDs known to refer to the same human
+	JID          string   `json:"jid"`
+	LID          string   `json:"lid,omitempty"`
+	Phone        string   `json:"phone,omitempty"`
+	PushName     string   `json:"push_name"`
+	VerifiedName string   `json:"verified_name,omitempty"`
+	IsBusiness   bool     `json:"is_business"`
+	Aliases      []string `json:"aliases,omitempty"` // other JIDs known to refer to the same human
 }
 
 type contactListResponse struct {
@@ -619,7 +620,7 @@ func (s *Server) handleSearchContacts(w http.ResponseWriter, r *http.Request) {
 
 	// Buffer initial matches; we'll expand and dedupe before responding.
 	type match struct {
-		c    contactRow
+		c     contactRow
 		isBiz int
 	}
 	var matches []match
@@ -719,6 +720,48 @@ func parseIntDefault(s string, def int) int {
 	}
 	n, err := strconv.Atoi(s)
 	if err != nil {
+		return def
+	}
+	return n
+}
+
+// handleBackfillDecode drives the MYC-3284 content backfill: it asks WhatsApp
+// to re-deliver history for the chats still holding empty rows. The repair
+// lands asynchronously as those chunks arrive (processHistorySyncEvent ->
+// backfillDecodedContent), so the response reports what was REQUESTED plus the
+// outstanding count — deliberately not "fixed N", which this handler cannot
+// know yet. Poll /healthcheck decoding.legacy_empty_system to watch it fall.
+func (s *Server) handleBackfillDecode(w http.ResponseWriter, r *http.Request) {
+	if s.bridge == nil {
+		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "bridge not configured"})
+		return
+	}
+	maxChats := atoiDefaultPositive(r.URL.Query().Get("max_chats"), 20)
+	perChat := atoiDefaultPositive(r.URL.Query().Get("per_chat"), 100)
+
+	requested, skipped, remaining, err := s.bridge.SweepDecodeBackfill(r.Context(), maxChats, perChat)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "decode backfill sweep failed", Details: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"chats_requested": requested,
+		"chats_skipped":   skipped,
+		"empty_rows_now":  remaining,
+		"per_chat":        perChat,
+		"note":            "history arrives asynchronously (observed: ~2 min); poll /healthcheck decoding.legacy_empty_system",
+		"timestamp":       time.Now().Unix(),
+	})
+}
+
+// atoiDefaultPositive parses a positive query-string integer, falling back on
+// anything missing or invalid.
+func atoiDefaultPositive(s string, def int) int {
+	if s == "" {
+		return def
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n <= 0 {
 		return def
 	}
 	return n

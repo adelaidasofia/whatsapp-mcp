@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -384,7 +385,20 @@ func chatTypeFromJID(j types.JID) string {
 	}
 }
 
+// extractContent decodes a live-receive event.
 func extractContent(evt *events.Message) (text, msgType string) {
+	return extractContentFromProto(evt.Message)
+}
+
+// extractContentFromProto is the real decoder. Live receive reaches it through
+// extractContent; the history-sync backfill reaches it directly, because
+// HistorySync delivers the same waE2E.Message the live path sees.
+//
+// Both callers share this ONE function on purpose. A backfill carrying its own
+// copy of the decode rules is free to drift from the live one, and the drift
+// would be invisible: rows it rewrote would decode differently from rows
+// arriving beside them, with nothing comparing the two.
+func extractContentFromProto(raw *waE2E.Message) (text, msgType string) {
 	// Reach the real payload first. Disappearing messages, view-once,
 	// device-sent, document-with-caption and edits all nest the actual message
 	// inside a wrapper, and every case below tests TOP-LEVEL fields only — so
@@ -392,7 +406,7 @@ func extractContent(evt *events.Message) (text, msgType string) {
 	// messages enabled matches nothing and lands in the default branch. It
 	// would be marked "[unsupported: ephemeralMessage]": visible, but with the
 	// text still uncaptured. See content_decode.go.
-	m := unwrapEnvelope(evt.Message)
+	m := unwrapEnvelope(raw)
 	switch {
 	case m.GetConversation() != "":
 		return m.GetConversation(), "text"
