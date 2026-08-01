@@ -219,7 +219,8 @@ func (b *Bridge) onMessage(evt *events.Message) {
 	id := evt.Info.ID
 	ts := evt.Info.Timestamp.Unix()
 
-	content, msgType := extractContent(evt)
+	decoded := ExtractContent(evt)
+	content, msgType := decoded.Text, decoded.Type
 	normalized := Normalize(content)
 	scrubbed, flags := Scrub(content)
 
@@ -253,16 +254,19 @@ func (b *Bridge) onMessage(evt *events.Message) {
 
 	// Insert message. Media columns are populated for image/video/document/
 	// audio/sticker; for text/system/reaction etc. they go in as NULL.
+	// raw_type records the decode path on every row (e.g.
+	// "ephemeralMessage>conversation") so "what was this really?" is answerable
+	// from the store rather than by re-deriving from a live client.
 	_, err = b.db.Exec(`
 		INSERT INTO messages (id, chat_jid, sender_jid, sender_display, timestamp, type, content_text, content_normalized, is_from_me, scrubbed_text, scrub_flags_json,
-			media_key, media_direct_path, media_url, media_enc_sha256, media_sha256, media_file_length, media_key_timestamp, media_mime)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			media_key, media_direct_path, media_url, media_enc_sha256, media_sha256, media_file_length, media_key_timestamp, media_mime, raw_type)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO NOTHING
 	`, id, chatJID, senderJID, senderDisplay, ts, msgType, content, normalized,
 		boolToInt(evt.Info.IsFromMe), scrubbed, ScrubFlagsJSON(flags),
 		mfields.MediaKey, mfields.MediaDirectPath, mfields.MediaURL,
 		mfields.MediaEncSHA, mfields.MediaSHA, mfields.MediaFileLength,
-		mfields.MediaKeyTimestamp, mfields.MediaMime)
+		mfields.MediaKeyTimestamp, mfields.MediaMime, decoded.RawType)
 	if err != nil {
 		log.Printf("onMessage: message insert failed: %v", err)
 	}
@@ -380,36 +384,9 @@ func chatTypeFromJID(j types.JID) string {
 	}
 }
 
-func extractContent(evt *events.Message) (text, msgType string) {
-	m := evt.Message
-	switch {
-	case m.GetConversation() != "":
-		return m.GetConversation(), "text"
-	case m.GetExtendedTextMessage() != nil:
-		return m.GetExtendedTextMessage().GetText(), "text"
-	case m.GetImageMessage() != nil:
-		return m.GetImageMessage().GetCaption(), "image"
-	case m.GetVideoMessage() != nil:
-		return m.GetVideoMessage().GetCaption(), "video"
-	case m.GetAudioMessage() != nil:
-		if m.GetAudioMessage().GetPTT() {
-			return "", "voice"
-		}
-		return "", "audio"
-	case m.GetDocumentMessage() != nil:
-		return m.GetDocumentMessage().GetCaption(), "document"
-	case m.GetStickerMessage() != nil:
-		return "", "sticker"
-	case m.GetLocationMessage() != nil:
-		return m.GetLocationMessage().GetComment(), "location"
-	case m.GetContactMessage() != nil:
-		return m.GetContactMessage().GetDisplayName(), "contact"
-	case m.GetReactionMessage() != nil:
-		return m.GetReactionMessage().GetText(), "reaction"
-	default:
-		return "", "system"
-	}
-}
+// Message content decoding lives in content.go (ExtractContent). It is
+// deliberately no longer a switch with a `default:` branch — see the header
+// comment there for what that shape cost before it was caught (MYC-3284).
 
 func truncate(s string, n int) string {
 	if len(s) <= n {

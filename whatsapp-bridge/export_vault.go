@@ -186,7 +186,7 @@ func exportOneChat(db *sql.DB, outputDir, jid, chatType, name string, participan
 
 	// Pull messages for this chat, newest first, but assemble in chronological order.
 	rows, err := db.Query(`
-		SELECT timestamp, COALESCE(scrubbed_text, COALESCE(content_text, '')), COALESCE(sender_display, ''), is_from_me, type, COALESCE(voice_note_transcript, '')
+		SELECT timestamp, COALESCE(scrubbed_text, COALESCE(content_text, '')), COALESCE(sender_display, ''), is_from_me, type, COALESCE(voice_note_transcript, ''), COALESCE(raw_type, '')
 		FROM messages
 		WHERE chat_jid = ?
 		ORDER BY timestamp ASC
@@ -203,12 +203,13 @@ func exportOneChat(db *sql.DB, outputDir, jid, chatType, name string, participan
 		fromMe        bool
 		msgType       string
 		transcript    string
+		rawType       string
 	}
 	messages := make([]msg, 0)
 	for rows.Next() {
 		var m msg
 		var fromMe int
-		if err := rows.Scan(&m.ts, &m.text, &m.senderDisplay, &fromMe, &m.msgType, &m.transcript); err != nil {
+		if err := rows.Scan(&m.ts, &m.text, &m.senderDisplay, &fromMe, &m.msgType, &m.transcript, &m.rawType); err != nil {
 			continue
 		}
 		m.fromMe = fromMe == 1
@@ -281,11 +282,44 @@ func exportOneChat(db *sql.DB, outputDir, jid, chatType, name string, participan
 			}
 		case "reaction":
 			text = fmt.Sprintf("[Reaction: %s]", m.text)
+		case "poll":
+			if m.text != "" {
+				text = fmt.Sprintf("[Poll] %s", m.text)
+			} else {
+				text = "[Poll]"
+			}
+		case "event":
+			if m.text != "" {
+				text = fmt.Sprintf("[Event] %s", m.text)
+			} else {
+				text = "[Event]"
+			}
+		case "unsupported":
+			// A message the bridge could not read. It MUST still appear, with
+			// enough detail to go find it in WhatsApp by hand: this line is the
+			// only trace that something was said here at all. Rendering nothing
+			// (the old behavior, via the blanket empty-text skip below) is what
+			// made 41% of the store vanish from the vault silently — the export
+			// looked healthy and the counts looked right.
+			if m.rawType != "" {
+				text = fmt.Sprintf("[Unsupported message — not captured (type: %s)]", m.rawType)
+			} else {
+				text = "[Unsupported message — not captured]"
+			}
 		default:
 			text = m.text
 		}
+		// Only genuinely-contentless rows are skipped, and only when the
+		// decoder positively classified them as such (a `system` protocol row
+		// like a revoke or a key exchange). Anything else with empty text is a
+		// decode gap, and gets a visible placeholder rather than silence.
 		if text == "" {
-			continue
+			if m.msgType != "system" {
+				text = fmt.Sprintf("[Empty %s message — not captured (type: %s)]",
+					m.msgType, orUnknown(m.rawType))
+			} else {
+				continue
+			}
 		}
 		timeStr := tm.Format("03:04 PM")
 		line := fmt.Sprintf("**%s** %s: %s", timeStr, speaker, text)
@@ -474,4 +508,14 @@ func isWindowsReservedName(s string) bool {
 
 func escapeYAML(s string) string {
 	return strings.ReplaceAll(s, `"`, `\"`)
+}
+
+// orUnknown labels a missing raw_type. Rows written before migration 004 have
+// no decode path recorded; saying so is better than printing an empty pair of
+// parentheses that reads like the field was checked and found blank.
+func orUnknown(s string) string {
+	if s == "" {
+		return "unrecorded, pre-004 row"
+	}
+	return s
 }

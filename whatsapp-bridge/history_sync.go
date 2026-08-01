@@ -91,6 +91,7 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 	updated := 0
 	scanned := 0
 	mediaSeen := 0
+	decodedFixed := 0
 	for _, conv := range convs {
 		log.Printf("history_sync: conversation %s has %d messages", conv.GetID(), len(conv.GetMessages()))
 		for _, hsMsg := range conv.GetMessages() {
@@ -103,6 +104,18 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 			if key == nil || key.GetID() == "" {
 				continue
 			}
+
+			// Re-derive content for rows written by the old silent decoder
+			// (MYC-3284). This runs BEFORE the media-key branch and must not
+			// share its `continue`: a re-decodable row is usually not
+			// media-bearing at all — the common case is a plain text message
+			// that arrived inside a disappearing-message envelope.
+			if n, err := b.backfillDecodedContent(key.GetID(), wm.GetMessage()); err != nil {
+				log.Printf("history_sync: content backfill %s failed: %v", key.GetID(), err)
+			} else {
+				decodedFixed += n
+			}
+
 			fields, ok := extractFromMessage(wm.GetMessage())
 			if !ok || len(fields.MediaKey) == 0 {
 				continue
@@ -138,8 +151,126 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 			updated += int(n)
 		}
 	}
-	log.Printf("history_sync: scanned %d msgs across %d conversations (progress=%d), saw %d media-bearing, backfilled %d rows",
-		scanned, len(convs), chunk.GetProgress(), mediaSeen, updated)
+	log.Printf("history_sync: scanned %d msgs across %d conversations (progress=%d), saw %d media-bearing, backfilled %d media rows, re-decoded %d silent rows",
+		scanned, len(convs), chunk.GetProgress(), mediaSeen, updated, decodedFixed)
+}
+
+// backfillDecodedContent re-decodes one history-sync message and repairs the
+// stored row if — and only if — that row is a casualty of the old silent
+// decoder (MYC-3284).
+//
+// The WHERE clause is the whole safety argument, so it is worth stating
+// plainly. A row is eligible only when all three hold:
+//
+//	raw_type IS NULL                        → written before migration 004, so
+//	                                          nothing has re-decoded it yet
+//	type = 'system'                          → the old catch-all bucket
+//	content_text IS NULL OR content_text=''  → it actually lost its payload
+//
+// Any row the current decoder wrote carries a raw_type and is therefore
+// untouchable here. That makes the backfill idempotent across overlapping
+// history chunks and incapable of clobbering good content with a stale
+// re-delivery — it can only ever turn a blank into text.
+//
+// Rows that re-decode to `system` again (genuine protocol messages) still get
+// their raw_type stamped, which retires them from the eligible set so repeated
+// sweeps converge instead of rescanning the same rows forever.
+func (b *Bridge) backfillDecodedContent(msgID string, m *waE2E.Message) (int, error) {
+	if msgID == "" || m == nil {
+		return 0, nil
+	}
+
+	// Same decoder as live receive, so a backfilled row is byte-identical to
+	// what the row would have been had it arrived today. A second, separate
+	// backfill decoder would be free to drift from the real one.
+	c := ExtractContentFromMessage(m)
+
+	scrubbed, flags := Scrub(c.Text)
+	res, err := b.db.Exec(`
+		UPDATE messages
+		   SET type               = ?,
+		       content_text       = ?,
+		       content_normalized = ?,
+		       scrubbed_text      = ?,
+		       scrub_flags_json   = ?,
+		       raw_type           = ?
+		 WHERE id = ?
+		   AND raw_type IS NULL
+		   AND type = 'system'
+		   AND (content_text IS NULL OR content_text = '')
+	`, c.Type, c.Text, Normalize(c.Text), scrubbed, ScrubFlagsJSON(flags), c.RawType, msgID)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
+// SweepDecodeBackfill asks WhatsApp to re-deliver history for every chat that
+// still holds legacy silent rows, newest-first. The repair itself happens
+// asynchronously in processHistorySyncEvent as those chunks arrive.
+//
+// Returns the chats requested and the number of legacy rows outstanding at the
+// time of the call, so an operator can watch the count fall across sweeps
+// rather than guess whether it worked.
+func (b *Bridge) SweepDecodeBackfill(ctx context.Context, maxChats, perChat int) (chatsRequested, legacyRemaining int, err error) {
+	if !b.IsConnected() {
+		return 0, 0, errors.New("bridge not connected; cannot request history")
+	}
+	if maxChats <= 0 {
+		maxChats = 25
+	}
+	if perChat <= 0 {
+		perChat = 200
+	}
+
+	if err := b.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM messages
+		 WHERE type = 'system' AND raw_type IS NULL
+		   AND (content_text IS NULL OR content_text = '')
+	`).Scan(&legacyRemaining); err != nil {
+		return 0, 0, fmt.Errorf("count legacy rows: %w", err)
+	}
+
+	rows, err := b.db.QueryContext(ctx, `
+		SELECT chat_jid, COUNT(*) AS n
+		  FROM messages
+		 WHERE type = 'system' AND raw_type IS NULL
+		   AND (content_text IS NULL OR content_text = '')
+		 GROUP BY chat_jid
+		 ORDER BY n DESC
+		 LIMIT ?
+	`, maxChats)
+	if err != nil {
+		return 0, legacyRemaining, fmt.Errorf("select affected chats: %w", err)
+	}
+	defer rows.Close()
+
+	var targets []string
+	for rows.Next() {
+		var jid string
+		var n int
+		if err := rows.Scan(&jid, &n); err != nil {
+			return 0, legacyRemaining, fmt.Errorf("scan affected chat: %w", err)
+		}
+		targets = append(targets, jid)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, legacyRemaining, fmt.Errorf("iterate affected chats: %w", err)
+	}
+
+	for _, jid := range targets {
+		if _, _, reqErr := b.RequestChatHistory(ctx, jid, perChat); reqErr != nil {
+			// One chat failing (deleted, left group, unparseable JID) must not
+			// abort the sweep for the rest.
+			log.Printf("decode backfill: history request for %s failed: %v", jid, reqErr)
+			continue
+		}
+		chatsRequested++
+	}
+	log.Printf("decode backfill: requested history for %d/%d chats; %d legacy rows outstanding",
+		chatsRequested, len(targets), legacyRemaining)
+	return chatsRequested, legacyRemaining, nil
 }
 
 // RequestChatHistory triggers WhatsApp to deliver `count` messages immediately
@@ -230,4 +361,3 @@ func (b *Bridge) RequestChatHistory(ctx context.Context, chatJID string, count i
 		count, chatJID, msgID, ts)
 	return
 }
-
