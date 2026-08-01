@@ -742,7 +742,13 @@ func (s *Server) handleBackfillDecode(w http.ResponseWriter, r *http.Request) {
 	walkBudget := atoiDefaultPositive(r.URL.Query().Get("walk_budget"), defaultWalkBudget)
 	maxRounds := atoiDefaultPositive(r.URL.Query().Get("max_rounds"), defaultMaxWalkRounds)
 
-	requested, skipped, remaining, err := s.bridge.SweepDecodeBackfill(r.Context(), maxChats, perChat, walkBudget, maxRounds)
+	requested, skipped, remaining, err := s.bridge.SweepDecodeBackfill(r.Context(), DecodeBackfillOptions{
+		ChatJID:    r.URL.Query().Get("chat_jid"),
+		MaxChats:   maxChats,
+		PerChat:    perChat,
+		WalkBudget: walkBudget,
+		MaxRounds:  maxRounds,
+	})
 	if err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "decode backfill sweep failed", Details: err.Error()})
 		return
