@@ -385,7 +385,14 @@ func chatTypeFromJID(j types.JID) string {
 }
 
 func extractContent(evt *events.Message) (text, msgType string) {
-	m := evt.Message
+	// Reach the real payload first. Disappearing messages, view-once,
+	// device-sent, document-with-caption and edits all nest the actual message
+	// inside a wrapper, and every case below tests TOP-LEVEL fields only — so
+	// without this, a plain text message sent in a chat with disappearing
+	// messages enabled matches nothing and lands in the default branch. It
+	// would be marked "[unsupported: ephemeralMessage]": visible, but with the
+	// text still uncaptured. See content_decode.go.
+	m := unwrapEnvelope(evt.Message)
 	switch {
 	case m.GetConversation() != "":
 		return m.GetConversation(), "text"
@@ -411,6 +418,23 @@ func extractContent(evt *events.Message) (text, msgType string) {
 	case m.GetReactionMessage() != nil:
 		return m.GetReactionMessage().GetText(), "reaction"
 	default:
+		// Second decode tier: types the switch above does not name but that do
+		// carry user-visible text (polls, events, live location, contact
+		// arrays, group invites, video notes, the commerce family). These were
+		// showing up as markers on the live bridge — a marker is right for
+		// something we cannot read, not for something we simply had not
+		// decoded yet. See content_decode.go.
+		//
+		// The `t != ""` gate is the important part: a decoder only gets to
+		// CLAIM a message when it actually produced text. A poll with no
+		// question, or an event stripped of its fields, would otherwise be
+		// stored as an empty row — trading this ticket's loud marker back for
+		// the silent drop it replaced. Falling through keeps such a message
+		// visible, which is always the safer of the two.
+		if t, mt, ok := decodeExtraContent(m); ok && t != "" {
+			return t, mt
+		}
+
 		// Fail LOUD (MYC-3284): a message that carries an undecoded CONTENT
 		// field keeps a NON-EMPTY marker naming the real proto type, so it is
 		// never a silent empty row that reads as "no text". A genuinely
