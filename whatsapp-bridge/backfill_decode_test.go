@@ -191,3 +191,98 @@ func TestCountEmptySystemRowsMeasuresTheRightShape(t *testing.T) {
 		t.Errorf("count = %d, want 2 — a marker row is NOT an empty row and must not inflate the backlog", n)
 	}
 }
+
+// --- targeted repair (MYC-3284 Done= clause 1) ------------------------------
+
+// TestTargetedRepairReachesAChatOutsideTheTopN is the gap this closes. The bulk
+// sweep walks "whichever chats hold the most empty rows", so a chat someone is
+// actually asking about is unreachable when it falls outside that cut —
+// measured 2026-08-01: the chat this ticket was opened on was not in the top 30
+// and no sweep ever touched it.
+func TestTargetedRepairReachesAChatOutsideTheTopN(t *testing.T) {
+	b, db := backfillDB(t)
+	// A loud chat that would dominate any top-N cut...
+	if _, err := db.Exec(`INSERT INTO chats (jid, chat_type, created_at, updated_at) VALUES ('loud@g.us','group',0,0)`); err != nil {
+		t.Fatalf("seed chat: %v", err)
+	}
+	for i := 0; i < 50; i++ {
+		if _, err := db.Exec(
+			`INSERT INTO messages (id, chat_jid, timestamp, type, content_text) VALUES (?,?,?,'system','')`,
+			"loud-"+string(rune('a'+i%26))+string(rune('a'+i/26)), "loud@g.us", 1000+i,
+		); err != nil {
+			t.Fatalf("seed loud: %v", err)
+		}
+	}
+	// ...and the quiet chat we actually care about (seeded on 'c@g.us').
+	seedRow(t, db, "quiet-1", "system", "")
+
+	ctx := context.Background()
+
+	// Bulk mode with a top-1 cut picks the loud chat, not ours.
+	bulk, err := b.decodeBackfillTargets(ctx, DecodeBackfillOptions{MaxChats: 1})
+	if err != nil {
+		t.Fatalf("bulk targets: %v", err)
+	}
+	if len(bulk) != 1 || bulk[0] != "loud@g.us" {
+		t.Fatalf("bulk targets = %v, want [loud@g.us]", bulk)
+	}
+
+	// Naming the quiet chat reaches it regardless of its rank.
+	targeted, err := b.decodeBackfillTargets(ctx, DecodeBackfillOptions{ChatJID: "c@g.us", MaxChats: 1})
+	if err != nil {
+		t.Fatalf("targeted targets: %v", err)
+	}
+	if len(targeted) != 1 || targeted[0] != "c@g.us" {
+		t.Fatalf("targeted = %v, want [c@g.us] — a named chat must be reachable outside the top-N", targeted)
+	}
+}
+
+// TestTargetedRepairSkipsAChatWithNothingToRepair: naming a chat must not spend
+// a request and a walk slot when it holds no empty rows.
+func TestTargetedRepairSkipsAChatWithNothingToRepair(t *testing.T) {
+	b, db := backfillDB(t)
+	seedRow(t, db, "has-text", "text", "already fine")
+
+	got, err := b.decodeBackfillTargets(context.Background(), DecodeBackfillOptions{ChatJID: "c@g.us"})
+	if err != nil {
+		t.Fatalf("targets: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("targets = %v, want empty — nothing to repair means no request", got)
+	}
+}
+
+// TestTargetedRepairIgnoresTheBroadcastExclusion: status@broadcast is skipped in
+// bulk mode because WhatsApp never answers for it, but an operator naming it
+// explicitly has made that call themselves.
+func TestTargetedRepairHonorsAnExplicitBroadcast(t *testing.T) {
+	b, db := backfillDB(t)
+	if _, err := db.Exec(`INSERT INTO chats (jid, chat_type, created_at, updated_at) VALUES ('status@broadcast','broadcast',0,0)`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO messages (id, chat_jid, timestamp, type, content_text) VALUES ('b1','status@broadcast',1,'system','')`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	ctx := context.Background()
+
+	bulk, _ := b.decodeBackfillTargets(ctx, DecodeBackfillOptions{MaxChats: 10})
+	for _, j := range bulk {
+		if j == "status@broadcast" {
+			t.Error("bulk mode targeted status@broadcast; WhatsApp never answers for it")
+		}
+	}
+	targeted, _ := b.decodeBackfillTargets(ctx, DecodeBackfillOptions{ChatJID: "status@broadcast"})
+	if len(targeted) != 1 {
+		t.Error("an explicitly named broadcast should be honored — the operator chose it")
+	}
+}
+
+// TestDecodeBackfillOptionsDefaults guards the struct swap: a zero-value option
+// must not silently mean "sweep zero chats".
+func TestDecodeBackfillOptionsDefaults(t *testing.T) {
+	var o DecodeBackfillOptions
+	o.applyDefaults()
+	if o.MaxChats <= 0 || o.PerChat <= 0 {
+		t.Errorf("defaults left MaxChats=%d PerChat=%d; a zero-value sweep must still do something sane", o.MaxChats, o.PerChat)
+	}
+}

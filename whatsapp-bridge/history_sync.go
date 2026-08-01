@@ -373,54 +373,33 @@ func (b *Bridge) CountEmptySystemRows(ctx context.Context) (int, error) {
 // status@broadcast is excluded: WhatsApp does not answer on-demand history
 // requests for it (verified live — the request sends, no chunk ever arrives),
 // so including it burns request budget for nothing.
-func (b *Bridge) SweepDecodeBackfill(ctx context.Context, maxChats, perChat, walkBudget, maxRounds int) (requested int, skipped int, remaining int, err error) {
+//
+// Setting opts.ChatJID repairs ONE named chat instead of the top-N. Without it
+// the only reachable population is "whichever chats happen to hold the most
+// empty rows", which leaves a specific chat someone is actually asking about
+// unrepairable when it sits outside that cut — measured 2026-08-01: the chat
+// this ticket was opened on was not in the top 30, so no sweep ever touched it.
+func (b *Bridge) SweepDecodeBackfill(ctx context.Context, opts DecodeBackfillOptions) (requested int, skipped int, remaining int, err error) {
 	if !b.IsConnected() {
 		return 0, 0, 0, errors.New("bridge not connected; cannot request history")
 	}
-	if maxChats <= 0 {
-		maxChats = 20
-	}
-	if perChat <= 0 {
-		perChat = 100
-	}
+	opts.applyDefaults()
 
 	remaining, err = b.CountEmptySystemRows(ctx)
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("count empty rows: %w", err)
 	}
 
-	rows, qErr := b.db.QueryContext(ctx, `
-		SELECT chat_jid, COUNT(*) AS n
-		  FROM messages
-		 WHERE type = 'system' AND (content_text IS NULL OR content_text = '')
-		   AND chat_jid <> 'status@broadcast'
-		 GROUP BY chat_jid
-		 ORDER BY n DESC
-		 LIMIT ?
-	`, maxChats)
-	if qErr != nil {
-		return 0, 0, remaining, fmt.Errorf("select affected chats: %w", qErr)
-	}
-	defer rows.Close()
-
-	var targets []string
-	for rows.Next() {
-		var jid string
-		var n int
-		if scanErr := rows.Scan(&jid, &n); scanErr != nil {
-			return 0, 0, remaining, fmt.Errorf("scan affected chat: %w", scanErr)
-		}
-		targets = append(targets, jid)
-	}
-	if rErr := rows.Err(); rErr != nil {
-		return 0, 0, remaining, fmt.Errorf("iterate affected chats: %w", rErr)
+	targets, tErr := b.decodeBackfillTargets(ctx, opts)
+	if tErr != nil {
+		return 0, 0, remaining, tErr
 	}
 
 	// Re-arm the walker for this sweep: fresh per-chat state and a fresh
 	// global request budget. Also release any chat left pinned by an
 	// unanswered request from a previous sweep.
 	b.walker.sweepStale()
-	b.walker.reset(walkBudget, maxRounds, perChat)
+	b.walker.reset(opts.WalkBudget, opts.MaxRounds, opts.PerChat)
 
 	for _, jid := range targets {
 		// Anchor the FIRST request on the newest message, then register the
@@ -434,11 +413,11 @@ func (b *Bridge) SweepDecodeBackfill(ctx context.Context, maxChats, perChat, wal
 			skipped++
 			continue
 		}
-		if !b.walker.begin(jid, anchorTS, perChat) {
+		if !b.walker.begin(jid, anchorTS, opts.PerChat) {
 			skipped++
 			continue
 		}
-		if _, _, reqErr := b.RequestChatHistory(ctx, jid, perChat); reqErr != nil {
+		if _, _, reqErr := b.RequestChatHistory(ctx, jid, opts.PerChat); reqErr != nil {
 			// One chat failing (left group, deleted, unparseable JID) must not
 			// abort the sweep for the rest.
 			log.Printf("decode backfill: history request for %s failed: %v", jid, reqErr)
@@ -450,4 +429,81 @@ func (b *Bridge) SweepDecodeBackfill(ctx context.Context, maxChats, perChat, wal
 	log.Printf("decode backfill: requested history for %d chats (%d skipped); %d empty rows outstanding",
 		requested, skipped, remaining)
 	return requested, skipped, remaining, nil
+}
+
+// DecodeBackfillOptions parameterizes a decode-backfill sweep. It is a struct
+// rather than positional arguments because four of the five knobs are ints:
+// SweepDecodeBackfill(ctx, 30, 200, 400, 20) is trivially transposable at a
+// call site and the compiler cannot catch it.
+type DecodeBackfillOptions struct {
+	// ChatJID repairs exactly this chat. Empty means "the top MaxChats chats
+	// by empty-row count", which is the bulk-drain mode.
+	ChatJID string
+
+	MaxChats   int
+	PerChat    int
+	WalkBudget int
+	MaxRounds  int
+}
+
+func (o *DecodeBackfillOptions) applyDefaults() {
+	if o.MaxChats <= 0 {
+		o.MaxChats = 20
+	}
+	if o.PerChat <= 0 {
+		o.PerChat = 100
+	}
+	// WalkBudget / MaxRounds are left at zero when unset; walker.reset keeps
+	// its own defaults for those rather than duplicating the constants here.
+}
+
+// decodeBackfillTargets picks which chats this sweep will walk.
+//
+// A named chat is honored even when it holds few empty rows — that is the
+// entire point of naming it — but it must still HAVE at least one, otherwise
+// the sweep would spend a request and a walk slot on a chat with nothing to
+// repair.
+func (b *Bridge) decodeBackfillTargets(ctx context.Context, opts DecodeBackfillOptions) ([]string, error) {
+	if opts.ChatJID != "" {
+		var n int
+		if err := b.db.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM messages
+			 WHERE chat_jid = ?
+			   AND type = 'system' AND (content_text IS NULL OR content_text = '')
+		`, opts.ChatJID).Scan(&n); err != nil {
+			return nil, fmt.Errorf("count empty rows for %s: %w", opts.ChatJID, err)
+		}
+		if n == 0 {
+			return nil, nil
+		}
+		return []string{opts.ChatJID}, nil
+	}
+
+	rows, err := b.db.QueryContext(ctx, `
+		SELECT chat_jid, COUNT(*) AS n
+		  FROM messages
+		 WHERE type = 'system' AND (content_text IS NULL OR content_text = '')
+		   AND chat_jid <> 'status@broadcast'
+		 GROUP BY chat_jid
+		 ORDER BY n DESC
+		 LIMIT ?
+	`, opts.MaxChats)
+	if err != nil {
+		return nil, fmt.Errorf("select affected chats: %w", err)
+	}
+	defer rows.Close()
+
+	var targets []string
+	for rows.Next() {
+		var jid string
+		var n int
+		if err := rows.Scan(&jid, &n); err != nil {
+			return nil, fmt.Errorf("scan affected chat: %w", err)
+		}
+		targets = append(targets, jid)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate affected chats: %w", err)
+	}
+	return targets, nil
 }
