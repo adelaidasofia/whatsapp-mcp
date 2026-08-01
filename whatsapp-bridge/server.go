@@ -76,6 +76,7 @@ func (s *Server) registerRoutes() {
 	// media-key-on-all-types patch.
 	s.mux.HandleFunc("POST /api/admin/request-history", s.handleRequestHistory)
 	s.mux.HandleFunc("POST /api/admin/backfill-decode", s.handleBackfillDecode)
+	s.mux.HandleFunc("GET /api/admin/backfill-decode/status", s.handleBackfillDecodeStatus)
 }
 
 // handleRequestHistory triggers a peer HistorySyncOnDemandRequest for a chat.
@@ -738,19 +739,56 @@ func (s *Server) handleBackfillDecode(w http.ResponseWriter, r *http.Request) {
 	}
 	maxChats := atoiDefaultPositive(r.URL.Query().Get("max_chats"), 20)
 	perChat := atoiDefaultPositive(r.URL.Query().Get("per_chat"), 100)
+	walkBudget := atoiDefaultPositive(r.URL.Query().Get("walk_budget"), defaultWalkBudget)
+	maxRounds := atoiDefaultPositive(r.URL.Query().Get("max_rounds"), defaultMaxWalkRounds)
 
-	requested, skipped, remaining, err := s.bridge.SweepDecodeBackfill(r.Context(), maxChats, perChat)
+	requested, skipped, remaining, err := s.bridge.SweepDecodeBackfill(r.Context(), maxChats, perChat, walkBudget, maxRounds)
 	if err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "decode backfill sweep failed", Details: err.Error()})
 		return
 	}
+	active, spent, budget, stopped := s.bridge.WalkStats()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"chats_requested": requested,
 		"chats_skipped":   skipped,
 		"empty_rows_now":  remaining,
 		"per_chat":        perChat,
-		"note":            "history arrives asynchronously (observed: ~2 min); poll /healthcheck decoding.legacy_empty_system",
-		"timestamp":       time.Now().Unix(),
+		"walk": map[string]any{
+			"active_chats":    active,
+			"requests_spent":  spent,
+			"request_budget":  budget,
+			"max_rounds":      maxRounds,
+			"stopped_reasons": stopped,
+		},
+		"note":      "each delivered chunk anchors the next step backwards; poll GET /api/admin/backfill-decode/status",
+		"timestamp": time.Now().Unix(),
+	})
+}
+
+// handleBackfillDecodeStatus reports walk progress WITHOUT starting a sweep.
+// A sweep is otherwise the only way to learn where the walk reached, and using
+// one to check progress would itself spend request budget — so observing has to
+// be separable from acting.
+func (s *Server) handleBackfillDecodeStatus(w http.ResponseWriter, r *http.Request) {
+	if s.bridge == nil {
+		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "bridge not configured"})
+		return
+	}
+	remaining, err := s.bridge.CountEmptySystemRows(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "count failed", Details: err.Error()})
+		return
+	}
+	active, spent, budget, stopped := s.bridge.WalkStats()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"empty_rows_now": remaining,
+		"walk": map[string]any{
+			"active_chats":    active,
+			"requests_spent":  spent,
+			"request_budget":  budget,
+			"stopped_reasons": stopped,
+		},
+		"timestamp": time.Now().Unix(),
 	})
 }
 
