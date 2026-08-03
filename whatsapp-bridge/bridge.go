@@ -154,6 +154,12 @@ func (b *Bridge) handleEvent(raw interface{}) {
 	switch evt := raw.(type) {
 	case *events.Message:
 		b.onMessage(evt)
+	// A message that fails to DECRYPT never becomes an events.Message —
+	// whatsmeow dispatches this and returns. Without this case the bridge wrote
+	// no row at all, so there was nothing for export, /healthcheck or retrieval
+	// to even report as missing (MYC-3569). See undecryptable.go.
+	case *events.UndecryptableMessage:
+		b.onUndecryptableMessage(evt)
 	case *events.Receipt:
 		b.onReceipt(evt)
 	case *events.Connected:
@@ -262,16 +268,50 @@ func (b *Bridge) onMessage(evt *events.Message) {
 
 	// Insert message. Media columns are populated for image/video/document/
 	// audio/sticker; for text/system/reaction etc. they go in as NULL.
+	//
+	// The conflict clause is an UPGRADE, not a plain DO NOTHING (MYC-3569).
+	// When a message could not be decrypted, the bridge has already stored a
+	// placeholder row under this same id (see undecryptable.go). whatsmeow asks
+	// the sender for a resend, and a successful retry arrives HERE, as a normal
+	// events.Message on that id. Under DO NOTHING the recovered content was
+	// dropped on the floor and the placeholder stayed forever, which would have
+	// made the retry path silently useless.
+	//
+	// Both WHERE conditions are load-bearing:
+	//   - the LIKE restricts the upgrade to placeholder rows, so a real row is
+	//     never rewritten and the historical DO NOTHING semantics are unchanged
+	//     for every other message;
+	//   - the content guard refuses a DOWNGRADE. A retry that decodes to a
+	//     genuinely empty "system" row must not overwrite a loud marker with a
+	//     blank — that would trade this fix back for the silent empty row
+	//     MYC-3284 exists to prevent.
 	_, err = b.db.Exec(`
 		INSERT INTO messages (id, chat_jid, sender_jid, sender_display, timestamp, type, content_text, content_normalized, is_from_me, scrubbed_text, scrub_flags_json,
 			media_key, media_direct_path, media_url, media_enc_sha256, media_sha256, media_file_length, media_key_timestamp, media_mime)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO NOTHING
+		ON CONFLICT(id) DO UPDATE SET
+			type = excluded.type,
+			content_text = excluded.content_text,
+			content_normalized = excluded.content_normalized,
+			sender_display = excluded.sender_display,
+			scrubbed_text = excluded.scrubbed_text,
+			scrub_flags_json = excluded.scrub_flags_json,
+			media_key = excluded.media_key,
+			media_direct_path = excluded.media_direct_path,
+			media_url = excluded.media_url,
+			media_enc_sha256 = excluded.media_enc_sha256,
+			media_sha256 = excluded.media_sha256,
+			media_file_length = excluded.media_file_length,
+			media_key_timestamp = excluded.media_key_timestamp,
+			media_mime = excluded.media_mime
+		WHERE messages.content_text LIKE ?
+		  AND (COALESCE(excluded.content_text, '') <> '' OR excluded.type <> 'system')
 	`, id, chatJID, senderJID, senderDisplay, ts, msgType, content, normalized,
 		boolToInt(evt.Info.IsFromMe), scrubbed, ScrubFlagsJSON(flags),
 		mfields.MediaKey, mfields.MediaDirectPath, mfields.MediaURL,
 		mfields.MediaEncSHA, mfields.MediaSHA, mfields.MediaFileLength,
-		mfields.MediaKeyTimestamp, mfields.MediaMime)
+		mfields.MediaKeyTimestamp, mfields.MediaMime,
+		undecryptablePrefix+"%")
 	if err != nil {
 		log.Printf("onMessage: message insert failed: %v", err)
 	}

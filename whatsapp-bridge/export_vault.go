@@ -288,7 +288,15 @@ func exportOneChat(db *sql.DB, outputDir, jid, chatType, name string, participan
 			// unrecoverable voice note: the reader sees THAT a message exists,
 			// who sent it and when (the line format supplies both), and why it
 			// could not be read. Never a blank, never silently omitted.
-			if raw := unsupportedRawType(m.text); raw != "" {
+			//
+			// MYC-3569 adds the sibling case: a message that never reached the
+			// decoder at all because it could not be DECRYPTED. Same treatment,
+			// distinct wording, because the two mean different things to a
+			// reader — "we could not read this type" versus "this did not
+			// decrypt, and it may still arrive".
+			if mode := undecryptableFailMode(m.text); mode != "" {
+				text = fmt.Sprintf("[Undecryptable message: %s]", mode)
+			} else if raw := unsupportedRawType(m.text); raw != "" {
 				text = fmt.Sprintf("[Unsupported message: %s]", raw)
 			} else {
 				text = m.text
