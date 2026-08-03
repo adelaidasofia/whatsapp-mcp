@@ -117,21 +117,21 @@ func TestUndecodedStatsCountsCaughtAndLegacyRows(t *testing.T) {
 	insertTestMessage(t, db, "B8", jid, "system", "group name changed", 1784846607)
 
 	s := &Server{db: db}
-	total, byType, legacyEmpty := s.undecodedStats(context.Background())
+	st := s.undecodedStats(context.Background())
 
-	if total != 4 {
-		t.Fatalf("undecoded_total: want 4, got %d", total)
+	if st.UndecodedTotal != 4 {
+		t.Fatalf("undecoded_total: want 4, got %d", st.UndecodedTotal)
 	}
-	if byType["eventMessage"] != 2 {
-		t.Fatalf("undecoded_by_type[eventMessage]: want 2, got %d (%v)", byType["eventMessage"], byType)
+	if st.UndecodedByType["eventMessage"] != 2 {
+		t.Fatalf("undecoded_by_type[eventMessage]: want 2, got %d (%v)", st.UndecodedByType["eventMessage"], st.UndecodedByType)
 	}
-	if byType["pollUpdateMessage"] != 1 {
-		t.Fatalf("undecoded_by_type[pollUpdateMessage]: want 1, got %d (%v)", byType["pollUpdateMessage"], byType)
+	if st.UndecodedByType["pollUpdateMessage"] != 1 {
+		t.Fatalf("undecoded_by_type[pollUpdateMessage]: want 1, got %d (%v)", st.UndecodedByType["pollUpdateMessage"], st.UndecodedByType)
 	}
-	if byType["unknown"] != 1 {
-		t.Fatalf("an unsupported row with no marker must count as \"unknown\", got %v", byType)
+	if st.UndecodedByType["unknown"] != 1 {
+		t.Fatalf("an unsupported row with no marker must count as \"unknown\", got %v", st.UndecodedByType)
 	}
-	if legacyEmpty != 2 {
-		t.Fatalf("legacy_empty_system: want 2 (the backfill size), got %d", legacyEmpty)
+	if st.LegacyEmptySystem != 2 {
+		t.Fatalf("legacy_empty_system: want 2 (the backfill size), got %d", st.LegacyEmptySystem)
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -166,6 +167,24 @@ type healthcheckResponse struct {
 	UndecodedTotal    int            `json:"undecoded_total"`
 	UndecodedByType   map[string]int `json:"undecoded_by_type"`
 	LegacyEmptySystem int            `json:"legacy_empty_system"`
+	// MYC-3569 — what the bridge could not DECRYPT. Counted separately from
+	// undecoded_total on purpose: these are a different failure at a different
+	// layer (the message never reached the decoder), and a share of them are
+	// recoverable by whatsmeow's resend request, so the two rates move
+	// independently and merging them would hide both.
+	UndecryptableTotal  int            `json:"undecryptable_total"`
+	UndecryptableByMode map[string]int `json:"undecryptable_by_mode"`
+}
+
+// decodeStats is what the bridge could not read or could not decrypt. Returned
+// as one value because every field comes from the SAME single pass over the
+// `system` rows — see undecodedStats.
+type decodeStats struct {
+	UndecodedTotal      int
+	UndecodedByType     map[string]int
+	LegacyEmptySystem   int
+	UndecryptableTotal  int
+	UndecryptableByMode map[string]int
 }
 
 // undecodedStats counts what the bridge could not read (MYC-3284), so the loss
@@ -178,31 +197,42 @@ type healthcheckResponse struct {
 //
 // A failed count is logged and reported as zero: the healthcheck must still
 // answer, and a logged error is not a silent one.
-func (s *Server) undecodedStats(ctx context.Context) (total int, byType map[string]int, legacyEmpty int) {
-	byType = map[string]int{}
-	// Keyed off the shared marker constant, never a copied literal, so the
-	// counter cannot drift from what the writer stores.
+func (s *Server) undecodedStats(ctx context.Context) decodeStats {
+	st := decodeStats{
+		UndecodedByType:     map[string]int{},
+		UndecryptableByMode: map[string]int{},
+	}
+	// Keyed off the shared marker constants, never a copied literal, so the
+	// counters cannot drift from what the writers store.
 	markerLike := unsupportedPrefix + "%"
+	undecryptableLike := undecryptablePrefix + "%"
 
-	// EVERY count is scoped to `type = 'system'`, which is where both writers
-	// put these rows (extractContent / baileysExtractContent) and which
-	// `idx_messages_type` (migrations/001) indexes. A bare `content_text LIKE`
-	// cannot use any index and scans the whole message store: measured at 16s
-	// on the founder's real store, turning /healthcheck into a timeout. The
-	// type predicate narrows to a small subset first. Both counts share one
-	// pass so the subset is visited once, not twice.
+	// EVERY count is scoped to `type = 'system'`, which is where all three
+	// writers put these rows (extractContent / baileysExtractContent /
+	// onUndecryptableMessage) and which `idx_messages_type` (migrations/001)
+	// indexes. A bare `content_text LIKE` cannot use any index and scans the
+	// whole message store: measured at 16s on the founder's real store, turning
+	// /healthcheck into a timeout. The type predicate narrows to a small subset
+	// first. All counts share one pass so the subset is visited once — adding
+	// the MYC-3569 counters here rather than in their own query is deliberate,
+	// because MYC-3577 is already tracking this endpoint's latency and a second
+	// pass would make it worse before that fix lands.
 	if err := s.db.QueryRowContext(ctx,
 		`SELECT
 		   COALESCE(SUM(CASE WHEN content_text LIKE ? THEN 1 ELSE 0 END), 0),
-		   COALESCE(SUM(CASE WHEN COALESCE(content_text, '') = '' THEN 1 ELSE 0 END), 0)
-		 FROM messages WHERE type = 'system'`, markerLike).Scan(&total, &legacyEmpty); err != nil {
+		   COALESCE(SUM(CASE WHEN COALESCE(content_text, '') = '' THEN 1 ELSE 0 END), 0),
+		   COALESCE(SUM(CASE WHEN content_text LIKE ? THEN 1 ELSE 0 END), 0)
+		 FROM messages WHERE type = 'system'`,
+		markerLike, undecryptableLike,
+	).Scan(&st.UndecodedTotal, &st.LegacyEmptySystem, &st.UndecryptableTotal); err != nil {
 		log.Printf("healthcheck: undecoded counts query failed: %v", err)
 	}
 
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT COALESCE(content_text, ''), COUNT(*) FROM messages
-		 WHERE type = 'system' AND content_text LIKE ? GROUP BY content_text`,
-		markerLike)
+		 WHERE type = 'system' AND (content_text LIKE ? OR content_text LIKE ?)
+		 GROUP BY content_text`,
+		markerLike, undecryptableLike)
 	if err != nil {
 		log.Printf("healthcheck: undecoded by-type query failed: %v", err)
 	} else {
@@ -214,20 +244,26 @@ func (s *Server) undecodedStats(ctx context.Context) (total int, byType map[stri
 				log.Printf("healthcheck: undecoded by-type scan failed: %v", err)
 				continue
 			}
+			// Dispatch on which marker it is. Checked in this order because
+			// only one prefix can match a given row.
+			if strings.HasPrefix(marker, undecryptablePrefix) {
+				scanUndecryptableMarker(marker, st.UndecryptableByMode, n)
+				continue
+			}
 			raw := unsupportedRawType(marker)
 			if raw == "" {
 				// A malformed marker still counts — reported as "unknown"
 				// rather than dropped, which is the bug this ticket is about.
 				raw = "unknown"
 			}
-			byType[raw] += n
+			st.UndecodedByType[raw] += n
 		}
 		if err := rows.Err(); err != nil {
 			log.Printf("healthcheck: undecoded by-type iteration failed: %v", err)
 		}
 	}
 
-	return total, byType, legacyEmpty
+	return st
 }
 
 func (s *Server) handleHealthcheck(w http.ResponseWriter, r *http.Request) {
@@ -275,19 +311,21 @@ func (s *Server) handleHealthcheck(w http.ResponseWriter, r *http.Request) {
 		log.Printf("healthcheck: alias coverage query failed: %v", covErr)
 	}
 
-	undecodedTotal, undecodedByType, legacyEmpty := s.undecodedStats(r.Context())
+	st := s.undecodedStats(r.Context())
 
 	writeJSON(w, http.StatusOK, healthcheckResponse{
-		Status:            "ok",
-		Version:           "0.3.0",
-		DBEncrypted:       s.cfg.EncryptDB,
-		SchemaVer:         schemaVer,
-		Timestamp:         time.Now().Unix(),
-		Transcription:     tx,
-		AliasCoverage:     cov,
-		UndecodedTotal:    undecodedTotal,
-		UndecodedByType:   undecodedByType,
-		LegacyEmptySystem: legacyEmpty,
+		Status:              "ok",
+		Version:             "0.3.0",
+		DBEncrypted:         s.cfg.EncryptDB,
+		SchemaVer:           schemaVer,
+		Timestamp:           time.Now().Unix(),
+		Transcription:       tx,
+		AliasCoverage:       cov,
+		UndecodedTotal:      st.UndecodedTotal,
+		UndecodedByType:     st.UndecodedByType,
+		LegacyEmptySystem:   st.LegacyEmptySystem,
+		UndecryptableTotal:  st.UndecryptableTotal,
+		UndecryptableByMode: st.UndecryptableByMode,
 	})
 }
 
