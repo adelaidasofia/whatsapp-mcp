@@ -40,7 +40,7 @@ const rawTypeUnknown = "unknown"
 // They get a sentinel instead of being left NULL so that ALL THREE counters
 // come from the ONE covering aggregate. The alternative was an index over
 // (type, content_text), and measured on SQLite that is the only shape that
-// covers a `content_text = ''` predicate — a partial index on the same
+// covers a `content_text = ”` predicate — a partial index on the same
 // predicate is simply never chosen. Indexing content_text would copy every
 // message BODY into an index on a 75MB store, which is a real cost to pay for
 // one counter.
