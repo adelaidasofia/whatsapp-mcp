@@ -28,12 +28,20 @@ func undecodedTestDB(t *testing.T) *sql.DB {
 	return db
 }
 
+// insertTestMessage writes a row the way a REAL writer does, deriving raw_type
+// through the same shared helper (MYC-3577). That is not incidental. Since the
+// counters now read the indexed raw_type column, any writer that sets
+// content_text without setting raw_type produces a row that is INVISIBLE to
+// /healthcheck. A helper that skipped it would model a broken writer and
+// quietly assert the wrong thing. TestEveryMarkerRowHasRawType guards the real
+// writers against the same mistake.
 func insertTestMessage(t *testing.T, db *sql.DB, id, chatJID, msgType, contentText string, ts int64) {
 	t.Helper()
 	_, err := db.Exec(
-		`INSERT INTO messages (id, chat_jid, sender_jid, sender_display, timestamp, type, content_text, is_from_me)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
-		id, chatJID, "31628239888478:3@lid", "Martha", ts, msgType, contentText)
+		`INSERT INTO messages (id, chat_jid, sender_jid, sender_display, timestamp, type, content_text, is_from_me, raw_type)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+		id, chatJID, "31628239888478:3@lid", "Martha", ts, msgType, contentText,
+		rawTypeNullable(msgType, contentText))
 	if err != nil {
 		t.Fatalf("insert message %s: %v", id, err)
 	}

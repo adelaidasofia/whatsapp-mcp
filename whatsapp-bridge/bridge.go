@@ -287,8 +287,8 @@ func (b *Bridge) onMessage(evt *events.Message) {
 	//     MYC-3284 exists to prevent.
 	_, err = b.db.Exec(`
 		INSERT INTO messages (id, chat_jid, sender_jid, sender_display, timestamp, type, content_text, content_normalized, is_from_me, scrubbed_text, scrub_flags_json,
-			media_key, media_direct_path, media_url, media_enc_sha256, media_sha256, media_file_length, media_key_timestamp, media_mime)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			media_key, media_direct_path, media_url, media_enc_sha256, media_sha256, media_file_length, media_key_timestamp, media_mime, raw_type)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			type = excluded.type,
 			content_text = excluded.content_text,
@@ -296,6 +296,10 @@ func (b *Bridge) onMessage(evt *events.Message) {
 			sender_display = excluded.sender_display,
 			scrubbed_text = excluded.scrubbed_text,
 			scrub_flags_json = excluded.scrub_flags_json,
+			-- The upgrade must move raw_type too, or a placeholder that a retry
+			-- recovered would keep being counted as undecryptable forever
+			-- (MYC-3569's rows are the ones that move most).
+			raw_type = excluded.raw_type,
 			media_key = excluded.media_key,
 			media_direct_path = excluded.media_direct_path,
 			media_url = excluded.media_url,
@@ -310,7 +314,7 @@ func (b *Bridge) onMessage(evt *events.Message) {
 		boolToInt(evt.Info.IsFromMe), scrubbed, ScrubFlagsJSON(flags),
 		mfields.MediaKey, mfields.MediaDirectPath, mfields.MediaURL,
 		mfields.MediaEncSHA, mfields.MediaSHA, mfields.MediaFileLength,
-		mfields.MediaKeyTimestamp, mfields.MediaMime,
+		mfields.MediaKeyTimestamp, mfields.MediaMime, rawTypeNullable(msgType, content),
 		undecryptablePrefix+"%")
 	if err != nil {
 		log.Printf("onMessage: message insert failed: %v", err)

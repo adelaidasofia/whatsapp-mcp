@@ -167,11 +167,11 @@ func (b *Bridge) onUndecryptableMessage(evt *events.UndecryptableMessage) {
 	}
 
 	res, err := b.db.Exec(`
-		INSERT INTO messages (id, chat_jid, sender_jid, sender_display, timestamp, type, content_text, content_normalized, is_from_me, scrubbed_text, scrub_flags_json)
-		VALUES (?, ?, ?, ?, ?, 'system', ?, ?, ?, ?, NULL)
+		INSERT INTO messages (id, chat_jid, sender_jid, sender_display, timestamp, type, content_text, content_normalized, is_from_me, scrubbed_text, scrub_flags_json, raw_type)
+		VALUES (?, ?, ?, ?, ?, 'system', ?, ?, ?, ?, NULL, ?)
 		ON CONFLICT(id) DO NOTHING
 	`, id, chatJID, senderJID, senderDisplay, ts, marker, Normalize(marker),
-		boolToInt(evt.Info.IsFromMe), marker)
+		boolToInt(evt.Info.IsFromMe), marker, rawTypeNullable("system", marker))
 	if err != nil {
 		log.Printf("onUndecryptableMessage: message insert failed: %v", err)
 		return
@@ -193,17 +193,7 @@ func (b *Bridge) onUndecryptableMessage(evt *events.UndecryptableMessage) {
 	}
 }
 
-// undecryptableStats counts undecryptable rows by failure mode for /healthcheck.
-// Kept in the SAME single pass as the MYC-3284 counters (see undecodedStats in
-// server.go) rather than issuing its own scan — MYC-3577 records that endpoint
-// already degrading to 16s on the live store, and adding a second full pass here
-// would make it worse before that ticket lands.
-func scanUndecryptableMarker(marker string, byMode map[string]int, n int) {
-	mode := undecryptableFailMode(marker)
-	if mode == "" {
-		// A malformed marker still counts — reported rather than dropped, which
-		// is the failure class this ticket is about.
-		mode = "unknown"
-	}
-	byMode[mode] += n
-}
+// The by-mode counting that used to live here moved to splitRawTypeCount in
+// raw_type.go (MYC-3577). The counters now read the indexed messages.raw_type
+// column rather than re-parsing a marker out of content_text on every call, so
+// there is one place that turns a stored value into a counter bucket.

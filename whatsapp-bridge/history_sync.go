@@ -341,11 +341,17 @@ func (b *Bridge) backfillDecodedContent(msgID string, m *waE2E.Message) (int, er
 		       content_text       = ?,
 		       content_normalized = ?,
 		       scrubbed_text      = ?,
-		       scrub_flags_json   = ?
+		       scrub_flags_json   = ?,
+		       -- Set alongside content_text, never separately (MYC-3577). This
+		       -- row is moving from the legacy-empty population into either
+		       -- "decoded" or "undecodable", and raw_type is what the counters
+		       -- read; leaving it stale here would make the backfill's own
+		       -- progress invisible to /healthcheck.
+		       raw_type           = ?
 		 WHERE id = ?
 		   AND type = 'system'
 		   AND (content_text IS NULL OR content_text = '')
-	`, msgType, text, Normalize(text), scrubbed, ScrubFlagsJSON(flags), msgID)
+	`, msgType, text, Normalize(text), scrubbed, ScrubFlagsJSON(flags), rawTypeNullable(msgType, text), msgID)
 	if err != nil {
 		return 0, err
 	}
