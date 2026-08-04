@@ -171,11 +171,11 @@ func RunBaileysImport(cfg *Config, db *sql.DB, storePath string) error {
 			scrubbed, flags := Scrub(content)
 
 			_, err := db.Exec(`
-				INSERT INTO messages (id, chat_jid, sender_jid, sender_display, timestamp, type, content_text, content_normalized, is_from_me, scrubbed_text, scrub_flags_json)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				INSERT INTO messages (id, chat_jid, sender_jid, sender_display, timestamp, type, content_text, content_normalized, is_from_me, scrubbed_text, scrub_flags_json, raw_type)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 				ON CONFLICT(id) DO NOTHING
 			`, m.Key.ID, jid, senderJID, senderDisplay, ts, msgType, content, normalized,
-				boolToInt(m.Key.FromMe), scrubbed, ScrubFlagsJSON(flags))
+				boolToInt(m.Key.FromMe), scrubbed, ScrubFlagsJSON(flags), rawTypeNullable(msgType, content))
 			if err != nil {
 				log.Printf("message insert failed for %s/%s: %v", jid, m.Key.ID, err)
 				messagesSkipped++

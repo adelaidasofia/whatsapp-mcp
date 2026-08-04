@@ -12,7 +12,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"time"
 )
 
@@ -202,64 +201,43 @@ func (s *Server) undecodedStats(ctx context.Context) decodeStats {
 		UndecodedByType:     map[string]int{},
 		UndecryptableByMode: map[string]int{},
 	}
-	// Keyed off the shared marker constants, never a copied literal, so the
-	// counters cannot drift from what the writers store.
-	markerLike := unsupportedPrefix + "%"
-	undecryptableLike := undecryptablePrefix + "%"
-
-	// EVERY count is scoped to `type = 'system'`, which is where all three
-	// writers put these rows (extractContent / baileysExtractContent /
-	// onUndecryptableMessage) and which `idx_messages_type` (migrations/001)
-	// indexes. A bare `content_text LIKE` cannot use any index and scans the
-	// whole message store: measured at 16s on the founder's real store, turning
-	// /healthcheck into a timeout. The type predicate narrows to a small subset
-	// first. All counts share one pass so the subset is visited once — adding
-	// the MYC-3569 counters here rather than in their own query is deliberate,
-	// because MYC-3577 is already tracking this endpoint's latency and a second
-	// pass would make it worse before that fix lands.
-	if err := s.db.QueryRowContext(ctx,
-		`SELECT
-		   COALESCE(SUM(CASE WHEN content_text LIKE ? THEN 1 ELSE 0 END), 0),
-		   COALESCE(SUM(CASE WHEN COALESCE(content_text, '') = '' THEN 1 ELSE 0 END), 0),
-		   COALESCE(SUM(CASE WHEN content_text LIKE ? THEN 1 ELSE 0 END), 0)
-		 FROM messages WHERE type = 'system'`,
-		markerLike, undecryptableLike,
-	).Scan(&st.UndecodedTotal, &st.LegacyEmptySystem, &st.UndecryptableTotal); err != nil {
-		log.Printf("healthcheck: undecoded counts query failed: %v", err)
-	}
-
+	// MYC-3577 — these counters used to be `content_text LIKE '[unsupported: %'`
+	// over every `system` row. Correct, and unscalable: five consecutive calls
+	// on the live store measured 14.75s, 8.65s, 2.88s, 3.19s and 1.48s. That
+	// spread is a scan warming its page cache, and a monitoring poll after an
+	// idle period always pays the top of it.
+	//
+	// The decode outcome now lives in the indexed messages.raw_type column
+	// (migration 006), written by every writer through the one shared
+	// rawTypeForStorage helper. So the by-type breakdown is a GROUP BY that
+	// `idx_messages_type_rawtype` COVERS: SQLite answers it from the index
+	// alone and never reads a table row.
+	//
+	// Both counter families share this single aggregate, namespaced rather than
+	// split in SQL, and the prefix routing happens in Go over the GROUPED
+	// result (dozens of rows) instead of over the message table (tens of
+	// thousands). The totals are then summed from those same rows, so a total
+	// can no longer disagree with its own breakdown — which the previous
+	// two-query shape allowed.
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT COALESCE(content_text, ''), COUNT(*) FROM messages
-		 WHERE type = 'system' AND (content_text LIKE ? OR content_text LIKE ?)
-		 GROUP BY content_text`,
-		markerLike, undecryptableLike)
+		`SELECT raw_type, COUNT(*) FROM messages
+		  WHERE type = 'system' AND raw_type IS NOT NULL
+		  GROUP BY raw_type`)
 	if err != nil {
-		log.Printf("healthcheck: undecoded by-type query failed: %v", err)
+		log.Printf("healthcheck: decode by-type query failed: %v", err)
 	} else {
 		defer rows.Close()
 		for rows.Next() {
-			var marker string
+			var rawType string
 			var n int
-			if err := rows.Scan(&marker, &n); err != nil {
-				log.Printf("healthcheck: undecoded by-type scan failed: %v", err)
+			if err := rows.Scan(&rawType, &n); err != nil {
+				log.Printf("healthcheck: decode by-type scan failed: %v", err)
 				continue
 			}
-			// Dispatch on which marker it is. Checked in this order because
-			// only one prefix can match a given row.
-			if strings.HasPrefix(marker, undecryptablePrefix) {
-				scanUndecryptableMarker(marker, st.UndecryptableByMode, n)
-				continue
-			}
-			raw := unsupportedRawType(marker)
-			if raw == "" {
-				// A malformed marker still counts — reported as "unknown"
-				// rather than dropped, which is the bug this ticket is about.
-				raw = "unknown"
-			}
-			st.UndecodedByType[raw] += n
+			splitRawTypeCount(rawType, n, &st)
 		}
 		if err := rows.Err(); err != nil {
-			log.Printf("healthcheck: undecoded by-type iteration failed: %v", err)
+			log.Printf("healthcheck: decode by-type iteration failed: %v", err)
 		}
 	}
 
