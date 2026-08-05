@@ -122,8 +122,10 @@ func storeGuardBeforeMint(storeName, dbPath string) error {
 //
 //	0  — item present and readable: use it.
 //	44 — errSecItemNotFound: PROVEN absent. The only state where minting is correct.
-//	51 — errSecInteractionNotAllowed (keychain locked / no UI): the key EXISTS
-//	     but cannot be read right now. Minting here overwrites the real key.
+//	51 — observed while the login keychain was locked with no UI allowed
+//	     (errSecAuthFailed-class; NOT errSecInteractionNotAllowed, which maps to
+//	     exit 36): the key EXISTS but cannot be read right now. Minting here
+//	     overwrites the real key.
 //
 // Anything that is not 0 or 44 is treated like 51: fail loud, write nothing.
 func getOrCreateDBKeyMacOS(service, account, dbPath string) (string, error) {
