@@ -155,10 +155,15 @@ func (s *Server) Shutdown() error {
 // --- handlers --------------------------------------------------------------
 
 type healthcheckResponse struct {
-	Status        string         `json:"status"`
-	Version       string         `json:"version"`
-	DBEncrypted   bool           `json:"db_encrypted"`
-	SchemaVer     int            `json:"schema_version"`
+	Status      string `json:"status"`
+	Version     string `json:"version"`
+	DBEncrypted bool   `json:"db_encrypted"`
+	SchemaVer   int    `json:"schema_version"`
+	// MYC-3698 — the live journal mode, READ from the database rather than
+	// remembered from startup. WAL is what lets this endpoint answer while
+	// ingest is writing; anything else here means reads are serializing behind
+	// writes and the latency below is not representative.
+	JournalMode   string         `json:"journal_mode"`
 	Timestamp     int64          `json:"timestamp"`
 	Transcription map[string]any `json:"transcription,omitempty"`
 	AliasCoverage AliasCoverage  `json:"alias_coverage"`
@@ -293,6 +298,7 @@ func (s *Server) handleHealthcheck(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, healthcheckResponse{
 		Status:              "ok",
+		JournalMode:         JournalMode(s.db),
 		Version:             "0.3.0",
 		DBEncrypted:         s.cfg.EncryptDB,
 		SchemaVer:           schemaVer,
