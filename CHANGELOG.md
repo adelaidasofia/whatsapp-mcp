@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **A transient secret-store read failure can no longer destroy the DB key (MYC-3694).** The bridge minted a fresh SQLCipher key on ANY failed keychain read and wrote it with overwrite semantics (`security add-generic-password -U`), so a locked keychain (exit 51) silently replaced the real key and permanently orphaned the encrypted message store. Reads are now classified on all three platforms — macOS exit 44 / Windows `ERROR_NOT_FOUND` / libsecret silent miss are the only "mint" states; every other failure exits loudly, writes nothing, and names the remedy (unlock the store, or set `WHATSAPP_DB_KEY`). The macOS write dropped `-U` (create-only), and minting is refused outright while a non-empty store database exists.
+
 ### Changed
 
 - `scripts/check_prerequisites.sh` no longer hard-fails on `ffmpeg` or the `sqlcipher` CLI: transcription is off by default (ffmpeg is only needed for `local-cpp`), and the bridge compiles its own SQLCipher (the CLI was never a runtime requirement — the checker itself was a leftover stuck-point). Both downgraded to warnings with accurate guidance, matching `check_prerequisites.ps1`.
