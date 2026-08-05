@@ -185,7 +185,7 @@ func ReconcileVault(db *sql.DB, vaultDir string, includeGroups bool, minMessages
 			memberSet[jid] = true
 		}
 		for j := range entries {
-			if !os.SameFile(entries[j].info, st) {
+			if entries[j].info == nil || !os.SameFile(entries[j].info, st) {
 				continue
 			}
 			if !memberSet[entries[j].jid] {

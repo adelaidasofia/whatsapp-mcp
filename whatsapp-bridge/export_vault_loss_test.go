@@ -150,7 +150,10 @@ func xvFileForJID(t *testing.T, outDir, jid string) string {
 			continue
 		}
 		fm, _ := xvReadFile(t, filepath.Join(outDir, e.Name()))
-		if fm["jid"] == jid {
+		// Ownership is type-aware (round 5, F1): a user note carrying a chat
+		// jid is not that chat's file, and the helper must judge coverage the
+		// way the exporter and reconcile do.
+		if fm["type"] == "whatsapp-chat" && fm["jid"] == jid {
 			return e.Name()
 		}
 	}
@@ -824,5 +827,164 @@ func TestExportUpdatesLegacyNFDFileInPlace(t *testing.T) {
 	}
 	if len(findings) != 0 {
 		t.Fatalf("reconcile findings on a migrated vault: %v", findings)
+	}
+}
+
+// TestExportNeverDestroysUsersNoteCarryingAChatJID — PR #64 review round 5,
+// F1 (HIGH), executed at 63c86fd and 3ef9e80: every ownership consumer read
+// `.jid` alone and ignored `type:`, while reconcile's own definition of a
+// chat file requires type: whatsapp-chat — the two halves disagreed about
+// what the exporter owns. A user's note that carries a chat's jid in its
+// frontmatter (realistic: duplicate a chat file to annotate it, the copy
+// keeps the frontmatter; the contact's display name later changes) was
+// heal-renamed onto the unit's canonical filename and force-rewritten — the
+// user's own content destroyed, rc=0, reconcile clean. Ownership now
+// requires jid membership AND the declared whatsapp-chat type; a
+// jid-claiming non-chat file is an OBSTACLE, never a victim.
+func TestExportNeverDestroysUsersNoteCarryingAChatJID(t *testing.T) {
+	db := xvDB(t)
+	outDir := t.TempDir()
+
+	const jid = "15555550501@s.whatsapp.net"
+	xvChat(t, db, jid, "direct", "Cliente Uno", xvPhoneLastTS)
+	xvContact(t, db, jid, "Cliente Uno", "15555550501")
+	xvMsg(t, db, "C1", jid, jid, "Cliente Uno", "text", "hola cliente", "", xvPhoneLastTS, false)
+
+	// The user's own analysis note, annotated from a copy of the chat file —
+	// it carries the chat's jid but is NOT a whatsapp-chat file.
+	note := "---\ntype: analysis\njid: \"" + jid + "\"\nlast_message_ts: 1\n---\n\nMIS NOTAS IMPORTANTES\n"
+	notePath := filepath.Join(outDir, "Anotaciones.md")
+	if err := os.WriteFile(notePath, []byte(note), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ExportVault(db, outDir, false, 0); err != nil {
+		t.Fatalf("ExportVault: %v", err)
+	}
+
+	data, err := os.ReadFile(notePath)
+	if err != nil {
+		t.Fatalf("the user's note was renamed or deleted by the export: %v", err)
+	}
+	if !strings.Contains(string(data), "MIS NOTAS IMPORTANTES") {
+		t.Fatalf("the user's note content was destroyed:\n%s", data)
+	}
+	chatFile := xvFileForJID(t, outDir, jid)
+	if chatFile == "" {
+		t.Fatal("the chat itself was not exported")
+	}
+	if chatFile == "Anotaciones.md" {
+		t.Fatal("the export claimed the user's note as the chat file")
+	}
+}
+
+// TestExportNeverWritesThroughASymlink — PR #64 review round 5, F2
+// (MEDIUM-HIGH), executed at 63c86fd and 3ef9e80: the planning scan used
+// os.Stat and SKIPPED stat failures, so a DANGLING symlink squatting a
+// unit's name was invisible — fail-open, inconsistent with the obstacle
+// posture everywhere else — while os.WriteFile follows symlinks. The chat
+// content was created OUTSIDE outputDir at the symlink's target, race-free,
+// with `written=1 dropped=0`. The scan now uses os.Lstat: symlinks and
+// unstattable entries are obstacles, so the unit's name escalates away and
+// nothing is ever written through a link.
+func TestExportNeverWritesThroughASymlink(t *testing.T) {
+	db := xvDB(t)
+	outDir := t.TempDir()
+	leakTarget := filepath.Join(t.TempDir(), "leaked.md") // outside outputDir, nonexistent
+
+	const jid = "15555550502@s.whatsapp.net"
+	xvChat(t, db, jid, "direct", "Ana Lopez", xvPhoneLastTS)
+	xvContact(t, db, jid, "Ana Lopez", "15555550502")
+	xvMsg(t, db, "S1", jid, jid, "Ana Lopez", "text", "contenido privado", "", xvPhoneLastTS, false)
+
+	if err := os.Symlink(leakTarget, filepath.Join(outDir, "Ana Lopez.md")); err != nil {
+		t.Skipf("cannot create symlinks here: %v", err)
+	}
+
+	if err := ExportVault(db, outDir, false, 0); err != nil {
+		t.Fatalf("ExportVault: %v", err)
+	}
+
+	if _, err := os.Stat(leakTarget); err == nil {
+		t.Fatal("chat content escaped the output directory through a symlink")
+	}
+	chatFile := xvFileForJID(t, outDir, jid)
+	if chatFile == "" {
+		t.Fatal("the chat was not exported inside the output directory")
+	}
+	if fi, err := os.Lstat(filepath.Join(outDir, chatFile)); err != nil || fi.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("the exported chat file must be a real regular file (err=%v)", err)
+	}
+}
+
+// TestExportRefusesCaseStraddleOntoAnotherUnitsStaleFile — PR #64 review
+// round 5, F3: failure-path coverage for the round-4 pre-write guard and
+// reconcile's COLLISION finding (a security control is tested on its own
+// failure path, because that is where its regressions hide). The shape the
+// obstacle planner cannot defuse: the victim file belongs to an
+// IN-POPULATION unit (so it is not an obstacle), sits under a stale name
+// healing cannot move (the unit's canonical file already exists), and a
+// different unit's name case-straddles onto it. The guard must refuse that
+// write NAMING both sides, the stale file must survive, and reconcile must
+// predict the refusal as COLLISION.
+func TestExportRefusesCaseStraddleOntoAnotherUnitsStaleFile(t *testing.T) {
+	db := xvDB(t)
+	outDir := t.TempDir()
+
+	// Needs a case-insensitive volume for the straddle.
+	if err := os.WriteFile(filepath.Join(outDir, "probe_case.md"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, caseErr := os.Stat(filepath.Join(outDir, "PROBE_CASE.md"))
+	os.Remove(filepath.Join(outDir, "probe_case.md"))
+	if caseErr != nil {
+		t.Skip("volume is case-sensitive; straddle not applicable here")
+	}
+
+	const jidB = "15555550512@s.whatsapp.net" // renamed contact: old file + canonical file
+	const jidA = "15555550511@s.whatsapp.net" // straddler whose display matches B's OLD filename
+	xvChat(t, db, jidB, "direct", "Mari Nueva", xvPhoneLastTS)
+	xvContact(t, db, jidB, "Mari Nueva", "15555550512")
+	xvMsg(t, db, "B1", jidB, jidB, "Mari Nueva", "text", "historia b", "", xvPhoneLastTS, false)
+	xvChat(t, db, jidA, "direct", "MARI OLD", xvPhoneLastTS-10)
+	xvContact(t, db, jidA, "MARI OLD", "15555550511")
+	xvMsg(t, db, "A1", jidA, jidA, "MARI OLD", "text", "historia a", "", xvPhoneLastTS-10, false)
+
+	// B's stale pre-rename file (in-population jid, so NOT an obstacle) and
+	// B's canonical file (so healing cannot move the stale one).
+	stale := "---\ntype: whatsapp-chat\njid: \"" + jidB + "\"\nchat_type: \"direct\"\nlast_message_ts: 1\nmessage_count: 1\n---\n\nhistoria vieja de b\n"
+	if err := os.WriteFile(filepath.Join(outDir, "Mari Old.md"), []byte(stale), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	canonical := "---\ntype: whatsapp-chat\njid: \"" + jidB + "\"\nchat_type: \"direct\"\nlast_message_ts: " + fmt.Sprint(xvPhoneLastTS) + "\nmessage_count: 1\n---\n\nhistoria b\n"
+	if err := os.WriteFile(filepath.Join(outDir, "Mari Nueva.md"), []byte(canonical), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reconcile FIRST: it must predict the refusal without mutating anything.
+	findings, rerr := ReconcileVault(db, outDir, false, 0)
+	if rerr != nil {
+		t.Fatalf("reconcile: %v", rerr)
+	}
+	collision := false
+	for _, f := range findings {
+		if strings.HasPrefix(f, "COLLISION") && strings.Contains(f, jidA) {
+			collision = true
+		}
+	}
+	if !collision {
+		t.Errorf("reconcile must predict the straddle as a COLLISION naming %s; findings: %v", jidA, findings)
+	}
+
+	err := ExportVault(db, outDir, false, 0)
+	if err == nil {
+		t.Fatal("the pre-write guard must refuse a write that resolves onto another unit's stale file")
+	}
+	if !strings.Contains(err.Error(), jidA) || !strings.Contains(err.Error(), "writing would destroy") || !strings.Contains(err.Error(), "Mari Old.md") {
+		t.Errorf("the refusal must name the straddler and the victim file; got: %v", err)
+	}
+	data, readErr := os.ReadFile(filepath.Join(outDir, "Mari Old.md"))
+	if readErr != nil || !strings.Contains(string(data), "historia vieja de b") {
+		t.Errorf("the stale file must survive the refused run intact (err=%v)", readErr)
 	}
 }

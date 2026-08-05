@@ -133,7 +133,7 @@ func ExportVault(db *sql.DB, outputDir string, includeGroups bool, minMessages i
 			memberSet[jid] = true
 		}
 		for j := range entries {
-			if !os.SameFile(entries[j].info, st) {
+			if entries[j].info == nil || !os.SameFile(entries[j].info, st) {
 				continue
 			}
 			if !memberSet[entries[j].jid] {
@@ -810,21 +810,29 @@ func foldKey(s string) string {
 	return strings.ToLower(norm.NFC.String(s))
 }
 
-// vaultEntry is one regular file in the output directory, as seen by the
-// planning scan: its exact byte name, the chat jid its frontmatter claims
-// ("" for non-chat or unreadable files), and its FileInfo for inode-identity
-// checks.
+// vaultEntry is one non-directory entry in the output directory, as seen by
+// the planning scan: its exact byte name, the jid of the chat file WE own at
+// that name ("" for anything else), and its Lstat FileInfo for
+// inode-identity checks (nil when the entry could not be statted).
 type vaultEntry struct {
 	name string
 	jid  string
 	info os.FileInfo
 }
 
-// scanVaultEntries lists every regular file in dir. Frontmatter identity is
-// parsed for .md files (case-insensitive suffix — a case-insensitive volume
-// resolves "X.MD" and "x.md" alike); other files still enter the scan so the
-// SameFile sweeps measure the ENTIRE namespace the exporter can write
-// through, not a filtered subset.
+// scanVaultEntries lists every non-directory entry in dir. Frontmatter
+// identity is parsed for regular .md files (case-insensitive suffix — a
+// case-insensitive volume resolves "X.MD" and "x.md" alike); everything else
+// still enters the scan so the SameFile sweeps measure the ENTIRE namespace
+// the exporter can write through, not a filtered subset.
+//
+// The .jid field means "this is a chat file WE own for that jid": it is set
+// only when the file declares `type: whatsapp-chat`. A file that carries a
+// chat's jid without that type — a user's annotated copy of a chat file —
+// is somebody's own document: an OBSTACLE for naming, never a heal source,
+// never a legitimate alias, never ours to overwrite (round 5, F1). This is
+// also what makes the export's ownership definition identical to
+// ReconcileVault's chat-file definition; the two halves used to disagree.
 func scanVaultEntries(dir string) ([]vaultEntry, error) {
 	dirEntries, err := os.ReadDir(dir)
 	if err != nil {
@@ -835,13 +843,27 @@ func scanVaultEntries(dir string) ([]vaultEntry, error) {
 		if e.IsDir() {
 			continue
 		}
-		info, err := os.Stat(filepath.Join(dir, e.Name()))
+		// Lstat, not Stat: a symlink must be SEEN as a symlink. Stat followed
+		// the link and skipped failures, so a dangling symlink squatting a
+		// planned name was invisible — fail-open — and os.WriteFile then
+		// followed it OUT of the output directory (round 5, F2). A symlink,
+		// like an unstattable entry (nil info), now enters the scan as a
+		// jid-less name obstacle: the planner escalates around it and the
+		// SameFile passes skip it.
+		info, err := os.Lstat(filepath.Join(dir, e.Name()))
 		if err != nil {
+			entries = append(entries, vaultEntry{name: e.Name()})
 			continue
 		}
 		ve := vaultEntry{name: e.Name(), info: info}
+		if info.Mode()&os.ModeSymlink != 0 {
+			entries = append(entries, ve)
+			continue
+		}
 		if n := len(e.Name()); n >= 3 && strings.EqualFold(e.Name()[n-3:], ".md") {
-			ve.jid = readChatFileIdentity(filepath.Join(dir, e.Name())).jid
+			if id := readChatFileIdentity(filepath.Join(dir, e.Name())); id.fileType == "whatsapp-chat" {
+				ve.jid = id.jid
+			}
 		}
 		entries = append(entries, ve)
 	}
@@ -958,11 +980,17 @@ func exportOneUnit(db *sql.DB, outputDir string, u exportUnit, todayStr string) 
 	out := filepath.Join(outputDir, u.filename)
 	id := readChatFileIdentity(out)
 
-	// The existing file only counts as "ours" when the jid it declares belongs
-	// to this unit. A file some OTHER chat wrote at this path (the pre-fix
-	// group-over-person collision) must be overwritten, never trusted for the
-	// unchanged-skip and never mined for preserved frontmatter.
-	fileIsOurs := !id.exists || id.jid == "" || memberSet[id.jid]
+	// The existing file only counts as "ours" when it declares BOTH the
+	// whatsapp-chat type and a jid belonging to this unit — the same
+	// ownership definition the planning scan and ReconcileVault use (round
+	// 5, F1). A file some OTHER chat wrote at this path (the pre-fix
+	// group-over-person collision) must be overwritten, never trusted for
+	// the unchanged-skip and never mined for preserved frontmatter. A
+	// jid-less or non-chat file here is NOT ours either (round 5, F4): plan
+	// time treats those as obstacles, so one at our target can only mean it
+	// appeared after the scan — a TOCTOU residual we do not inherit
+	// frontmatter from or trust for skips.
+	fileIsOurs := !id.exists || (id.fileType == "whatsapp-chat" && memberSet[id.jid])
 
 	// Unchanged-skip: same chat, same alias closure (a newly discovered alias
 	// must trigger a merge rewrite), and nothing newer in the DB. Mirrors
