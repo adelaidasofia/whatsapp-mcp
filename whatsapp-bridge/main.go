@@ -72,7 +72,7 @@ func main() {
 			dbKey = cfg.DBKey
 			log.Println("DB key: explicit WHATSAPP_DB_KEY override")
 		} else {
-			dbKey, err = GetOrCreateDBKey(cfg.KeychainService, cfg.KeychainAccount)
+			dbKey, err = GetOrCreateDBKey(cfg.KeychainService, cfg.KeychainAccount, cfg.DBPath)
 			if err != nil {
 				log.Fatalf("DB key: %v", err)
 			}
