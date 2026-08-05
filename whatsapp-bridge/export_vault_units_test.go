@@ -97,6 +97,33 @@ func TestAssignFilenamesDisambiguatesSameDisplayName(t *testing.T) {
 	}
 }
 
+// PR #64 review, LOW 2: an alias edge pointing at a JID with NO chats row
+// bypassed the non-direct edge guard, landing a group-shaped JID inside a
+// person file's alias closure. Reconcile honors alias claims, so that stray
+// entry could mask a real future chat at that JID from MISSING detection.
+// Non-direct-shaped JIDs (by server suffix) never join a direct closure.
+func TestBuildExportUnitsRejectsGroupShapedAliasWithoutChatRow(t *testing.T) {
+	db := xvDB(t)
+	const rowlessGroupJID = "120363999999999999@g.us"
+	xvChat(t, db, xvLIDJID, "direct", "Alex Rivera", xvLIDLastTS)
+	xvContact(t, db, xvLIDJID, "Alex Rivera", "")
+	xvMsg(t, db, "L1", xvLIDJID, xvLIDJID, "Alex Rivera", "text", "hola", "", xvLIDLastTS, false)
+	xvAlias(t, db, xvLIDJID, rowlessGroupJID) // corrupt edge: person <-> rowless group JID
+
+	units, _, err := buildExportUnits(db, false, 0)
+	if err != nil {
+		t.Fatalf("buildExportUnits: %v", err)
+	}
+	if len(units) != 1 {
+		t.Fatalf("units = %d, want 1", len(units))
+	}
+	for _, a := range units[0].aliasJIDs {
+		if a == rowlessGroupJID {
+			t.Fatalf("group-shaped JID %s entered a direct chat's alias closure: %v", rowlessGroupJID, units[0].aliasJIDs)
+		}
+	}
+}
+
 func TestReadChatFileIdentityParsesAliasArray(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "x.md")

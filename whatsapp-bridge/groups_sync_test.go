@@ -87,3 +87,33 @@ func TestSyncGroupMetadataInsertsUnknownGroupAndKeepsNameWhenSubjectEmpty(t *tes
 		t.Errorf("name = %q, want %q (empty subject must never blank a known name)", name, "Named Later")
 	}
 }
+
+// PR #64 review, LOW 1: an event or sync entry carrying NEITHER a participant
+// count NOR a participant list must not zero a previously stored count — the
+// same guard the name column already has against empty overwrites.
+func TestSyncGroupMetadataNeverZeroesAStoredCount(t *testing.T) {
+	db := xvDB(t)
+
+	full := &types.GroupInfo{
+		JID:              types.JID{User: "120363000000000003", Server: "g.us"},
+		ParticipantCount: 9,
+	}
+	full.Name = "Counted Group"
+	if _, err := SyncGroupMetadata(context.Background(), db, fakeGroupLister{groups: []*types.GroupInfo{full}}); err != nil {
+		t.Fatalf("SyncGroupMetadata (full): %v", err)
+	}
+
+	empty := &types.GroupInfo{JID: full.JID} // no count, no participants, no name
+	if _, err := SyncGroupMetadata(context.Background(), db, fakeGroupLister{groups: []*types.GroupInfo{empty}}); err != nil {
+		t.Fatalf("SyncGroupMetadata (empty): %v", err)
+	}
+
+	var count int
+	if err := db.QueryRow(`SELECT COALESCE(participants_count,0) FROM chats WHERE jid = ?`, "120363000000000003@g.us").
+		Scan(&count); err != nil {
+		t.Fatalf("read chat row: %v", err)
+	}
+	if count != 9 {
+		t.Errorf("participants_count = %d, want 9 (a count-less update must not zero a stored count)", count)
+	}
+}

@@ -98,13 +98,18 @@ func UpsertGroupChat(db *sql.DB, g *types.GroupInfo) error {
 		count = len(g.Participants)
 	}
 	now := time.Now().Unix()
+	// Both name and participants_count only ever UPGRADE a row: a payload
+	// that carries neither a subject nor any participant data (count 0,
+	// empty list) must not blank a stored name or zero a stored count
+	// (PR #64 review, LOW 1). A real group always has >= 1 participant, so
+	// 0 can only mean "not included in this payload".
 	_, err := db.Exec(`
 		INSERT INTO chats (jid, chat_type, name, normalized_name, participants_count, created_at, updated_at)
 		VALUES (?, 'group', ?, ?, ?, ?, ?)
 		ON CONFLICT(jid) DO UPDATE SET
 			name = CASE WHEN excluded.name <> '' THEN excluded.name ELSE chats.name END,
 			normalized_name = CASE WHEN excluded.name <> '' THEN excluded.normalized_name ELSE chats.normalized_name END,
-			participants_count = excluded.participants_count,
+			participants_count = CASE WHEN excluded.participants_count > 0 THEN excluded.participants_count ELSE chats.participants_count END,
 			updated_at = excluded.updated_at
 	`, g.JID.String(), g.Name, Normalize(g.Name), count, now, now)
 	if err != nil {

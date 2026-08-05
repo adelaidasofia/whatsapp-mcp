@@ -372,6 +372,107 @@ func TestExportGroupNeverTakesAPersonNamedFile(t *testing.T) {
 	}
 }
 
+// TestExportDisambiguatesSameNameSamePhoneWithoutAliasEdge — PR #64 review,
+// HIGH finding, executed counterexample (a): the SAME human's LID and phone
+// rows with NO jid_aliases edge (alias coverage is incomplete in the wild —
+// Baileys-imported contacts carry phones but the import never writes edges).
+// The LID contact carries the repaired real phone, so BOTH units display the
+// same name AND disambiguate to the same "+phone" tag. First-round collision
+// handling keyed on the undecorated name never re-checked final names, so
+// both units silently shared one path: one file, one chat gone, rc=0.
+func TestExportDisambiguatesSameNameSamePhoneWithoutAliasEdge(t *testing.T) {
+	db := xvDB(t)
+	outDir := t.TempDir()
+
+	const person = "Same Name"
+	xvChat(t, db, xvLIDJID, "direct", person, xvLIDLastTS)
+	xvChat(t, db, xvPhoneJID, "direct", person, xvPhoneLastTS)
+	// The LID row carries the repaired REAL phone; deliberately NO alias edge.
+	xvContact(t, db, xvLIDJID, person, "15555550100")
+	xvContact(t, db, xvPhoneJID, person, "15555550100")
+	xvMsg(t, db, "L1", xvLIDJID, xvLIDJID, person, "text", "lado lid", "", xvLIDLastTS, false)
+	xvMsg(t, db, "P1", xvPhoneJID, xvPhoneJID, person, "text", "lado telefono", "", xvPhoneLastTS, false)
+
+	if err := ExportVault(db, outDir, false, 0); err != nil {
+		t.Fatalf("ExportVault: %v", err)
+	}
+
+	lidFile := xvFileForJID(t, outDir, xvLIDJID)
+	phoneFile := xvFileForJID(t, outDir, xvPhoneJID)
+	if lidFile == "" || phoneFile == "" {
+		t.Fatalf("a chat lost its file to a residual filename collision: lid=%q phone=%q", lidFile, phoneFile)
+	}
+	if lidFile == phoneFile {
+		t.Fatalf("both chats claim one file %q — the collision was not resolved", lidFile)
+	}
+}
+
+// TestExportPushNameMimicsDisambiguatedName — PR #64 review, HIGH finding,
+// executed counterexample (b): push names are attacker-controlled, and a push
+// name that LOOKS like a disambiguated name ("Same Name (+15555550311)")
+// collided with the genuinely disambiguated file of a different human named
+// "Same Name" with phone 15555550311. Final names must be checked to a fixed
+// point, not derived in one pass from the undecorated name.
+func TestExportPushNameMimicsDisambiguatedName(t *testing.T) {
+	db := xvDB(t)
+	outDir := t.TempDir()
+
+	const mimicJID = "15555550377@s.whatsapp.net"
+	const victimAJID = "15555550311@s.whatsapp.net"
+	const victimBJID = "15555550322@s.whatsapp.net"
+	xvChat(t, db, mimicJID, "direct", "Same Name (+15555550311)", xvPhoneLastTS)
+	xvChat(t, db, victimAJID, "direct", "Same Name", xvPhoneLastTS-10)
+	xvChat(t, db, victimBJID, "direct", "Same Name", xvPhoneLastTS-20)
+	xvContact(t, db, mimicJID, "Same Name (+15555550311)", "15555550377")
+	xvContact(t, db, victimAJID, "Same Name", "15555550311")
+	xvContact(t, db, victimBJID, "Same Name", "15555550322")
+	xvMsg(t, db, "M1", mimicJID, mimicJID, "Same Name (+15555550311)", "text", "soy quien digo ser", "", xvPhoneLastTS, false)
+	xvMsg(t, db, "A1", victimAJID, victimAJID, "Same Name", "text", "soy a", "", xvPhoneLastTS-10, false)
+	xvMsg(t, db, "B1", victimBJID, victimBJID, "Same Name", "text", "soy b", "", xvPhoneLastTS-20, false)
+
+	if err := ExportVault(db, outDir, false, 0); err != nil {
+		t.Fatalf("ExportVault: %v", err)
+	}
+
+	seen := map[string]string{}
+	for _, jid := range []string{mimicJID, victimAJID, victimBJID} {
+		f := xvFileForJID(t, outDir, jid)
+		if f == "" {
+			t.Fatalf("chat %s lost its file to a push name mimicking a disambiguated name", jid)
+		}
+		if owner, dup := seen[f]; dup {
+			t.Fatalf("chats %s and %s share one file %q", owner, jid, f)
+		}
+		seen[f] = jid
+	}
+}
+
+// TestExportFailsLoudOnUnresolvableFilenameCollision: when even the JID-based
+// suffixes cannot separate two chats (pathological JIDs that sanitize to the
+// same filename), the export must refuse to run rather than let two units
+// race for one path with rc=0. Fail closed, name both chats.
+func TestExportFailsLoudOnUnresolvableFilenameCollision(t *testing.T) {
+	db := xvDB(t)
+	outDir := t.TempDir()
+
+	// Distinct JIDs whose sanitized forms are identical (":" sanitizes to "-")
+	// and which contain no digits, so every disambiguation level collides.
+	const jidA = "a:b@lid"
+	const jidB = "a-b@lid"
+	xvChat(t, db, jidA, "direct", "Weird Pair", xvPhoneLastTS)
+	xvChat(t, db, jidB, "direct", "Weird Pair", xvPhoneLastTS-10)
+	xvMsg(t, db, "W1", jidA, jidA, "Weird Pair", "text", "uno", "", xvPhoneLastTS, false)
+	xvMsg(t, db, "W2", jidB, jidB, "Weird Pair", "text", "dos", "", xvPhoneLastTS-10, false)
+
+	err := ExportVault(db, outDir, false, 0)
+	if err == nil {
+		t.Fatal("ExportVault returned nil while two chats contend for one filename")
+	}
+	if !strings.Contains(err.Error(), jidA) || !strings.Contains(err.Error(), jidB) {
+		t.Errorf("the error must NAME both colliding chats; got: %v", err)
+	}
+}
+
 // TestExportFailsLoudWhenAChatCannotBeWritten: a chat that the exporter
 // enumerates but cannot write must make the run FAIL and be NAMED. Pre-fix the
 // error was logged, counted as a skip, and the run exited 0 — the

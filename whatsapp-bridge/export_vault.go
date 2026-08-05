@@ -258,6 +258,13 @@ func buildExportUnits(db *sql.DB, includeGroups bool, minMessages int) ([]export
 		if c, ok := chats[b]; ok && c.chatType != "direct" {
 			continue
 		}
+		// The chats-row check above cannot see an edge endpoint with NO row;
+		// the server-suffix check catches those, so a group-shaped JID can
+		// never enter a person's closure and later mask a real chat at that
+		// JID from reconcile's MISSING detection (PR #64 review, LOW 2).
+		if chatTypeFromServerSuffix(a) != "direct" || chatTypeFromServerSuffix(b) != "direct" {
+			continue
+		}
 		union(a, b)
 	}
 	edgeRows.Close()
@@ -321,7 +328,9 @@ func buildExportUnits(db *sql.DB, includeGroups bool, minMessages int) ([]export
 			return u.members[i] < u.members[j]
 		})
 		for _, jid := range closure {
-			if jid != u.primary {
+			// Same defense as the edge guard: only direct-shaped JIDs belong
+			// in a person's alias closure.
+			if jid != u.primary && chatTypeFromServerSuffix(jid) == "direct" {
 				u.aliasJIDs = append(u.aliasJIDs, jid)
 			}
 		}
@@ -347,6 +356,21 @@ func buildExportUnits(db *sql.DB, includeGroups bool, minMessages int) ([]export
 		return nil, 0, err
 	}
 	assignFilenames(units)
+
+	// Structural guarantee behind invariant 4: no two units may share a final
+	// path. Anything the fixed-point escalation could not separate fails the
+	// run here, naming both chats — never a silent last-writer-wins on one
+	// file, and never two goroutines writing the same path (PR #64 review,
+	// HIGH finding).
+	byFinal := map[string]int{}
+	for i := range units {
+		key := strings.ToLower(units[i].filename)
+		if j, dup := byFinal[key]; dup {
+			return nil, 0, fmt.Errorf("filename collision after disambiguation: %s and %s both resolve to %q — refusing to export",
+				units[j].primary, units[i].primary, units[i].filename)
+		}
+		byFinal[key] = i
+	}
 
 	sort.Slice(units, func(i, j int) bool { return units[i].filename < units[j].filename })
 	return units, len(chats), nil
@@ -472,48 +496,91 @@ type chatRowLite struct {
 	participantsCount int
 }
 
-// assignFilenames gives every unit a deterministic, collision-free filename.
+// assignFilenames gives every unit a deterministic filename, escalated to a
+// FIXED POINT on the final (lowercased) names.
 //
-// Direct chats keep the historical `<Display>.md` shape. Non-direct chats
+// Direct chats keep the historical `<Display>.md` shape; non-direct chats
 // ALWAYS carry their chat_type (`<Display> (group).md`), so a group can never
-// occupy a person-named file. When two units still collide (two humans with
-// the same push name, two groups with the same subject), every collider gets
-// its JID digits appended — deterministic, so names never churn between runs.
+// occupy a person-named file. Collisions escalate per unit through levels:
+//
+//	0  the historical shape above
+//	1  phone / JID-digit tag appended (two humans sharing a push name)
+//	2  the full sanitized primary JID appended
+//
+// Every member of a colliding FINAL-name set escalates and the loop
+// re-checks, so the two shapes that slipped through a single
+// undecorated-name pass (PR #64 review, HIGH finding) resolve here: both JID
+// forms of one human carrying the same repaired phone with no alias edge
+// (identical level-1 tags → distinct level-2 JIDs), and a push name that
+// itself mimics a disambiguated name ("Name (+1555…)") colliding with a
+// genuinely disambiguated file (both sides escalate until distinct).
+//
+// buildExportUnits verifies final uniqueness afterwards and FAILS the run on
+// any residue (pathological JIDs that sanitize identically), which is what
+// makes one-file-one-path structural: the concurrent write pass can never
+// hold two units with the same target, so a shared-path write race cannot
+// exist by construction.
 func assignFilenames(units []exportUnit) {
-	base := func(u *exportUnit, disambiguate bool) string {
-		name := sanitizeFilename(u.display)
-		switch {
-		case u.chatType == "direct" && !disambiguate:
-			return name
-		case u.chatType == "direct":
+	name := func(u *exportUnit, level int) string {
+		base := sanitizeFilename(u.display)
+		if u.chatType != "direct" {
+			switch level {
+			case 0:
+				return fmt.Sprintf("%s (%s)", base, u.chatType)
+			case 1:
+				tag := extractPhone(u.primary)
+				if tag == "" {
+					tag = sanitizeFilename(u.primary)
+				}
+				return fmt.Sprintf("%s (%s %s)", base, u.chatType, tag)
+			default:
+				return fmt.Sprintf("%s (%s %s)", base, u.chatType, sanitizeFilename(u.primary))
+			}
+		}
+		switch level {
+		case 0:
+			return base
+		case 1:
 			tag := u.phone
 			if tag != "" {
 				tag = "+" + tag
 			} else if tag = extractPhone(u.primary); tag == "" {
 				tag = sanitizeFilename(u.primary)
 			}
-			return fmt.Sprintf("%s (%s)", name, tag)
-		case !disambiguate:
-			return fmt.Sprintf("%s (%s)", name, u.chatType)
+			return fmt.Sprintf("%s (%s)", base, tag)
 		default:
-			tag := extractPhone(u.primary)
-			if tag == "" {
-				tag = sanitizeFilename(u.primary)
-			}
-			return fmt.Sprintf("%s (%s %s)", name, u.chatType, tag)
+			return fmt.Sprintf("%s (%s)", base, sanitizeFilename(u.primary))
 		}
 	}
 
-	byName := map[string][]int{}
-	for i := range units {
-		n := strings.ToLower(base(&units[i], false))
-		byName[n] = append(byName[n], i)
-	}
-	for _, idxs := range byName {
-		disambiguate := len(idxs) > 1
-		for _, i := range idxs {
-			units[i].filename = base(&units[i], disambiguate) + ".md"
+	const maxLevel = 2
+	levels := make([]int, len(units))
+	// Each round either escalates at least one unit or is the fixed point;
+	// levels cap at maxLevel, so maxLevel+1 rounds bound the loop.
+	for round := 0; round <= maxLevel; round++ {
+		byName := map[string][]int{}
+		for i := range units {
+			key := strings.ToLower(name(&units[i], levels[i]))
+			byName[key] = append(byName[key], i)
 		}
+		changed := false
+		for _, idxs := range byName {
+			if len(idxs) < 2 {
+				continue
+			}
+			for _, i := range idxs {
+				if levels[i] < maxLevel {
+					levels[i]++
+					changed = true
+				}
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+	for i := range units {
+		units[i].filename = name(&units[i], levels[i]) + ".md"
 	}
 }
 
