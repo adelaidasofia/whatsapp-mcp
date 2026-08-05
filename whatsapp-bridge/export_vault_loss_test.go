@@ -500,3 +500,137 @@ func TestExportFailsLoudWhenAChatCannotBeWritten(t *testing.T) {
 		t.Errorf("the error must NAME the dropped chat %q; got: %v", jid, err)
 	}
 }
+
+// TestExportSeparatesNormalizationTwinNames — PR #64 review round 3, HIGH,
+// executed at dd54464: the dedup key and the final-uniqueness gate compared
+// STRING identity, but APFS (macOS default, where this bridge ships and the
+// vault is iCloud-synced) resolves filenames normalization-INSENSITIVELY. Two
+// different humans whose push names are the NFC and NFD spellings of "José"
+// are byte-distinct — no collision detected, neither escalates — yet both
+// units open ONE physical file, racing the same inode with rc=0. Real
+// reachability: accented names are the norm in this product's LatAm market,
+// mixed NFC/NFD arrives from real devices and vCard imports, and a contact
+// can deliberately set the NFD twin of another contact's name (the same
+// mimicry class as the round-2 fix, one axis deeper).
+//
+// After the fix, filenames are NFC-folded before comparison AND before
+// writing, so the twins collide at plan time and escalate to distinct
+// "+phone" names. On byte-literal filesystems (ext4) the pre-fix code
+// happened to write two files, so the RED proof for this test is on macOS;
+// post-fix behavior is identical on every platform.
+func TestExportSeparatesNormalizationTwinNames(t *testing.T) {
+	db := xvDB(t)
+	outDir := t.TempDir()
+
+	const nfcJID = "15555550201@s.whatsapp.net"
+	const nfdJID = "15555550202@s.whatsapp.net"
+	nameNFC := "José"  // é precomposed
+	nameNFD := "José" // e + combining acute
+	if nameNFC == nameNFD {
+		t.Fatal("fixture broken: the two spellings must be byte-distinct")
+	}
+	xvChat(t, db, nfcJID, "direct", nameNFC, xvPhoneLastTS)
+	xvChat(t, db, nfdJID, "direct", nameNFD, xvPhoneLastTS-10)
+	xvContact(t, db, nfcJID, nameNFC, "15555550201")
+	xvContact(t, db, nfdJID, nameNFD, "15555550202")
+	xvMsg(t, db, "N1", nfcJID, nfcJID, nameNFC, "text", "soy nfc", "", xvPhoneLastTS, false)
+	xvMsg(t, db, "N2", nfdJID, nfdJID, nameNFD, "text", "soy nfd", "", xvPhoneLastTS-10, false)
+
+	if err := ExportVault(db, outDir, false, 0); err != nil {
+		t.Fatalf("ExportVault: %v", err)
+	}
+
+	nfcFile := xvFileForJID(t, outDir, nfcJID)
+	nfdFile := xvFileForJID(t, outDir, nfdJID)
+	if nfcFile == "" || nfdFile == "" {
+		t.Fatalf("a chat lost its file to filename normalization aliasing: nfc=%q nfd=%q", nfcFile, nfdFile)
+	}
+	if nfcFile == nfdFile {
+		t.Fatalf("both chats claim one file %q", nfcFile)
+	}
+}
+
+// TestExportResolvesLongMimicChains — PR #64 review round 3, MEDIUM, executed
+// at dd54464: the escalation loop was capped at 3 rounds, not run to its
+// fixed point. This 5-chat corpus ("Bob" twice, plus push names mimicking
+// each successive decorated form) needs more rounds than the cap; the capped
+// loop failed CLOSED (residue error, zero files) — no data loss, but four
+// attacker-influenceable push names bricked the entire export until someone
+// renamed a contact. The unbounded loop provably terminates (each continuing
+// round escalates at least one unit and levels are capped, so total
+// escalations are bounded by 2n) and separates this corpus in five rounds.
+func TestExportResolvesLongMimicChains(t *testing.T) {
+	db := xvDB(t)
+	outDir := t.TempDir()
+
+	chain := []struct {
+		jid   string
+		name  string
+		phone string
+	}{
+		{"15555550411@s.whatsapp.net", "Bob", "15555550411"},
+		{"15555550422@s.whatsapp.net", "Bob", "15555550422"},
+		{"15555550433@s.whatsapp.net", "Bob (+15555550411)", "15555550433"},
+		{"15555550444@s.whatsapp.net", "Bob (+15555550411) (+15555550433)", "15555550444"},
+		{"15555550455@s.whatsapp.net", "Bob (+15555550411) (+15555550433) (+15555550444)", "15555550455"},
+	}
+	for i, c := range chain {
+		xvChat(t, db, c.jid, "direct", c.name, xvPhoneLastTS-int64(i))
+		xvContact(t, db, c.jid, c.name, c.phone)
+		xvMsg(t, db, fmt.Sprintf("C%d", i), c.jid, c.jid, c.name, "text", "hola", "", xvPhoneLastTS-int64(i), false)
+	}
+
+	if err := ExportVault(db, outDir, false, 0); err != nil {
+		t.Fatalf("ExportVault must separate a resolvable mimic chain, got: %v", err)
+	}
+
+	seen := map[string]string{}
+	for _, c := range chain {
+		f := xvFileForJID(t, outDir, c.jid)
+		if f == "" {
+			t.Fatalf("chat %s got no file", c.jid)
+		}
+		if owner, dup := seen[f]; dup {
+			t.Fatalf("chats %s and %s share one file %q", owner, c.jid, f)
+		}
+		seen[f] = c.jid
+	}
+}
+
+// TestExportDetectsFilesystemAliasedPaths — PR #64 review round 3, HIGH part
+// (b): name-level prevention (NFC folding, case-insensitive dedup) can only
+// cover the aliasing axes we know about. The reconciliation must verify the
+// RECIPIENT's predicate — distinct units landed on distinct FILES — via
+// os.SameFile, so any filesystem mechanism that maps two distinct names onto
+// one inode (normalization, case-folding, links) fails the run loudly instead
+// of counting two chats as written into one file. Here the aliasing is forced
+// with a hard link, the axis no name folding can see.
+func TestExportDetectsFilesystemAliasedPaths(t *testing.T) {
+	db := xvDB(t)
+	outDir := t.TempDir()
+
+	const jidA = "15555550401@s.whatsapp.net"
+	const jidB = "15555550402@s.whatsapp.net"
+	xvChat(t, db, jidA, "direct", "Person A", xvPhoneLastTS)
+	xvChat(t, db, jidB, "direct", "Person B", xvPhoneLastTS-10)
+	xvContact(t, db, jidA, "Person A", "15555550401")
+	xvContact(t, db, jidB, "Person B", "15555550402")
+	xvMsg(t, db, "H1", jidA, jidA, "Person A", "text", "soy a", "", xvPhoneLastTS, false)
+	xvMsg(t, db, "H2", jidB, jidB, "Person B", "text", "soy b", "", xvPhoneLastTS-10, false)
+
+	// Alias the two (collision-free) target paths onto ONE inode.
+	if err := os.WriteFile(filepath.Join(outDir, "Person B.md"), nil, 0o644); err != nil {
+		t.Fatalf("seed alias target: %v", err)
+	}
+	if err := os.Link(filepath.Join(outDir, "Person B.md"), filepath.Join(outDir, "Person A.md")); err != nil {
+		t.Skipf("filesystem does not support hard links here: %v", err)
+	}
+
+	err := ExportVault(db, outDir, false, 0)
+	if err == nil {
+		t.Fatal("ExportVault returned nil while two chats' files are one inode (a write raced and one history was destroyed)")
+	}
+	if !strings.Contains(err.Error(), jidA) || !strings.Contains(err.Error(), jidB) {
+		t.Errorf("the error must NAME both aliased chats; got: %v", err)
+	}
+}

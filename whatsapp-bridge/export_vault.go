@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 // ExportVault regenerates one markdown file per chat from the SQLite DB.
@@ -113,6 +115,11 @@ func ExportVault(db *sql.DB, outputDir string, includeGroups bool, minMessages i
 	skippedUnchanged := 0
 	skippedEmpty := 0
 	var dropped []string
+	type onDisk struct {
+		i    int
+		info os.FileInfo
+	}
+	var files []onDisk
 	for i, u := range units {
 		if errs[i] != nil {
 			dropped = append(dropped, fmt.Sprintf("%s (→ %s): %v", u.primary, u.filename, errs[i]))
@@ -122,17 +129,53 @@ func ExportVault(db *sql.DB, outputDir string, includeGroups bool, minMessages i
 		case writeResultWrote, writeResultUnchanged:
 			// The file must actually exist on disk; a claim without a file is
 			// exactly the silent no-op this ticket exists to kill.
-			if _, statErr := os.Stat(filepath.Join(outputDir, u.filename)); statErr != nil {
+			info, statErr := os.Stat(filepath.Join(outputDir, u.filename))
+			if statErr != nil {
 				dropped = append(dropped, fmt.Sprintf("%s (→ %s): result recorded but file missing: %v", u.primary, u.filename, statErr))
 				continue
 			}
-			if results[i] == writeResultWrote {
-				written++
-			} else {
-				skippedUnchanged++
-			}
+			files = append(files, onDisk{i: i, info: info})
 		case writeResultEmpty:
 			skippedEmpty++
+		}
+	}
+
+	// The RECIPIENT's predicate (PR #64 review round 3): distinct units must
+	// have landed on distinct FILES, not merely distinct strings. Unique
+	// final names are guaranteed by buildExportUnits, but a filesystem can
+	// alias two distinct names onto one inode — normalization-insensitive
+	// lookup (APFS), case-insensitive volumes, hard or symbolic links — and
+	// on that axis one unit's write destroys the other's file while both
+	// paths still stat successfully. os.SameFile closes the whole class,
+	// including axes the name folding in sanitizeFilename does not know
+	// about. Every aliased unit is dropped and NAMED; rc=0 keeps meaning
+	// complete.
+	aliasPartner := map[int]int{}
+	for x := 1; x < len(files); x++ {
+		for y := 0; y < x; y++ {
+			if os.SameFile(files[y].info, files[x].info) {
+				if _, seen := aliasPartner[files[x].i]; !seen {
+					aliasPartner[files[x].i] = files[y].i
+				}
+				if _, seen := aliasPartner[files[y].i]; !seen {
+					aliasPartner[files[y].i] = files[x].i
+				}
+			}
+		}
+	}
+	for i, j := range aliasPartner {
+		dropped = append(dropped, fmt.Sprintf(
+			"%s (→ %s): its path is the SAME FILE as %s (→ %s) — filesystem aliasing collapsed two chats onto one inode",
+			units[i].primary, units[i].filename, units[j].primary, units[j].filename))
+	}
+	for _, f := range files {
+		if _, isAliased := aliasPartner[f.i]; isAliased {
+			continue
+		}
+		if results[f.i] == writeResultWrote {
+			written++
+		} else {
+			skippedUnchanged++
 		}
 	}
 
@@ -555,9 +598,17 @@ func assignFilenames(units []exportUnit) {
 
 	const maxLevel = 2
 	levels := make([]int, len(units))
-	// Each round either escalates at least one unit or is the fixed point;
-	// levels cap at maxLevel, so maxLevel+1 rounds bound the loop.
-	for round := 0; round <= maxLevel; round++ {
+	// Run to the TRUE fixed point, not a capped round count. Termination is
+	// still guaranteed: a round either escalates at least one unit or changes
+	// nothing and exits, levels only grow, and each is capped at maxLevel —
+	// so the loop runs at most maxLevel*len(units)+1 rounds. The cap that
+	// used to sit here (3 rounds) turned a RESOLVABLE corpus into a
+	// fail-closed residue error: a chain of push names mimicking each
+	// successive decorated form needs one round per link, so four
+	// attacker-influenceable contact names bricked the entire export
+	// (PR #64 review round 3, MEDIUM). The residue check in buildExportUnits
+	// remains the backstop for sets that genuinely cannot be separated.
+	for {
 		byName := map[string][]int{}
 		for i := range units {
 			key := strings.ToLower(name(&units[i], levels[i]))
@@ -1035,6 +1086,18 @@ func extractNonCanonicalFrontmatter(path string) []string {
 }
 
 func sanitizeFilename(name string) string {
+	// NFC-fold BOTH what is compared and what is written. Every filename
+	// component derives from this function, so folding here is one chokepoint
+	// covering dedup keys, final names, and disambiguation tags. The WRITTEN
+	// bytes are folded too — not just the comparison key — because
+	// filesystems disagree about normalization: APFS resolves names
+	// normalization-insensitively (the NFC and NFD spellings of "José" open
+	// ONE physical file — the PR #64 round-3 HIGH: two byte-distinct units
+	// silently sharing one inode with rc=0), while ext4/NTFS compare bytes
+	// (the same twins would be TWO files). Writing canonical NFC makes the
+	// export behave identically on every platform, and the collision loop
+	// inherits the fold because its keys are built from folded names.
+	name = norm.NFC.String(name)
 	replacer := strings.NewReplacer(
 		"/", "-", "\\", "-", "?", "-", "%", "-", "*", "-", ":", "-",
 		"|", "-", "\"", "-", "<", "-", ">", "-", "[", "-", "]", "-",
