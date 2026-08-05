@@ -76,7 +76,16 @@ func ExportVault(db *sql.DB, outputDir string, includeGroups bool, minMessages i
 		minMessages = 0
 	}
 
-	units, totalChats, err := buildExportUnits(db, includeGroups, minMessages)
+	// One scan of the directory feeds everything that follows: name planning
+	// (existing out-of-population files are obstacles a unit's name must not
+	// fold onto), healing, the pre-write alias guard, and the post-write
+	// sweep's pre-state.
+	entries, err := scanVaultEntries(outputDir)
+	if err != nil {
+		return fmt.Errorf("scan output dir: %w", err)
+	}
+
+	units, totalChats, err := buildExportUnits(db, includeGroups, minMessages, entries)
 	if err != nil {
 		return err
 	}
@@ -85,7 +94,7 @@ func ExportVault(db *sql.DB, outputDir string, includeGroups bool, minMessages i
 	// name, a chat filed under its raw LID digits) before the write pass, so
 	// the old file's timestamp cannot shadow this run and the vault does not
 	// accumulate duplicates for the same chat.
-	healLegacyFilenames(outputDir, units)
+	healLegacyFilenames(outputDir, units, entries)
 
 	log.Printf("export: writing %d chats (%d chat rows in db) to %s", len(units), totalChats, outputDir)
 
@@ -98,7 +107,50 @@ func ExportVault(db *sql.DB, outputDir string, includeGroups bool, minMessages i
 	results := make([]writeResult, len(units))
 	errs := make([]error, len(units))
 
+	// Pre-write alias guard: name planning avoided every KNOWN fold-collision
+	// with an existing out-of-population file, but fold tables and filesystem
+	// semantics can diverge (Turkish dotted-İ casing, exotic normalization).
+	// Before writing, verify each target path does not RESOLVE to a
+	// differently-named entry belonging to someone else; if it does, refuse
+	// that unit's write entirely — prevention, because for a chat since
+	// deleted from the DB the file on disk is the LAST copy and a post-write
+	// detector could only name what it had already destroyed.
+	entryNames := map[string]bool{}
+	for i := range entries {
+		entryNames[entries[i].name] = true
+	}
 	for i := range units {
+		u := &units[i]
+		st, statErr := os.Stat(filepath.Join(outputDir, u.filename))
+		if statErr != nil {
+			continue // fresh path; nothing to alias
+		}
+		if entryNames[u.filename] {
+			continue // resolves to our own byte-named entry (owned or healed)
+		}
+		memberSet := map[string]bool{}
+		for _, jid := range u.members {
+			memberSet[jid] = true
+		}
+		for j := range entries {
+			if !os.SameFile(entries[j].info, st) {
+				continue
+			}
+			if !memberSet[entries[j].jid] {
+				victim := fmt.Sprintf("file %q", entries[j].name)
+				if entries[j].jid != "" {
+					victim = fmt.Sprintf("file %q (chat %s)", entries[j].name, entries[j].jid)
+				}
+				errs[i] = fmt.Errorf("writing would destroy %s: the filesystem resolves both names to one file", victim)
+			}
+			break
+		}
+	}
+
+	for i := range units {
+		if errs[i] != nil {
+			continue // blocked by the pre-write alias guard
+		}
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
@@ -140,16 +192,18 @@ func ExportVault(db *sql.DB, outputDir string, includeGroups bool, minMessages i
 		}
 	}
 
-	// The RECIPIENT's predicate (PR #64 review round 3): distinct units must
-	// have landed on distinct FILES, not merely distinct strings. Unique
-	// final names are guaranteed by buildExportUnits, but a filesystem can
-	// alias two distinct names onto one inode — normalization-insensitive
-	// lookup (APFS), case-insensitive volumes, hard or symbolic links — and
-	// on that axis one unit's write destroys the other's file while both
-	// paths still stat successfully. os.SameFile closes the whole class,
-	// including axes the name folding in sanitizeFilename does not know
-	// about. Every aliased unit is dropped and NAMED; rc=0 keeps meaning
-	// complete.
+	// The RECIPIENT's predicate (PR #64 review rounds 3+4): distinct units
+	// must have landed on distinct FILES, and no unit's file may be the same
+	// inode as ANY other directory entry it does not own. The measured
+	// population is every regular entry of outputDir — not just this run's
+	// units — because the exporter writes flat basenames into this one
+	// directory, so the entire namespace it can destroy IS that entry list.
+	// Round 4's operating rule made the gap concrete: "A Measured Population
+	// Is a Floor Until the Measurement Itself Is Exhaustive" — the round-3
+	// sweep measured units only, so a file whose chat was filtered out by
+	// min-messages, excluded by includeGroups=false, or deleted from the DB
+	// was unmeasured, and a case-straddling unit write destroyed it with
+	// rc=0. Aliased units are dropped and NAMED; rc=0 keeps meaning complete.
 	aliasPartner := map[int]int{}
 	for x := 1; x < len(files); x++ {
 		for y := 0; y < x; y++ {
@@ -168,6 +222,63 @@ func ExportVault(db *sql.DB, outputDir string, includeGroups bool, minMessages i
 			"%s (→ %s): its path is the SAME FILE as %s (→ %s) — filesystem aliasing collapsed two chats onto one inode",
 			units[i].primary, units[i].filename, units[j].primary, units[j].filename))
 	}
+
+	// Cross-population half of the sweep: re-list the directory and stat
+	// EVERY regular entry that is not a unit's own file. An entry sharing an
+	// inode with a unit's file means that unit's write went through a foreign
+	// name — unless the entry provably belonged to the unit before the run
+	// (the APFS in-place update of a legacy differently-normalized name).
+	preJID := map[string]string{}
+	for i := range entries {
+		preJID[entries[i].name] = entries[i].jid
+	}
+	unitFilename := map[string]int{}
+	for i := range units {
+		unitFilename[units[i].filename] = i
+	}
+	if postEntries, err := os.ReadDir(outputDir); err == nil {
+		for _, e := range postEntries {
+			if e.IsDir() {
+				continue
+			}
+			if _, isUnit := unitFilename[e.Name()]; isUnit {
+				continue
+			}
+			st, statErr := os.Stat(filepath.Join(outputDir, e.Name()))
+			if statErr != nil {
+				continue
+			}
+			for _, f := range files {
+				if !os.SameFile(st, f.info) {
+					continue
+				}
+				u := units[f.i]
+				legit := false
+				if pj, known := preJID[e.Name()]; known && pj != "" {
+					for _, jid := range u.members {
+						if jid == pj {
+							legit = true // the unit's own legacy file, updated in place
+							break
+						}
+					}
+				}
+				if !legit {
+					victim := fmt.Sprintf("pre-existing file %q", e.Name())
+					if pj := preJID[e.Name()]; pj != "" {
+						victim = fmt.Sprintf("pre-existing file %q (chat %s)", e.Name(), pj)
+					}
+					dropped = append(dropped, fmt.Sprintf(
+						"%s (→ %s): its write went through %s — filesystem aliasing destroyed that file's content",
+						u.primary, u.filename, victim))
+					if _, seen := aliasPartner[f.i]; !seen {
+						aliasPartner[f.i] = f.i // exclude from written counts below
+					}
+				}
+				break
+			}
+		}
+	}
+
 	for _, f := range files {
 		if _, isAliased := aliasPartner[f.i]; isAliased {
 			continue
@@ -230,9 +341,16 @@ type exportUnit struct {
 // collision-free filenames. Shared by ExportVault and ReconcileVault so the
 // two can never disagree about what a complete export looks like.
 //
+// entries is the caller's scan of the output directory (nil when there is no
+// directory to plan against). Existing files whose jid is OUTSIDE this run's
+// unit set — chats filtered by min-messages, groups under includeGroups=false,
+// chats deleted from the DB, or non-chat notes — are obstacles: a unit whose
+// name would FOLD onto one of them escalates away instead of overwriting a
+// file this run does not manage (PR #64 round 4).
+//
 // Returns the eligible units (post includeGroups/minMessages filter) and the
 // total number of chat rows in the DB (for the reconciliation line).
-func buildExportUnits(db *sql.DB, includeGroups bool, minMessages int) ([]exportUnit, int, error) {
+func buildExportUnits(db *sql.DB, includeGroups bool, minMessages int, entries []vaultEntry) ([]exportUnit, int, error) {
 	chatRows, err := db.Query(`
 		SELECT jid, chat_type, COALESCE(name, ''), COALESCE(last_message_time, 0), COALESCE(participants_count, 0)
 		FROM chats
@@ -398,19 +516,54 @@ func buildExportUnits(db *sql.DB, includeGroups bool, minMessages int) ([]export
 	if err := resolveUnitIdentities(db, units, chats); err != nil {
 		return nil, 0, err
 	}
-	assignFilenames(units)
+
+	// Obstacle map for name planning: fold-keyed names of existing files this
+	// run does NOT manage. A file claiming a jid inside the unit set is the
+	// unit's own (or its healing source) and must NOT be an obstacle — a unit
+	// never escalates away from its own file. Everything else (filtered-out
+	// chats, deleted chats, jid-less notes) must never be overwritten via a
+	// fold-equal name, so units escalate around them.
+	memberJIDs := map[string]bool{}
+	for i := range units {
+		for _, jid := range units[i].members {
+			memberJIDs[jid] = true
+		}
+	}
+	taken := map[string]string{}
+	for i := range entries {
+		e := entries[i]
+		nameLen := len(e.name)
+		if nameLen < 3 || !strings.EqualFold(e.name[nameLen-3:], ".md") {
+			continue // naming only ever produces .md files; others cannot fold-collide
+		}
+		if e.jid != "" && memberJIDs[e.jid] {
+			continue
+		}
+		desc := fmt.Sprintf("existing file %q", e.name)
+		if e.jid != "" {
+			desc = fmt.Sprintf("existing file %q (chat %s, outside this run's filters)", e.name, e.jid)
+		}
+		taken[foldKey(e.name[:nameLen-3])] = desc
+	}
+
+	assignFilenames(units, taken)
 
 	// Structural guarantee behind invariant 4: no two units may share a final
-	// path. Anything the fixed-point escalation could not separate fails the
-	// run here, naming both chats — never a silent last-writer-wins on one
-	// file, and never two goroutines writing the same path (PR #64 review,
-	// HIGH finding).
+	// path, and no unit may land fold-equal to a file this run does not
+	// manage. Anything the fixed-point escalation could not separate fails
+	// the run here, naming both sides — never a silent last-writer-wins on
+	// one file, and never two goroutines writing the same path (PR #64
+	// reviews, HIGH findings rounds 2 and 4).
 	byFinal := map[string]int{}
 	for i := range units {
-		key := strings.ToLower(units[i].filename)
+		key := foldKey(strings.TrimSuffix(units[i].filename, ".md"))
 		if j, dup := byFinal[key]; dup {
 			return nil, 0, fmt.Errorf("filename collision after disambiguation: %s and %s both resolve to %q — refusing to export",
 				units[j].primary, units[i].primary, units[i].filename)
+		}
+		if desc, blocked := taken[key]; blocked {
+			return nil, 0, fmt.Errorf("filename collision after disambiguation: %s resolves to %q, which collides with %s — refusing to export",
+				units[i].primary, units[i].filename, desc)
 		}
 		byFinal[key] = i
 	}
@@ -558,12 +711,19 @@ type chatRowLite struct {
 // itself mimics a disambiguated name ("Name (+1555…)") colliding with a
 // genuinely disambiguated file (both sides escalate until distinct).
 //
+// A name colliding with a `taken` obstacle (an existing file this run does
+// not manage, keyed by foldKey) escalates exactly like an in-set collision —
+// obstacles never move, units move around them — so a filtered-out chat's
+// file or a user's note is never claimed by a fold-equal unit name (PR #64
+// round 4).
+//
 // buildExportUnits verifies final uniqueness afterwards and FAILS the run on
-// any residue (pathological JIDs that sanitize identically), which is what
-// makes one-file-one-path structural: the concurrent write pass can never
-// hold two units with the same target, so a shared-path write race cannot
-// exist by construction.
-func assignFilenames(units []exportUnit) {
+// any residue (pathological JIDs that sanitize identically, or an obstacle
+// squatting every level of a unit's name), so the concurrent write pass can
+// never hold two units with the same target. Filesystem aliasing beyond the
+// fold's knowledge is handled by the pre-write guard and the SameFile sweep
+// in ExportVault.
+func assignFilenames(units []exportUnit, taken map[string]string) {
 	name := func(u *exportUnit, level int) string {
 		base := sanitizeFilename(u.display)
 		if u.chatType != "direct" {
@@ -584,9 +744,14 @@ func assignFilenames(units []exportUnit) {
 		case 0:
 			return base
 		case 1:
+			// The tag routes through sanitizeFilename like every other
+			// filename component, so an NFC/NFD twin pair of malformed
+			// contacts.phone values folds equal here and escalates to
+			// distinct level-2 JIDs instead of producing byte-distinct
+			// finals that alias on APFS (PR #64 round 4, finding 2).
 			tag := u.phone
 			if tag != "" {
-				tag = "+" + tag
+				tag = sanitizeFilename("+" + tag)
 			} else if tag = extractPhone(u.primary); tag == "" {
 				tag = sanitizeFilename(u.primary)
 			}
@@ -611,12 +776,13 @@ func assignFilenames(units []exportUnit) {
 	for {
 		byName := map[string][]int{}
 		for i := range units {
-			key := strings.ToLower(name(&units[i], levels[i]))
+			key := foldKey(name(&units[i], levels[i]))
 			byName[key] = append(byName[key], i)
 		}
 		changed := false
-		for _, idxs := range byName {
-			if len(idxs) < 2 {
+		for key, idxs := range byName {
+			_, blocked := taken[key]
+			if len(idxs) < 2 && !blocked {
 				continue
 			}
 			for _, i := range idxs {
@@ -633,6 +799,53 @@ func assignFilenames(units []exportUnit) {
 	for i := range units {
 		units[i].filename = name(&units[i], levels[i]) + ".md"
 	}
+}
+
+// foldKey is THE filename-equality predicate for planning: Unicode
+// canonical composition (NFC) plus lowercasing, matching how sanitizeFilename
+// writes names and approximating how case- and normalization-insensitive
+// filesystems compare them. Anything the fold cannot model (exotic casefold
+// tables, links) is caught by the SameFile layers instead.
+func foldKey(s string) string {
+	return strings.ToLower(norm.NFC.String(s))
+}
+
+// vaultEntry is one regular file in the output directory, as seen by the
+// planning scan: its exact byte name, the chat jid its frontmatter claims
+// ("" for non-chat or unreadable files), and its FileInfo for inode-identity
+// checks.
+type vaultEntry struct {
+	name string
+	jid  string
+	info os.FileInfo
+}
+
+// scanVaultEntries lists every regular file in dir. Frontmatter identity is
+// parsed for .md files (case-insensitive suffix — a case-insensitive volume
+// resolves "X.MD" and "x.md" alike); other files still enter the scan so the
+// SameFile sweeps measure the ENTIRE namespace the exporter can write
+// through, not a filtered subset.
+func scanVaultEntries(dir string) ([]vaultEntry, error) {
+	dirEntries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var entries []vaultEntry
+	for _, e := range dirEntries {
+		if e.IsDir() {
+			continue
+		}
+		info, err := os.Stat(filepath.Join(dir, e.Name()))
+		if err != nil {
+			continue
+		}
+		ve := vaultEntry{name: e.Name(), info: info}
+		if n := len(e.Name()); n >= 3 && strings.EqualFold(e.Name()[n-3:], ".md") {
+			ve.jid = readChatFileIdentity(filepath.Join(dir, e.Name())).jid
+		}
+		entries = append(entries, ve)
+	}
+	return entries, nil
 }
 
 // chatFileIdentity is the slice of a chat file's frontmatter the exporter
@@ -700,19 +913,13 @@ func readChatFileIdentity(path string) chatFileIdentity {
 // frontmatter jid provably belongs to the unit is touched, and only when the
 // target name is free. Renamed units are force-rewritten so stale content
 // (fabricated phone lines, participants_count: 0) regenerates immediately.
-func healLegacyFilenames(outputDir string, units []exportUnit) {
-	entries, err := os.ReadDir(outputDir)
-	if err != nil {
-		return
-	}
-	claimedBy := map[string]string{} // jid → basename of the file claiming it
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
-			continue
-		}
-		id := readChatFileIdentity(filepath.Join(outputDir, e.Name()))
-		if id.jid != "" && claimedBy[id.jid] == "" {
-			claimedBy[id.jid] = e.Name()
+func healLegacyFilenames(outputDir string, units []exportUnit, entries []vaultEntry) {
+	claimedBy := map[string]int{} // jid → index into entries of the file claiming it
+	for i := range entries {
+		if entries[i].jid != "" {
+			if _, seen := claimedBy[entries[i].jid]; !seen {
+				claimedBy[entries[i].jid] = i
+			}
 		}
 	}
 	for i := range units {
@@ -721,15 +928,19 @@ func healLegacyFilenames(outputDir string, units []exportUnit) {
 			continue // target already exists; ownership is checked at write time
 		}
 		for _, jid := range u.members {
-			old := claimedBy[jid]
-			if old == "" || old == u.filename {
+			ei, ok := claimedBy[jid]
+			if !ok || entries[ei].name == u.filename {
 				continue
 			}
+			old := entries[ei].name
 			if err := os.Rename(filepath.Join(outputDir, old), filepath.Join(outputDir, u.filename)); err != nil {
 				log.Printf("export: heal rename %q → %q failed: %v", old, u.filename, err)
 				continue
 			}
 			log.Printf("export: healed legacy filename %q → %q", old, u.filename)
+			// Keep the shared scan truthful for the pre-write guard and the
+			// post-write sweep: the entry now lives under the unit's name.
+			entries[ei].name = u.filename
 			u.forceRewrite = true
 			break
 		}

@@ -15,7 +15,7 @@ import (
 // group under a person's name, with rc=0 and nothing measuring the gap.
 //
 // Checks (each finding is printed on its own line, machine-greppable by the
-// MISSING / MISFILED / DRIFT / DUPLICATE / ORPHAN prefixes):
+// MISSING / MISFILED / DRIFT / DUPLICATE / ORPHAN / COLLISION prefixes):
 //
 //	MISSING    a chat in the DB with messages that no vault file covers
 //	MISFILED   a non-direct chat sitting in a file without its type marker
@@ -23,12 +23,21 @@ import (
 //	DRIFT      a file whose message_count disagrees with the DB
 //	DUPLICATE  a JID claimed by more than one file
 //	ORPHAN     a chat file whose JID no longer exists in the DB
+//	COLLISION  a unit's expected path RESOLVES (on this filesystem) to an
+//	           existing file the unit does not own — an export would refuse
+//	           to write it (read-only mirror of the export's pre-write guard)
 //
-// Same filters as the export (includeGroups, minMessages) so the comparison
-// is against what the export was supposed to produce. Returns the findings;
-// the caller exits non-zero when there are any.
+// Same filters as the export (includeGroups, minMessages), and the same
+// directory-aware name planning, so the comparison is against exactly what
+// the export would produce. Returns the findings; the caller exits non-zero
+// when there are any.
 func ReconcileVault(db *sql.DB, vaultDir string, includeGroups bool, minMessages int) ([]string, error) {
-	units, totalChats, err := buildExportUnits(db, includeGroups, minMessages)
+	entries, err := scanVaultEntries(vaultDir)
+	if err != nil {
+		return nil, fmt.Errorf("read vault dir: %w", err)
+	}
+
+	units, totalChats, err := buildExportUnits(db, includeGroups, minMessages, entries)
 	if err != nil {
 		return nil, err
 	}
@@ -46,28 +55,24 @@ func ReconcileVault(db *sql.DB, vaultDir string, includeGroups bool, minMessages
 	}
 	rows.Close()
 
-	// Scan the vault: every whatsapp-chat file, indexed by every JID it claims.
+	// Index every whatsapp-chat file by every JID it claims.
 	type vaultFile struct {
 		name string
 		id   chatFileIdentity
 	}
 	var files []vaultFile
 	claims := map[string][]string{} // jid → file basenames claiming it
-	entries, err := os.ReadDir(vaultDir)
-	if err != nil {
-		return nil, fmt.Errorf("read vault dir: %w", err)
-	}
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
-			continue
-		}
-		id := readChatFileIdentity(filepath.Join(vaultDir, e.Name()))
-		if !id.exists || id.fileType != "whatsapp-chat" || id.jid == "" {
+	for i := range entries {
+		if entries[i].jid == "" {
 			continue // not a chat file this exporter owns
 		}
-		files = append(files, vaultFile{name: e.Name(), id: id})
+		id := readChatFileIdentity(filepath.Join(vaultDir, entries[i].name))
+		if !id.exists || id.fileType != "whatsapp-chat" {
+			continue
+		}
+		files = append(files, vaultFile{name: entries[i].name, id: id})
 		for _, jid := range append([]string{id.jid}, id.aliasJIDs...) {
-			claims[jid] = append(claims[jid], e.Name())
+			claims[jid] = append(claims[jid], entries[i].name)
 		}
 	}
 
@@ -156,6 +161,43 @@ func ReconcileVault(db *sql.DB, vaultDir string, includeGroups bool, minMessages
 		if !allChatJIDs[f.id.jid] {
 			findings = append(findings, fmt.Sprintf(
 				"ORPHAN    %q claims %s which no longer exists in the DB", f.name, f.id.jid))
+		}
+	}
+
+	// COLLISION — the read-only mirror of the export's pre-write alias guard:
+	// a unit's expected path resolving (on THIS filesystem) to a
+	// differently-named file the unit does not own. Name planning avoids
+	// every fold-predictable case, so this fires only where fold tables and
+	// filesystem semantics diverge — exactly the shape an export run would
+	// refuse to write.
+	entryNames := map[string]bool{}
+	for i := range entries {
+		entryNames[entries[i].name] = true
+	}
+	for i := range units {
+		u := units[i]
+		st, statErr := os.Stat(filepath.Join(vaultDir, u.filename))
+		if statErr != nil || entryNames[u.filename] {
+			continue
+		}
+		memberSet := map[string]bool{}
+		for _, jid := range u.members {
+			memberSet[jid] = true
+		}
+		for j := range entries {
+			if !os.SameFile(entries[j].info, st) {
+				continue
+			}
+			if !memberSet[entries[j].jid] {
+				victim := fmt.Sprintf("file %q", entries[j].name)
+				if entries[j].jid != "" {
+					victim = fmt.Sprintf("file %q (chat %s)", entries[j].name, entries[j].jid)
+				}
+				findings = append(findings, fmt.Sprintf(
+					"COLLISION %s expects %q, which this filesystem resolves to %s — an export would refuse to write it",
+					u.primary, u.filename, victim))
+			}
+			break
 		}
 	}
 

@@ -21,7 +21,7 @@ func TestBuildExportUnitsMergesAliasedDirects(t *testing.T) {
 	xvMsg(t, db, "P1", xvPhoneJID, xvPhoneJID, "Alex Rivera", "text", "dos", "", xvPhoneLastTS, false)
 	xvMsg(t, db, "P2", xvPhoneJID, xvPhoneJID, "Alex Rivera", "text", "tres", "", xvPhoneLastTS-1, false)
 
-	units, total, err := buildExportUnits(db, false, 0)
+	units, total, err := buildExportUnits(db, false, 0, nil)
 	if err != nil {
 		t.Fatalf("buildExportUnits: %v", err)
 	}
@@ -73,7 +73,7 @@ func TestAssignFilenamesDisambiguatesSameDisplayName(t *testing.T) {
 	xvMsg(t, db, "G1", "120363000000000011@g.us", a, "Same Name", "text", "g uno", "", xvGroupLastTS, false)
 	xvMsg(t, db, "G2", "120363000000000022@g.us", b, "Same Name", "text", "g dos", "", xvGroupLastTS-10, false)
 
-	units, _, err := buildExportUnits(db, true, 0)
+	units, _, err := buildExportUnits(db, true, 0, nil)
 	if err != nil {
 		t.Fatalf("buildExportUnits: %v", err)
 	}
@@ -110,7 +110,7 @@ func TestBuildExportUnitsRejectsGroupShapedAliasWithoutChatRow(t *testing.T) {
 	xvMsg(t, db, "L1", xvLIDJID, xvLIDJID, "Alex Rivera", "text", "hola", "", xvLIDLastTS, false)
 	xvAlias(t, db, xvLIDJID, rowlessGroupJID) // corrupt edge: person <-> rowless group JID
 
-	units, _, err := buildExportUnits(db, false, 0)
+	units, _, err := buildExportUnits(db, false, 0, nil)
 	if err != nil {
 		t.Fatalf("buildExportUnits: %v", err)
 	}
@@ -168,7 +168,11 @@ func TestHealLegacyFilenamesMovesGroupOffPersonName(t *testing.T) {
 		display:  "Alex Rivera",
 		filename: "Alex Rivera (group).md",
 	}}
-	healLegacyFilenames(dir, units)
+	entries, err := scanVaultEntries(dir)
+	if err != nil {
+		t.Fatalf("scanVaultEntries: %v", err)
+	}
+	healLegacyFilenames(dir, units, entries)
 
 	if _, err := os.Stat(filepath.Join(dir, legacy)); !os.IsNotExist(err) {
 		t.Errorf("legacy person-named group file still present (err=%v)", err)
@@ -178,5 +182,9 @@ func TestHealLegacyFilenamesMovesGroupOffPersonName(t *testing.T) {
 	}
 	if !units[0].forceRewrite {
 		t.Error("healed unit must be force-rewritten so stale content regenerates")
+	}
+	// The shared scan must have been kept truthful for the later sweeps.
+	if entries[0].name != "Alex Rivera (group).md" {
+		t.Errorf("heal must update the scan entry to the new name, got %q", entries[0].name)
 	}
 }

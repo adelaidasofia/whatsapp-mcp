@@ -471,6 +471,14 @@ func TestExportFailsLoudOnUnresolvableFilenameCollision(t *testing.T) {
 	if !strings.Contains(err.Error(), jidA) || !strings.Contains(err.Error(), jidB) {
 		t.Errorf("the error must NAME both colliding chats; got: %v", err)
 	}
+	// Positive control on the branch itself (PR #64 round 4, finding 3): this
+	// failure must come from the fixed-point RESIDUE gate, not from some other
+	// error path that happens to mention both JIDs. If the escalation ever
+	// starts resolving this fixture, this assertion goes red and the residue
+	// backstop is known to have lost its only coverage.
+	if !strings.Contains(err.Error(), "filename collision after disambiguation") {
+		t.Errorf("expected the residue fail-closed gate to fire; got: %v", err)
+	}
 }
 
 // TestExportFailsLoudWhenAChatCannotBeWritten: a chat that the exporter
@@ -618,8 +626,13 @@ func TestExportDetectsFilesystemAliasedPaths(t *testing.T) {
 	xvMsg(t, db, "H1", jidA, jidA, "Person A", "text", "soy a", "", xvPhoneLastTS, false)
 	xvMsg(t, db, "H2", jidB, jidB, "Person B", "text", "soy b", "", xvPhoneLastTS-10, false)
 
-	// Alias the two (collision-free) target paths onto ONE inode.
-	if err := os.WriteFile(filepath.Join(outDir, "Person B.md"), nil, 0o644); err != nil {
+	// Alias the two (collision-free) target paths onto ONE inode. The seeded
+	// file carries B's jid so both dir entries stay INSIDE this run's
+	// population (since round 4, a jid-less or foreign file would be treated
+	// as an obstacle and the units would escalate their names away from it —
+	// this test is about the aliasing axes name planning cannot see).
+	seed := "---\ntype: whatsapp-chat\njid: \"" + jidB + "\"\nchat_type: \"direct\"\nlast_message_ts: 1\n---\n\nold\n"
+	if err := os.WriteFile(filepath.Join(outDir, "Person B.md"), []byte(seed), 0o644); err != nil {
 		t.Fatalf("seed alias target: %v", err)
 	}
 	if err := os.Link(filepath.Join(outDir, "Person B.md"), filepath.Join(outDir, "Person A.md")); err != nil {
@@ -632,5 +645,184 @@ func TestExportDetectsFilesystemAliasedPaths(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), jidA) || !strings.Contains(err.Error(), jidB) {
 		t.Errorf("the error must NAME both aliased chats; got: %v", err)
+	}
+}
+
+// TestExportPreservesFilteredOutChatFileOnCaseStraddle — PR #64 review round
+// 4, HIGH, executed at 3ef9e80 (reviewer probe, ported): the SameFile sweep
+// measured THIS RUN'S UNITS only, so a file belonging to a chat OUTSIDE the
+// unit set — filtered by min-messages, excluded by includeGroups=false (the
+// default), or deleted from the DB since a previous export — was never
+// statted. Chat B ("Jose", 2 msgs) was exported under min-messages=0; later a
+// DIFFERENT human ("JOSE", 6 msgs) exported under min-messages=5. On a
+// case-insensitive volume (APFS/NTFS defaults) the write to "JOSE.md" opened
+// B's "Jose.md": one dir entry left carrying A's jid, B's exported history
+// destroyed, err=nil, dropped=0, and a matched-flags reconcile reported zero
+// findings. Operating rule: A Measured Population Is a Floor Until the
+// Measurement Itself Is Exhaustive — the guard's population must be the
+// entire namespace the exporter can write through, not the unit subset.
+//
+// Post-fix: names are planned AGAINST the existing directory (a fold-equal
+// entry claiming a jid outside the unit set escalates the unit's name), so
+// both humans coexist on every filesystem and B's file survives byte-for-byte.
+func TestExportPreservesFilteredOutChatFileOnCaseStraddle(t *testing.T) {
+	db := xvDB(t)
+	outDir := t.TempDir()
+
+	// The straddle needs a case-insensitive volume; skip where names are
+	// byte-literal (ext4 CI leg) — behavior there was already two files.
+	if err := os.WriteFile(filepath.Join(outDir, "probe_case.md"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, caseErr := os.Stat(filepath.Join(outDir, "PROBE_CASE.md"))
+	os.Remove(filepath.Join(outDir, "probe_case.md"))
+	if caseErr != nil {
+		t.Skip("volume is case-sensitive; straddle not applicable here")
+	}
+
+	const jidB = "15555550902@s.whatsapp.net"
+	xvChat(t, db, jidB, "direct", "Jose", xvPhoneLastTS-100)
+	xvContact(t, db, jidB, "Jose", "15555550902")
+	xvMsg(t, db, "B1", jidB, jidB, "Jose", "text", "historia de jose b", "", xvPhoneLastTS-101, false)
+	xvMsg(t, db, "B2", jidB, jidB, "Jose", "text", "mas historia b", "", xvPhoneLastTS-100, false)
+
+	if err := ExportVault(db, outDir, false, 0); err != nil {
+		t.Fatalf("run 1: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(outDir, "Jose.md")); err != nil {
+		t.Fatalf("run 1 must produce Jose.md: %v", err)
+	}
+
+	const jidA = "15555550901@s.whatsapp.net"
+	xvChat(t, db, jidA, "direct", "JOSE", xvPhoneLastTS)
+	xvContact(t, db, jidA, "JOSE", "15555550901")
+	for i, msg := range []string{"a1", "a2", "a3", "a4", "a5", "a6"} {
+		xvMsg(t, db, "A"+msg, jidA, jidA, "JOSE", "text", "historia de JOSE "+msg, "", xvPhoneLastTS-int64(i), false)
+	}
+
+	// Run 2: narrow filter. B (2 msgs) is OUTSIDE the unit set; A is in.
+	if err := ExportVault(db, outDir, false, 5); err != nil {
+		t.Fatalf("run 2 must succeed by escalating A's name away from B's file, got: %v", err)
+	}
+
+	bFile := xvFileForJID(t, outDir, jidB)
+	if bFile == "" {
+		t.Fatal("filtered-out chat B's exported file was destroyed by a case-straddling unit write")
+	}
+	_, bBody := xvReadFile(t, filepath.Join(outDir, bFile))
+	if !strings.Contains(bBody, "historia de jose b") {
+		t.Errorf("B's file survived in name but lost its history:\n%s", bBody)
+	}
+	aFile := xvFileForJID(t, outDir, jidA)
+	if aFile == "" {
+		t.Fatal("chat A was not exported")
+	}
+	if aFile == bFile {
+		t.Fatalf("A and B share one file %q", aFile)
+	}
+	// The matched-flags reconcile must agree the vault is complete.
+	findings, err := ReconcileVault(db, outDir, false, 5)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("reconcile findings on a healthy straddled vault: %v", findings)
+	}
+}
+
+// TestExportFoldsDisambiguationTagsThroughSanitizer — PR #64 review round 4,
+// finding 2: the direct level-1 disambiguation tag interpolated u.phone
+// VERBATIM, bypassing the sanitizeFilename NFC chokepoint the round-3 comment
+// claimed covered "dedup keys, final names, and disambiguation tags". Two
+// LID-only contacts sharing a push name whose contacts.phone values are
+// NFC/NFD twins produced byte-distinct finals that alias on APFS — the
+// SameFile sweep caught it (fail closed, no data loss) but BRICKED an export
+// that should have succeeded. Post-fix the tag routes through
+// sanitizeFilename: the twin tags fold equal, escalate to distinct level-2
+// JIDs, and both chats export everywhere.
+func TestExportFoldsDisambiguationTagsThroughSanitizer(t *testing.T) {
+	db := xvDB(t)
+	outDir := t.TempDir()
+
+	const jidX = "84930125550041@lid"
+	const jidY = "84930125550042@lid"
+	// Explicit escapes, not literals: editors and toolchains love to
+	// re-normalize source text, which would silently collapse the fixture.
+	phoneNFC := "0601555\u00e9"  // e-acute precomposed (NFC)
+	phoneNFD := "0601555e\u0301" // e + combining acute (NFD)
+	if phoneNFC == phoneNFD {
+		t.Fatal("fixture broken: the two spellings must be byte-distinct")
+	}
+	xvChat(t, db, jidX, "direct", "Ana", xvPhoneLastTS)
+	xvChat(t, db, jidY, "direct", "Ana", xvPhoneLastTS-10)
+	xvContact(t, db, jidX, "Ana", phoneNFC)
+	xvContact(t, db, jidY, "Ana", phoneNFD)
+	xvMsg(t, db, "X1", jidX, jidX, "Ana", "text", "soy x", "", xvPhoneLastTS, false)
+	xvMsg(t, db, "Y1", jidY, jidY, "Ana", "text", "soy y", "", xvPhoneLastTS-10, false)
+
+	if err := ExportVault(db, outDir, false, 0); err != nil {
+		t.Fatalf("ExportVault must fold the tags and separate the twins, got: %v", err)
+	}
+	xFile := xvFileForJID(t, outDir, jidX)
+	yFile := xvFileForJID(t, outDir, jidY)
+	if xFile == "" || yFile == "" {
+		t.Fatalf("a chat lost its file: x=%q y=%q", xFile, yFile)
+	}
+	if xFile == yFile {
+		t.Fatalf("both chats claim one file %q", xFile)
+	}
+}
+
+// TestExportUpdatesLegacyNFDFileInPlace — reviewer probe (round 4, ported):
+// pre-round-3 exports wrote unfolded display bytes, so a device supplying NFD
+// produced an NFD-named file. Post-fix the unit's filename is NFC. On a
+// normalization-insensitive volume the NFC path opens that same physical
+// file, which is the ONE legitimate shape of "unit file aliases a
+// differently-named entry" — the cross-population sweep must recognize it
+// via the entry's pre-run jid and not flag it, exactly one file must remain,
+// and reconcile must stay clean. On byte-literal volumes healing renames the
+// NFD file instead; either way the assertions below hold.
+func TestExportUpdatesLegacyNFDFileInPlace(t *testing.T) {
+	db := xvDB(t)
+	outDir := t.TempDir()
+
+	const jid = "15555550903@s.whatsapp.net"
+	nameNFD := "José" // e + combining acute — what a pre-fix export wrote
+	xvChat(t, db, jid, "direct", nameNFD, xvPhoneLastTS)
+	xvContact(t, db, jid, nameNFD, "15555550903")
+	xvMsg(t, db, "M1", jid, jid, nameNFD, "text", "hola", "", xvPhoneLastTS, false)
+
+	legacyContent := "---\ntype: whatsapp-chat\njid: \"" + jid + "\"\nlast_message_ts: 1\nmessage_count: 1\n---\nold body\n"
+	if err := os.WriteFile(filepath.Join(outDir, nameNFD+".md"), []byte(legacyContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ExportVault(db, outDir, false, 0); err != nil {
+		t.Fatalf("ExportVault flagged its own legacy file as a foreign alias: %v", err)
+	}
+
+	entries, err := os.ReadDir(outDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mds []string
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".md") {
+			mds = append(mds, e.Name())
+		}
+	}
+	if len(mds) != 1 {
+		t.Fatalf("expected exactly one file after migration, got %v", mds)
+	}
+	fm, body := xvReadFile(t, filepath.Join(outDir, mds[0]))
+	if fm["jid"] != jid || strings.Contains(body, "old body") {
+		t.Fatalf("legacy file not regenerated in place: fm=%v", fm)
+	}
+	findings, err := ReconcileVault(db, outDir, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("reconcile findings on a migrated vault: %v", findings)
 	}
 }
