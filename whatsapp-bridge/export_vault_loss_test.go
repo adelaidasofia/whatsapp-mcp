@@ -988,3 +988,70 @@ func TestExportRefusesCaseStraddleOntoAnotherUnitsStaleFile(t *testing.T) {
 		t.Errorf("the stale file must survive the refused run intact (err=%v)", readErr)
 	}
 }
+
+// TestExportToleratesSymlinkAliasOfOwnChatFile — PR #64 review round 6, F1
+// (MEDIUM, introduced by round 5's Lstat change): the post-write sweep
+// re-lists the directory with follow-links os.Stat but judges legitimacy via
+// the pre-run jid map, which the Lstat scan leaves EMPTY for symlinks. A
+// user's ordinary shortcut inside the export dir pointing at a unit's OWN
+// file ("Atajo a Nora.md" → "Nora Vega.md") therefore produced a FALSE
+// destruction claim on every run that wrote or unchanged-skipped that chat:
+// permanent non-zero exit, under-counted written, export/reconcile
+// disagreement — while the write had actually succeeded and nothing was
+// destroyed.
+//
+// The sweep now Lstats each non-unit entry and skips symlinks: a link's own
+// inode is the link, not a destroyable file, and any real file it points at
+// inside the directory is judged under its own entry name. Write-THROUGH-
+// symlink prevention is upstream (scan obstacle + pre-write guard) and is
+// asserted separately by TestExportNeverWritesThroughASymlink.
+func TestExportToleratesSymlinkAliasOfOwnChatFile(t *testing.T) {
+	db := xvDB(t)
+	outDir := t.TempDir()
+
+	const jid = "15555550661@s.whatsapp.net"
+	xvChat(t, db, jid, "direct", "Nora Vega", xvPhoneLastTS)
+	xvContact(t, db, jid, "Nora Vega", "15555550661")
+	xvMsg(t, db, "SA1", jid, jid, "Nora Vega", "text", "hola nora", "", xvPhoneLastTS, false)
+
+	if err := ExportVault(db, outDir, false, 0); err != nil {
+		t.Fatalf("run 1: %v", err)
+	}
+	real := filepath.Join(outDir, "Nora Vega.md")
+	if _, err := os.Stat(real); err != nil {
+		t.Fatalf("expected chat file: %v", err)
+	}
+
+	// The user's own shortcut to their own chat file, inside the dir.
+	link := filepath.Join(outDir, "Atajo a Nora.md")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("no symlinks: %v", err)
+	}
+
+	// New message so run 2 must WRITE (not unchanged-skip).
+	xvMsg(t, db, "SA2", jid, jid, "Nora Vega", "text", "segundo mensaje", "", xvPhoneLastTS+50, false)
+	if _, err := db.Exec(`UPDATE chats SET last_message_time = ? WHERE jid = ?`, xvPhoneLastTS+50, jid); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ExportVault(db, outDir, false, 0); err != nil {
+		t.Fatalf("a user's symlink alias to the unit's own file must not fail the run: %v", err)
+	}
+
+	b, err := os.ReadFile(real)
+	if err != nil {
+		t.Fatalf("chat file gone: %v", err)
+	}
+	if !strings.Contains(string(b), "segundo mensaje") {
+		t.Errorf("second message missing from chat file (write suppressed?)")
+	}
+	if fi, err := os.Lstat(link); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("the user's symlink must survive untouched (err=%v)", err)
+	}
+
+	// And a third run with nothing new must be a clean unchanged-skip, not a
+	// permanent failure loop.
+	if err := ExportVault(db, outDir, false, 0); err != nil {
+		t.Fatalf("run 3 (unchanged) must stay clean with the symlink present: %v", err)
+	}
+}

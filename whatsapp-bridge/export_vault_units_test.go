@@ -152,6 +152,24 @@ func TestReadChatFileIdentityParsesAliasArray(t *testing.T) {
 	if got := readChatFileIdentity(filepath.Join(dir, "missing.md")); got.exists {
 		t.Error("missing file must not claim existence")
 	}
+
+	// PR #64 round 6, F2: both YAML quote styles must parse identically —
+	// since round 5 the type field is load-bearing for ownership, and a
+	// single-quoted value must not silently demote a chat file to not-ours.
+	for name, quoted := range map[string]string{
+		"single.md": "---\ntype: 'whatsapp-chat'\njid: '" + xvLIDJID + "'\nchat_type: 'direct'\n---\nbody\n",
+		"double.md": "---\ntype: \"whatsapp-chat\"\njid: \"" + xvLIDJID + "\"\nchat_type: \"direct\"\n---\nbody\n",
+		"bare.md":   "---\ntype: whatsapp-chat\njid: " + xvLIDJID + "\nchat_type: direct\n---\nbody\n",
+	} {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(quoted), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		got := readChatFileIdentity(p)
+		if got.fileType != "whatsapp-chat" || got.jid != xvLIDJID || got.chatType != "direct" {
+			t.Errorf("%s: quote style changed the parse: %+v", name, got)
+		}
+	}
 }
 
 func TestHealLegacyFilenamesMovesGroupOffPersonName(t *testing.T) {

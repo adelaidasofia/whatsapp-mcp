@@ -244,8 +244,19 @@ func ExportVault(db *sql.DB, outputDir string, includeGroups bool, minMessages i
 			if _, isUnit := unitFilename[e.Name()]; isUnit {
 				continue
 			}
-			st, statErr := os.Stat(filepath.Join(outputDir, e.Name()))
-			if statErr != nil {
+			// Lstat, and skip symlinks: a link's own inode is the link, not
+			// a file this run could have destroyed, and any real file it
+			// points at inside this directory is judged under its own entry
+			// name. A follow-links Stat here condemned a user's ordinary
+			// shortcut to a unit's OWN file as "destroyed" on every run — a
+			// false claim with a permanent non-zero exit (round 6, F1;
+			// introduced when round 5's Lstat scan stopped giving symlinks a
+			// pre-run jid). This does NOT weaken write-through-symlink
+			// prevention, which lives upstream: the scan makes symlinks name
+			// obstacles and the pre-write guard refuses unowned resolutions
+			// before any write happens.
+			st, statErr := os.Lstat(filepath.Join(outputDir, e.Name()))
+			if statErr != nil || st.Mode()&os.ModeSymlink != 0 {
 				continue
 			}
 			for _, f := range files {
@@ -848,8 +859,11 @@ func scanVaultEntries(dir string) ([]vaultEntry, error) {
 		// planned name was invisible — fail-open — and os.WriteFile then
 		// followed it OUT of the output directory (round 5, F2). A symlink,
 		// like an unstattable entry (nil info), now enters the scan as a
-		// jid-less name obstacle: the planner escalates around it and the
-		// SameFile passes skip it.
+		// jid-less name obstacle: the planner escalates unit names around
+		// it, the pre-write guard and reconcile's COLLISION check skip
+		// nil-info entries, and the post-write sweep Lstat-skips symlink
+		// entries itself (it re-lists the directory rather than consuming
+		// this scan — round 6, F1).
 		info, err := os.Lstat(filepath.Join(dir, e.Name()))
 		if err != nil {
 			entries = append(entries, vaultEntry{name: e.Name()})
@@ -909,12 +923,17 @@ func readChatFileIdentity(path string) chatFileIdentity {
 		key := strings.TrimSpace(line[:idx])
 		val := strings.TrimSpace(line[idx+1:])
 		switch key {
+		// Both quote styles are trimmed: YAML treats 'whatsapp-chat' and
+		// "whatsapp-chat" identically, and since round 5 the type field is
+		// load-bearing for OWNERSHIP — a hand-edited or foreign-tool
+		// single-quoted value must not silently demote a chat file to
+		// not-ours (round 6, F2). No writer of ours emits single quotes.
 		case "type":
-			id.fileType = strings.Trim(val, `"`)
+			id.fileType = strings.Trim(val, `"'`)
 		case "jid":
-			id.jid = strings.Trim(val, `"`)
+			id.jid = strings.Trim(val, `"'`)
 		case "chat_type":
-			id.chatType = strings.Trim(val, `"`)
+			id.chatType = strings.Trim(val, `"'`)
 		case "last_message_ts":
 			fmt.Sscanf(val, "%d", &id.lastTs)
 		case "message_count":
