@@ -152,6 +152,13 @@ func (b *Bridge) onUndecryptableMessage(evt *events.UndecryptableMessage) {
 	// most recent message in that chat, and showing the member an honest "we
 	// could not read this" beats showing a stale preview that implies nothing
 	// arrived.
+	//
+	// Like onMessage, the sender's push name only names DIRECT chats: a group
+	// named after one member is the MYC-3555 person-named-group-file bug.
+	chatName := senderDisplay
+	if chatTypeFromJID(evt.Info.Chat) != "direct" {
+		chatName = ""
+	}
 	_, err := b.db.Exec(`
 		INSERT INTO chats (jid, chat_type, name, normalized_name, created_at, updated_at, last_message_id, last_message_time, last_message_preview)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -160,7 +167,7 @@ func (b *Bridge) onUndecryptableMessage(evt *events.UndecryptableMessage) {
 			last_message_time = excluded.last_message_time,
 			last_message_preview = excluded.last_message_preview,
 			updated_at = excluded.updated_at
-	`, chatJID, chatTypeFromJID(evt.Info.Chat), senderDisplay, Normalize(senderDisplay),
+	`, chatJID, chatTypeFromJID(evt.Info.Chat), chatName, Normalize(chatName),
 		ts, ts, id, ts, marker)
 	if err != nil {
 		log.Printf("onUndecryptableMessage: chat upsert failed: %v", err)

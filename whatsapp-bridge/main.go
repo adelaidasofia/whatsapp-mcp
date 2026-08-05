@@ -33,7 +33,9 @@ func main() {
 	exportIncludeGroups := flag.Bool("export-include-groups", false,
 		"When set with --export-to-vault, also exports group chats (default exports direct chats only, matching Baileys behavior).")
 	exportMinMessages := flag.Int("export-min-messages", 0,
-		"With --export-to-vault: only export chats with at least this many messages (default 0 = export everything; recommended 5 to skip drive-by contacts).")
+		"With --export-to-vault: only export chats with at least this many messages (default 0 = export everything; recommended 5 to skip drive-by contacts). Counted across a person's merged JID forms.")
+	reconcileVault := flag.String("reconcile-vault", "",
+		"Path to an exported vault folder. If set, the bridge compares the SQLite DB against the chat files (honoring --export-include-groups / --export-min-messages), prints MISSING/MISFILED/DRIFT/DUPLICATE/ORPHAN findings, and exits non-zero when any exist. Exits without connecting to WhatsApp.")
 	pairPhone := flag.String("pair-phone", "",
 		"Pair by typed code instead of QR scanning: your own phone number in international format (e.g. +15551234567). The 8-char code prints here; on the phone: WhatsApp > Settings > Linked Devices > Link a Device > 'Link with phone number instead'. Works on Android and iOS.")
 	flag.Parse()
@@ -97,11 +99,26 @@ func main() {
 	}
 
 	// Export-only path: regenerate markdown vault files from SQLite and exit.
+	// ExportVault fails (→ non-zero exit) when any enumerated chat produced
+	// neither a file nor a legitimate skip; rc=0 means the export is complete.
 	if *exportVault != "" {
 		if err := ExportVault(db, *exportVault, *exportIncludeGroups, *exportMinMessages); err != nil {
 			log.Fatalf("export failed: %v", err)
 		}
 		log.Println("export done")
+		return
+	}
+
+	// Reconcile-only path: audit an exported vault against the DB and exit.
+	if *reconcileVault != "" {
+		findings, err := ReconcileVault(db, *reconcileVault, *exportIncludeGroups, *exportMinMessages)
+		if err != nil {
+			log.Fatalf("reconcile failed: %v", err)
+		}
+		if len(findings) > 0 {
+			log.Fatalf("reconcile: %d finding(s) — see report above", len(findings))
+		}
+		log.Println("reconcile clean: vault matches DB")
 		return
 	}
 
@@ -162,9 +179,25 @@ func main() {
 		written, repaired, err := BackfillJIDAliases(ctx, db, bridge.Client())
 		if err != nil {
 			log.Printf("jid alias backfill failed (non-fatal): %v", err)
-			return
+		} else {
+			log.Printf("jid alias backfill: %d new edges written, %d phone columns repaired", written, repaired)
 		}
-		log.Printf("jid alias backfill: %d new edges written, %d phone columns repaired", written, repaired)
+
+		// Group metadata sync: real subjects + participant counts into chats.
+		// Heals rows the pre-MYC-3555 live path named after a message sender
+		// and gives the vault export a real participants_count to emit.
+		//
+		// Non-fatal like its neighbors below: each of these three syncs covers
+		// a disjoint slice of the chats table (aliases, groups, address-book
+		// direct chats) and one's failure says nothing about whether the
+		// others can still make progress, so no failure here returns out of
+		// the goroutine and skips the rest.
+		groups, err := SyncGroupMetadata(ctx, db, bridge.Client())
+		if err != nil {
+			log.Printf("group metadata sync failed (non-fatal): %v", err)
+		} else {
+			log.Printf("group metadata sync: %d groups updated", groups)
+		}
 
 		// Address-book names, after the alias backfill and deliberately so:
 		// naming a chat walks jid_aliases to reach the row the user actually
@@ -174,9 +207,9 @@ func main() {
 		named, renamed, err := SyncContactNames(ctx, db, bridge.Client())
 		if err != nil {
 			log.Printf("contact name sync failed (non-fatal): %v", err)
-			return
+		} else {
+			log.Printf("contact name sync: %d address-book entries, %d chat(s) named", named, renamed)
 		}
-		log.Printf("contact name sync: %d address-book entries, %d chat(s) named", named, renamed)
 	}()
 
 	server := NewServer(cfg, db, bridge, backfiller)

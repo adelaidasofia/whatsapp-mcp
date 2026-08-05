@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -76,6 +78,65 @@ func buildGroupList(ctx context.Context, lister groupLister) (groupListResponse,
 	}
 	resp.Total = len(resp.Groups)
 	return resp, nil
+}
+
+// UpsertGroupChat writes a group's AUTHORITATIVE metadata — its real subject
+// and participant count — into the chats table.
+//
+// This is the source-side fix for MYC-3555's person-named group files: the
+// live-receive path cannot know the group subject (events.Message does not
+// carry it), so before this, a group born from a live message was permanently
+// named after whichever member sent the first message the bridge saw, and its
+// participants_count was never populated at all (the vault export then emitted
+// participants_count: 0, which slid under every group-size policy).
+func UpsertGroupChat(db *sql.DB, g *types.GroupInfo) error {
+	if g == nil {
+		return nil
+	}
+	count := g.ParticipantCount
+	if count == 0 {
+		count = len(g.Participants)
+	}
+	now := time.Now().Unix()
+	_, err := db.Exec(`
+		INSERT INTO chats (jid, chat_type, name, normalized_name, participants_count, created_at, updated_at)
+		VALUES (?, 'group', ?, ?, ?, ?, ?)
+		ON CONFLICT(jid) DO UPDATE SET
+			name = CASE WHEN excluded.name <> '' THEN excluded.name ELSE chats.name END,
+			normalized_name = CASE WHEN excluded.name <> '' THEN excluded.normalized_name ELSE chats.normalized_name END,
+			participants_count = excluded.participants_count,
+			updated_at = excluded.updated_at
+	`, g.JID.String(), g.Name, Normalize(g.Name), count, now, now)
+	if err != nil {
+		return fmt.Errorf("upsert group chat %s: %w", g.JID.String(), err)
+	}
+	return nil
+}
+
+// SyncGroupMetadata pulls every joined group from whatsmeow's synced state and
+// upserts its subject + participant count into chats. Runs at startup (async,
+// after the connection settles) so historical person-named group rows heal and
+// participants_count becomes real data rather than a NULL the export has to
+// floor-estimate. Idempotent. Returns how many groups were written.
+func SyncGroupMetadata(ctx context.Context, db *sql.DB, lister groupLister) (int, error) {
+	if lister == nil {
+		return 0, fmt.Errorf("SyncGroupMetadata: no group lister available")
+	}
+	groups, err := lister.GetJoinedGroups(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("SyncGroupMetadata: %w", err)
+	}
+	written := 0
+	for _, g := range groups {
+		if g == nil {
+			continue
+		}
+		if err := UpsertGroupChat(db, g); err != nil {
+			return written, err
+		}
+		written++
+	}
+	return written, nil
 }
 
 // handleListGroups serves GET /api/groups: every joined group with its
