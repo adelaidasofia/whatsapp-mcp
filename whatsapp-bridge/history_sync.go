@@ -91,8 +91,15 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 	updated := 0
 	scanned := 0
 	mediaSeen := 0
+	decoded := 0
 	for _, conv := range convs {
 		log.Printf("history_sync: conversation %s has %d messages", conv.GetID(), len(conv.GetMessages()))
+
+		// Track the OLDEST message in this conversation's chunk. It becomes
+		// the anchor for the next step backwards (backfill_walk.go); without
+		// it the walk would re-request the same window forever.
+		var oldest chunkAnchor
+
 		for _, hsMsg := range conv.GetMessages() {
 			scanned++
 			wm := hsMsg.GetMessage()
@@ -103,6 +110,20 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 			if key == nil || key.GetID() == "" {
 				continue
 			}
+			if ts := int64(wm.GetMessageTimestamp()); ts > 0 && (oldest.TS == 0 || ts < oldest.TS) {
+				oldest = chunkAnchor{ID: key.GetID(), TS: ts, FromMe: key.GetFromMe()}
+			}
+
+			// Re-decode rows the pre-MYC-3284 decoder stored empty. Runs BEFORE
+			// the media branch and must not share its `continue`: a recoverable
+			// row is usually not media-bearing at all — the common case is text
+			// that arrived inside an envelope the old switch could not see.
+			if n, err := b.backfillDecodedContent(key.GetID(), wm.GetMessage()); err != nil {
+				log.Printf("history_sync: content backfill %s failed: %v", key.GetID(), err)
+			} else {
+				decoded += n
+			}
+
 			fields, ok := extractFromMessage(wm.GetMessage())
 			if !ok || len(fields.MediaKey) == 0 {
 				continue
@@ -137,9 +158,16 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 			n, _ := res.RowsAffected()
 			updated += int(n)
 		}
+
+		// Decide whether this chat keeps walking backwards. Every stop
+		// condition lives in the walker, so delivery just reports where the
+		// chunk ended and obeys the verdict.
+		if conv.GetID() != "" {
+			b.continueWalk(context.Background(), conv.GetID(), oldest)
+		}
 	}
-	log.Printf("history_sync: scanned %d msgs across %d conversations (progress=%d), saw %d media-bearing, backfilled %d rows",
-		scanned, len(convs), chunk.GetProgress(), mediaSeen, updated)
+	log.Printf("history_sync: scanned %d msgs across %d conversations (progress=%d), saw %d media-bearing, backfilled %d media rows, re-decoded %d empty rows",
+		scanned, len(convs), chunk.GetProgress(), mediaSeen, updated, decoded)
 }
 
 // RequestChatHistory triggers WhatsApp to deliver `count` messages immediately
@@ -174,6 +202,10 @@ func (b *Bridge) RequestChatHistory(ctx context.Context, chatJID string, count i
 	//
 	// Earlier mistake: anchoring on the OLDEST message asks for pre-history
 	// (messages before the chat started), which always returns zero results.
+	//
+	// Note this reaches only the most recent `count` messages, and re-calling
+	// it returns the SAME window every time. Walking further back is
+	// RequestHistoryBefore's job — see backfill_walk.go.
 	var (
 		msgID    string
 		ts       int64
@@ -195,6 +227,41 @@ func (b *Bridge) RequestChatHistory(ctx context.Context, chatJID string, count i
 		return
 	}
 	anchorID = msgID
+
+	resp, err = b.RequestHistoryBefore(ctx, chatJID, msgID, ts, isFromMe == 1, count)
+	return
+}
+
+// RequestHistoryBefore asks WhatsApp for the `count` messages immediately
+// before an EXPLICIT anchor, rather than before the newest row we hold.
+//
+// This is what makes walking backwards possible. RequestChatHistory always
+// anchors on the newest message, so calling it repeatedly returns the same
+// most-recent window forever — measured live 2026-08-01: a second sweep of 40
+// chats delivered 8 more chunks and recovered 0 additional rows. Feeding the
+// OLDEST message of each delivered chunk back in as the next anchor is what
+// actually advances through a chat's history.
+func (b *Bridge) RequestHistoryBefore(ctx context.Context, chatJID, anchorID string, anchorTS int64, anchorFromMe bool, count int) (resp whatsmeow.SendResponse, err error) {
+	if !b.IsConnected() {
+		err = errors.New("bridge not connected; cannot request history")
+		return
+	}
+	if anchorID == "" {
+		err = errors.New("anchor message id required")
+		return
+	}
+	if count <= 0 {
+		count = 50
+	}
+	if count > 200 {
+		count = 200
+	}
+
+	msgID, ts := anchorID, anchorTS
+	isFromMe := 0
+	if anchorFromMe {
+		isFromMe = 1
+	}
 
 	chat, parseErr := types.ParseJID(chatJID)
 	if parseErr != nil {
@@ -231,3 +298,218 @@ func (b *Bridge) RequestChatHistory(ctx context.Context, chatJID string, count i
 	return
 }
 
+// --- MYC-3284 content backfill ---------------------------------------------
+
+// backfillDecodedContent re-decodes one history-sync message and repairs the
+// stored row if — and only if — that row was written empty by the pre-MYC-3284
+// decoder.
+//
+// The WHERE clause is the entire safety argument, so it is worth stating
+// plainly. A row is eligible only when BOTH hold:
+//
+//	type = 'system'                          the old catch-all bucket
+//	content_text IS NULL OR content_text=''  it actually has no payload
+//
+// So this can only ever turn a blank into something. It cannot overwrite text,
+// cannot touch a media row, and cannot disturb a row the current decoder wrote
+// (those carry either real text or an "[unsupported: …]" marker, and a marker
+// is non-empty). Overlapping history chunks are therefore idempotent, and a
+// stale re-delivery cannot clobber a fresher live row.
+//
+// A genuinely textless protocol carrier re-decodes to ("", "system") and the
+// UPDATE is a no-op write of identical values, which is the correct outcome:
+// key-distribution rows stay silent rather than gaining vault noise.
+func (b *Bridge) backfillDecodedContent(msgID string, m *waE2E.Message) (int, error) {
+	if msgID == "" || m == nil {
+		return 0, nil
+	}
+
+	// Same decoder as live receive (see extractContentFromProto), so a
+	// backfilled row is byte-identical to what it would have been had the
+	// message arrived today.
+	text, msgType := extractContentFromProto(m)
+	if text == "" {
+		// Nothing recovered — leave the row exactly as it is rather than
+		// rewriting it with the same emptiness.
+		return 0, nil
+	}
+
+	scrubbed, flags := Scrub(text)
+	res, err := b.db.Exec(`
+		UPDATE messages
+		   SET type               = ?,
+		       content_text       = ?,
+		       content_normalized = ?,
+		       scrubbed_text      = ?,
+		       scrub_flags_json   = ?,
+		       -- Set alongside content_text, never separately (MYC-3577). This
+		       -- row is moving from the legacy-empty population into either
+		       -- "decoded" or "undecodable", and raw_type is what the counters
+		       -- read; leaving it stale here would make the backfill's own
+		       -- progress invisible to /healthcheck.
+		       raw_type           = ?
+		 WHERE id = ?
+		   AND type = 'system'
+		   AND (content_text IS NULL OR content_text = '')
+	`, msgType, text, Normalize(text), scrubbed, ScrubFlagsJSON(flags), rawTypeNullable(msgType, text), msgID)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
+// CountEmptySystemRows reports how many rows still carry the pre-MYC-3284
+// shape. The backfill's progress is measured by watching this fall.
+func (b *Bridge) CountEmptySystemRows(ctx context.Context) (int, error) {
+	var n int
+	err := b.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM messages
+		 WHERE type = 'system' AND (content_text IS NULL OR content_text = '')
+	`).Scan(&n)
+	return n, err
+}
+
+// SweepDecodeBackfill asks WhatsApp to re-deliver history for the chats holding
+// the most empty rows. The repair itself happens asynchronously in
+// processHistorySyncEvent as those chunks arrive, which is why this reports
+// what it REQUESTED plus the current outstanding count rather than "fixed N" —
+// a number it cannot honestly know yet.
+//
+// status@broadcast is excluded: WhatsApp does not answer on-demand history
+// requests for it (verified live — the request sends, no chunk ever arrives),
+// so including it burns request budget for nothing.
+//
+// Setting opts.ChatJID repairs ONE named chat instead of the top-N. Without it
+// the only reachable population is "whichever chats happen to hold the most
+// empty rows", which leaves a specific chat someone is actually asking about
+// unrepairable when it sits outside that cut — measured 2026-08-01: the chat
+// this ticket was opened on was not in the top 30, so no sweep ever touched it.
+func (b *Bridge) SweepDecodeBackfill(ctx context.Context, opts DecodeBackfillOptions) (requested int, skipped int, remaining int, err error) {
+	if !b.IsConnected() {
+		return 0, 0, 0, errors.New("bridge not connected; cannot request history")
+	}
+	opts.applyDefaults()
+
+	remaining, err = b.CountEmptySystemRows(ctx)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("count empty rows: %w", err)
+	}
+
+	targets, tErr := b.decodeBackfillTargets(ctx, opts)
+	if tErr != nil {
+		return 0, 0, remaining, tErr
+	}
+
+	// Re-arm the walker for this sweep: fresh per-chat state and a fresh
+	// global request budget. Also release any chat left pinned by an
+	// unanswered request from a previous sweep.
+	b.walker.sweepStale()
+	b.walker.reset(opts.WalkBudget, opts.MaxRounds, opts.PerChat)
+
+	for _, jid := range targets {
+		// Anchor the FIRST request on the newest message, then register the
+		// chat as walking. begin() returns false when the global budget is
+		// already spent, in which case no request is issued at all.
+		var anchorTS int64
+		if tsErr := b.db.QueryRowContext(ctx,
+			`SELECT timestamp FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT 1`, jid,
+		).Scan(&anchorTS); tsErr != nil {
+			log.Printf("decode backfill: no anchor for %s: %v", jid, tsErr)
+			skipped++
+			continue
+		}
+		if !b.walker.begin(jid, anchorTS, opts.PerChat) {
+			skipped++
+			continue
+		}
+		if _, _, reqErr := b.RequestChatHistory(ctx, jid, opts.PerChat); reqErr != nil {
+			// One chat failing (left group, deleted, unparseable JID) must not
+			// abort the sweep for the rest.
+			log.Printf("decode backfill: history request for %s failed: %v", jid, reqErr)
+			skipped++
+			continue
+		}
+		requested++
+	}
+	log.Printf("decode backfill: requested history for %d chats (%d skipped); %d empty rows outstanding",
+		requested, skipped, remaining)
+	return requested, skipped, remaining, nil
+}
+
+// DecodeBackfillOptions parameterizes a decode-backfill sweep. It is a struct
+// rather than positional arguments because four of the five knobs are ints:
+// SweepDecodeBackfill(ctx, 30, 200, 400, 20) is trivially transposable at a
+// call site and the compiler cannot catch it.
+type DecodeBackfillOptions struct {
+	// ChatJID repairs exactly this chat. Empty means "the top MaxChats chats
+	// by empty-row count", which is the bulk-drain mode.
+	ChatJID string
+
+	MaxChats   int
+	PerChat    int
+	WalkBudget int
+	MaxRounds  int
+}
+
+func (o *DecodeBackfillOptions) applyDefaults() {
+	if o.MaxChats <= 0 {
+		o.MaxChats = 20
+	}
+	if o.PerChat <= 0 {
+		o.PerChat = 100
+	}
+	// WalkBudget / MaxRounds are left at zero when unset; walker.reset keeps
+	// its own defaults for those rather than duplicating the constants here.
+}
+
+// decodeBackfillTargets picks which chats this sweep will walk.
+//
+// A named chat is honored even when it holds few empty rows — that is the
+// entire point of naming it — but it must still HAVE at least one, otherwise
+// the sweep would spend a request and a walk slot on a chat with nothing to
+// repair.
+func (b *Bridge) decodeBackfillTargets(ctx context.Context, opts DecodeBackfillOptions) ([]string, error) {
+	if opts.ChatJID != "" {
+		var n int
+		if err := b.db.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM messages
+			 WHERE chat_jid = ?
+			   AND type = 'system' AND (content_text IS NULL OR content_text = '')
+		`, opts.ChatJID).Scan(&n); err != nil {
+			return nil, fmt.Errorf("count empty rows for %s: %w", opts.ChatJID, err)
+		}
+		if n == 0 {
+			return nil, nil
+		}
+		return []string{opts.ChatJID}, nil
+	}
+
+	rows, err := b.db.QueryContext(ctx, `
+		SELECT chat_jid, COUNT(*) AS n
+		  FROM messages
+		 WHERE type = 'system' AND (content_text IS NULL OR content_text = '')
+		   AND chat_jid <> 'status@broadcast'
+		 GROUP BY chat_jid
+		 ORDER BY n DESC
+		 LIMIT ?
+	`, opts.MaxChats)
+	if err != nil {
+		return nil, fmt.Errorf("select affected chats: %w", err)
+	}
+	defer rows.Close()
+
+	var targets []string
+	for rows.Next() {
+		var jid string
+		var n int
+		if err := rows.Scan(&jid, &n); err != nil {
+			return nil, fmt.Errorf("scan affected chat: %w", err)
+		}
+		targets = append(targets, jid)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate affected chats: %w", err)
+	}
+	return targets, nil
+}

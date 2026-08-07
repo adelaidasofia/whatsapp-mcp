@@ -3,8 +3,7 @@
 package main
 
 import (
-	"crypto/rand"
-	"encoding/hex"
+	"errors"
 	"fmt"
 	"runtime"
 	"unsafe"
@@ -53,24 +52,35 @@ func credTarget(service, account string) string {
 	return service + ":" + account
 }
 
-func getOrCreateDBKeyWindows(service, account string) (string, error) {
-	if key, err := winCredRead(credTarget(service, account)); err == nil {
-		if len(key) == 64 { // 32 bytes hex-encoded
-			return key, nil
-		}
-		// Key exists but wrong length; fall through to replace (CredWrite overwrites).
-	}
+func getOrCreateDBKeyWindows(service, account, dbPath string) (string, error) {
+	target := credTarget(service, account)
+	return keyStore{
+		name:   "Windows Credential Manager",
+		remedy: "check Credential Manager access for this user and retry, or set WHATSAPP_DB_KEY to the original key",
+		read:   func() (string, keyReadResult, error) { return winClassifiedRead(target) },
+		write: func(key string) error {
+			// Reachable only after a proven ERROR_NOT_FOUND. CredWriteW has
+			// no create-only mode; the classification above is the guard
+			// against ever writing over an unread key.
+			return winCredWrite(target, account, key)
+		},
+	}.getOrCreate(dbPath)
+}
 
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return "", fmt.Errorf("generate random key: %w", err)
+// winClassifiedRead maps CredReadW outcomes onto the shared three-state
+// contract (MYC-3694): ERROR_NOT_FOUND (1168) is the ONLY proven-absent
+// signal; every other failure — locked store, revoked access, an empty blob —
+// may mean the key still exists, so it must never lead to a mint.
+func winClassifiedRead(target string) (string, keyReadResult, error) {
+	key, err := winCredRead(target)
+	switch {
+	case err == nil:
+		return key, keyReadOK, nil
+	case errors.Is(err, windows.ERROR_NOT_FOUND):
+		return "", keyReadNotFound, nil
+	default:
+		return "", keyReadError, err
 	}
-	key := hex.EncodeToString(b)
-
-	if err := winCredWrite(credTarget(service, account), account, key); err != nil {
-		return "", fmt.Errorf("write key to Windows Credential Manager: %w", err)
-	}
-	return key, nil
 }
 
 func winCredRead(target string) (string, error) {

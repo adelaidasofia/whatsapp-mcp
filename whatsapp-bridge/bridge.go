@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -36,6 +37,10 @@ type Bridge struct {
 	// restart the login loop (e.g. after a WhatsApp-side logout) without
 	// holding a request-scoped ctx.
 	rootCtx context.Context
+
+	// walker drives the MYC-3284 backfill's backwards walk through chat
+	// history. See backfill_walk.go.
+	walker *backfillWalker
 
 	mu            sync.RWMutex
 	connected     bool
@@ -90,6 +95,7 @@ func NewBridge(ctx context.Context, cfg *Config, db *sql.DB, dbKey string, trans
 		transcriber: transcriber,
 		rootCtx:     ctx,
 		authState:   AuthStateUnauthenticated,
+		walker:      newBackfillWalker(),
 	}
 	client.AddEventHandler(b.handleEvent)
 	return b, nil
@@ -148,6 +154,12 @@ func (b *Bridge) handleEvent(raw interface{}) {
 	switch evt := raw.(type) {
 	case *events.Message:
 		b.onMessage(evt)
+	// A message that fails to DECRYPT never becomes an events.Message —
+	// whatsmeow dispatches this and returns. Without this case the bridge wrote
+	// no row at all, so there was nothing for export, /healthcheck or retrieval
+	// to even report as missing (MYC-3569). See undecryptable.go.
+	case *events.UndecryptableMessage:
+		b.onUndecryptableMessage(evt)
 	case *events.Receipt:
 		b.onReceipt(evt)
 	case *events.Connected:
@@ -283,16 +295,54 @@ func (b *Bridge) onMessage(evt *events.Message) {
 
 	// Insert message. Media columns are populated for image/video/document/
 	// audio/sticker; for text/system/reaction etc. they go in as NULL.
+	//
+	// The conflict clause is an UPGRADE, not a plain DO NOTHING (MYC-3569).
+	// When a message could not be decrypted, the bridge has already stored a
+	// placeholder row under this same id (see undecryptable.go). whatsmeow asks
+	// the sender for a resend, and a successful retry arrives HERE, as a normal
+	// events.Message on that id. Under DO NOTHING the recovered content was
+	// dropped on the floor and the placeholder stayed forever, which would have
+	// made the retry path silently useless.
+	//
+	// Both WHERE conditions are load-bearing:
+	//   - the LIKE restricts the upgrade to placeholder rows, so a real row is
+	//     never rewritten and the historical DO NOTHING semantics are unchanged
+	//     for every other message;
+	//   - the content guard refuses a DOWNGRADE. A retry that decodes to a
+	//     genuinely empty "system" row must not overwrite a loud marker with a
+	//     blank — that would trade this fix back for the silent empty row
+	//     MYC-3284 exists to prevent.
 	_, err = b.db.Exec(`
 		INSERT INTO messages (id, chat_jid, sender_jid, sender_display, timestamp, type, content_text, content_normalized, is_from_me, scrubbed_text, scrub_flags_json,
-			media_key, media_direct_path, media_url, media_enc_sha256, media_sha256, media_file_length, media_key_timestamp, media_mime)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO NOTHING
+			media_key, media_direct_path, media_url, media_enc_sha256, media_sha256, media_file_length, media_key_timestamp, media_mime, raw_type)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			type = excluded.type,
+			content_text = excluded.content_text,
+			content_normalized = excluded.content_normalized,
+			sender_display = excluded.sender_display,
+			scrubbed_text = excluded.scrubbed_text,
+			scrub_flags_json = excluded.scrub_flags_json,
+			-- The upgrade must move raw_type too, or a placeholder that a retry
+			-- recovered would keep being counted as undecryptable forever
+			-- (MYC-3569's rows are the ones that move most).
+			raw_type = excluded.raw_type,
+			media_key = excluded.media_key,
+			media_direct_path = excluded.media_direct_path,
+			media_url = excluded.media_url,
+			media_enc_sha256 = excluded.media_enc_sha256,
+			media_sha256 = excluded.media_sha256,
+			media_file_length = excluded.media_file_length,
+			media_key_timestamp = excluded.media_key_timestamp,
+			media_mime = excluded.media_mime
+		WHERE messages.content_text LIKE ?
+		  AND (COALESCE(excluded.content_text, '') <> '' OR excluded.type <> 'system')
 	`, id, chatJID, senderJID, senderDisplay, ts, msgType, content, normalized,
 		boolToInt(evt.Info.IsFromMe), scrubbed, ScrubFlagsJSON(flags),
 		mfields.MediaKey, mfields.MediaDirectPath, mfields.MediaURL,
 		mfields.MediaEncSHA, mfields.MediaSHA, mfields.MediaFileLength,
-		mfields.MediaKeyTimestamp, mfields.MediaMime)
+		mfields.MediaKeyTimestamp, mfields.MediaMime, rawTypeNullable(msgType, content),
+		undecryptablePrefix+"%")
 	if err != nil {
 		log.Printf("onMessage: message insert failed: %v", err)
 	}
@@ -438,8 +488,28 @@ func chatTypeFromJID(j types.JID) string {
 	}
 }
 
+// extractContent decodes a live-receive event.
 func extractContent(evt *events.Message) (text, msgType string) {
-	m := evt.Message
+	return extractContentFromProto(evt.Message)
+}
+
+// extractContentFromProto is the real decoder. Live receive reaches it through
+// extractContent; the history-sync backfill reaches it directly, because
+// HistorySync delivers the same waE2E.Message the live path sees.
+//
+// Both callers share this ONE function on purpose. A backfill carrying its own
+// copy of the decode rules is free to drift from the live one, and the drift
+// would be invisible: rows it rewrote would decode differently from rows
+// arriving beside them, with nothing comparing the two.
+func extractContentFromProto(raw *waE2E.Message) (text, msgType string) {
+	// Reach the real payload first. Disappearing messages, view-once,
+	// device-sent, document-with-caption and edits all nest the actual message
+	// inside a wrapper, and every case below tests TOP-LEVEL fields only — so
+	// without this, a plain text message sent in a chat with disappearing
+	// messages enabled matches nothing and lands in the default branch. It
+	// would be marked "[unsupported: ephemeralMessage]": visible, but with the
+	// text still uncaptured. See content_decode.go.
+	m := unwrapEnvelope(raw)
 	switch {
 	case m.GetConversation() != "":
 		return m.GetConversation(), "text"
@@ -465,6 +535,23 @@ func extractContent(evt *events.Message) (text, msgType string) {
 	case m.GetReactionMessage() != nil:
 		return m.GetReactionMessage().GetText(), "reaction"
 	default:
+		// Second decode tier: types the switch above does not name but that do
+		// carry user-visible text (polls, events, live location, contact
+		// arrays, group invites, video notes, the commerce family). These were
+		// showing up as markers on the live bridge — a marker is right for
+		// something we cannot read, not for something we simply had not
+		// decoded yet. See content_decode.go.
+		//
+		// The `t != ""` gate is the important part: a decoder only gets to
+		// CLAIM a message when it actually produced text. A poll with no
+		// question, or an event stripped of its fields, would otherwise be
+		// stored as an empty row — trading this ticket's loud marker back for
+		// the silent drop it replaced. Falling through keeps such a message
+		// visible, which is always the safer of the two.
+		if t, mt, ok := decodeExtraContent(m); ok && t != "" {
+			return t, mt
+		}
+
 		// Fail LOUD (MYC-3284): a message that carries an undecoded CONTENT
 		// field keeps a NON-EMPTY marker naming the real proto type, so it is
 		// never a silent empty row that reads as "no text". A genuinely

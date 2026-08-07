@@ -75,6 +75,8 @@ func (s *Server) registerRoutes() {
 	// Recovers historical media for messages received before the
 	// media-key-on-all-types patch.
 	s.mux.HandleFunc("POST /api/admin/request-history", s.handleRequestHistory)
+	s.mux.HandleFunc("POST /api/admin/backfill-decode", s.handleBackfillDecode)
+	s.mux.HandleFunc("GET /api/admin/backfill-decode/status", s.handleBackfillDecodeStatus)
 }
 
 // handleRequestHistory triggers a peer HistorySyncOnDemandRequest for a chat.
@@ -108,12 +110,12 @@ func (s *Server) handleRequestHistory(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"chat_jid":         body.ChatJID,
-		"anchor_message":   anchorID,
-		"requested_count":  body.Count,
-		"sent_message_id":  resp.ID,
-		"sent_at_unix":     resp.Timestamp.Unix(),
-		"hint":             "WhatsApp delivers the response asynchronously over the history-sync stream. Watch ~/Library/Logs/whatsapp-bridge.stdout.log for 'history_sync: backfilled media-key for N rows' lines, then re-run any consumers that need the historical media (e.g. POST /api/media/download for individual receipts).",
+		"chat_jid":        body.ChatJID,
+		"anchor_message":  anchorID,
+		"requested_count": body.Count,
+		"sent_message_id": resp.ID,
+		"sent_at_unix":    resp.Timestamp.Unix(),
+		"hint":            "WhatsApp delivers the response asynchronously over the history-sync stream. Watch ~/Library/Logs/whatsapp-bridge.stdout.log for 'history_sync: backfilled media-key for N rows' lines, then re-run any consumers that need the historical media (e.g. POST /api/media/download for individual receipts).",
 	})
 }
 
@@ -153,17 +155,40 @@ func (s *Server) Shutdown() error {
 // --- handlers --------------------------------------------------------------
 
 type healthcheckResponse struct {
-	Status         string         `json:"status"`
-	Version        string         `json:"version"`
-	DBEncrypted    bool           `json:"db_encrypted"`
-	SchemaVer      int            `json:"schema_version"`
-	Timestamp      int64          `json:"timestamp"`
-	Transcription  map[string]any `json:"transcription,omitempty"`
-	AliasCoverage  AliasCoverage  `json:"alias_coverage"`
+	Status      string `json:"status"`
+	Version     string `json:"version"`
+	DBEncrypted bool   `json:"db_encrypted"`
+	SchemaVer   int    `json:"schema_version"`
+	// MYC-3698 — the live journal mode, READ from the database rather than
+	// remembered from startup. WAL is what lets this endpoint answer while
+	// ingest is writing; anything else here means reads are serializing behind
+	// writes and the latency below is not representative.
+	JournalMode   string         `json:"journal_mode"`
+	Timestamp     int64          `json:"timestamp"`
+	Transcription map[string]any `json:"transcription,omitempty"`
+	AliasCoverage AliasCoverage  `json:"alias_coverage"`
 	// MYC-3284 — what the bridge could not read, made measurable.
 	UndecodedTotal    int            `json:"undecoded_total"`
 	UndecodedByType   map[string]int `json:"undecoded_by_type"`
 	LegacyEmptySystem int            `json:"legacy_empty_system"`
+	// MYC-3569 — what the bridge could not DECRYPT. Counted separately from
+	// undecoded_total on purpose: these are a different failure at a different
+	// layer (the message never reached the decoder), and a share of them are
+	// recoverable by whatsmeow's resend request, so the two rates move
+	// independently and merging them would hide both.
+	UndecryptableTotal  int            `json:"undecryptable_total"`
+	UndecryptableByMode map[string]int `json:"undecryptable_by_mode"`
+}
+
+// decodeStats is what the bridge could not read or could not decrypt. Returned
+// as one value because every field comes from the SAME single pass over the
+// `system` rows — see undecodedStats.
+type decodeStats struct {
+	UndecodedTotal      int
+	UndecodedByType     map[string]int
+	LegacyEmptySystem   int
+	UndecryptableTotal  int
+	UndecryptableByMode map[string]int
 }
 
 // undecodedStats counts what the bridge could not read (MYC-3284), so the loss
@@ -176,56 +201,52 @@ type healthcheckResponse struct {
 //
 // A failed count is logged and reported as zero: the healthcheck must still
 // answer, and a logged error is not a silent one.
-func (s *Server) undecodedStats(ctx context.Context) (total int, byType map[string]int, legacyEmpty int) {
-	byType = map[string]int{}
-	// Keyed off the shared marker constant, never a copied literal, so the
-	// counter cannot drift from what the writer stores.
-	markerLike := unsupportedPrefix + "%"
-
-	// EVERY count is scoped to `type = 'system'`, which is where both writers
-	// put these rows (extractContent / baileysExtractContent) and which
-	// `idx_messages_type` (migrations/001) indexes. A bare `content_text LIKE`
-	// cannot use any index and scans the whole message store: measured at 16s
-	// on the founder's real store, turning /healthcheck into a timeout. The
-	// type predicate narrows to a small subset first. Both counts share one
-	// pass so the subset is visited once, not twice.
-	if err := s.db.QueryRowContext(ctx,
-		`SELECT
-		   COALESCE(SUM(CASE WHEN content_text LIKE ? THEN 1 ELSE 0 END), 0),
-		   COALESCE(SUM(CASE WHEN COALESCE(content_text, '') = '' THEN 1 ELSE 0 END), 0)
-		 FROM messages WHERE type = 'system'`, markerLike).Scan(&total, &legacyEmpty); err != nil {
-		log.Printf("healthcheck: undecoded counts query failed: %v", err)
+func (s *Server) undecodedStats(ctx context.Context) decodeStats {
+	st := decodeStats{
+		UndecodedByType:     map[string]int{},
+		UndecryptableByMode: map[string]int{},
 	}
-
+	// MYC-3577 — these counters used to be `content_text LIKE '[unsupported: %'`
+	// over every `system` row. Correct, and unscalable: five consecutive calls
+	// on the live store measured 14.75s, 8.65s, 2.88s, 3.19s and 1.48s. That
+	// spread is a scan warming its page cache, and a monitoring poll after an
+	// idle period always pays the top of it.
+	//
+	// The decode outcome now lives in the indexed messages.raw_type column
+	// (migration 006), written by every writer through the one shared
+	// rawTypeForStorage helper. So the by-type breakdown is a GROUP BY that
+	// `idx_messages_type_rawtype` COVERS: SQLite answers it from the index
+	// alone and never reads a table row.
+	//
+	// Both counter families share this single aggregate, namespaced rather than
+	// split in SQL, and the prefix routing happens in Go over the GROUPED
+	// result (dozens of rows) instead of over the message table (tens of
+	// thousands). The totals are then summed from those same rows, so a total
+	// can no longer disagree with its own breakdown — which the previous
+	// two-query shape allowed.
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT COALESCE(content_text, ''), COUNT(*) FROM messages
-		 WHERE type = 'system' AND content_text LIKE ? GROUP BY content_text`,
-		markerLike)
+		`SELECT raw_type, COUNT(*) FROM messages
+		  WHERE type = 'system' AND raw_type IS NOT NULL
+		  GROUP BY raw_type`)
 	if err != nil {
-		log.Printf("healthcheck: undecoded by-type query failed: %v", err)
+		log.Printf("healthcheck: decode by-type query failed: %v", err)
 	} else {
 		defer rows.Close()
 		for rows.Next() {
-			var marker string
+			var rawType string
 			var n int
-			if err := rows.Scan(&marker, &n); err != nil {
-				log.Printf("healthcheck: undecoded by-type scan failed: %v", err)
+			if err := rows.Scan(&rawType, &n); err != nil {
+				log.Printf("healthcheck: decode by-type scan failed: %v", err)
 				continue
 			}
-			raw := unsupportedRawType(marker)
-			if raw == "" {
-				// A malformed marker still counts — reported as "unknown"
-				// rather than dropped, which is the bug this ticket is about.
-				raw = "unknown"
-			}
-			byType[raw] += n
+			splitRawTypeCount(rawType, n, &st)
 		}
 		if err := rows.Err(); err != nil {
-			log.Printf("healthcheck: undecoded by-type iteration failed: %v", err)
+			log.Printf("healthcheck: decode by-type iteration failed: %v", err)
 		}
 	}
 
-	return total, byType, legacyEmpty
+	return st
 }
 
 func (s *Server) handleHealthcheck(w http.ResponseWriter, r *http.Request) {
@@ -235,10 +256,10 @@ func (s *Server) handleHealthcheck(w http.ResponseWriter, r *http.Request) {
 	// Transcription health: surface the actual data points an operator
 	// needs to know whether voice notes are flowing through. Hides nothing.
 	tx := map[string]any{
-		"backend":     s.cfg.WhisperBackend,
-		"language":    s.cfg.WhisperLanguage,
-		"model_path":  s.cfg.WhisperModelPath,
-		"bin_path":    s.cfg.WhisperBinPath,
+		"backend":    s.cfg.WhisperBackend,
+		"language":   s.cfg.WhisperLanguage,
+		"model_path": s.cfg.WhisperModelPath,
+		"bin_path":   s.cfg.WhisperBinPath,
 	}
 	var pending int
 	_ = s.db.QueryRowContext(r.Context(),
@@ -273,19 +294,22 @@ func (s *Server) handleHealthcheck(w http.ResponseWriter, r *http.Request) {
 		log.Printf("healthcheck: alias coverage query failed: %v", covErr)
 	}
 
-	undecodedTotal, undecodedByType, legacyEmpty := s.undecodedStats(r.Context())
+	st := s.undecodedStats(r.Context())
 
 	writeJSON(w, http.StatusOK, healthcheckResponse{
-		Status:            "ok",
-		Version:           "0.3.0",
-		DBEncrypted:       s.cfg.EncryptDB,
-		SchemaVer:         schemaVer,
-		Timestamp:         time.Now().Unix(),
-		Transcription:     tx,
-		AliasCoverage:     cov,
-		UndecodedTotal:    undecodedTotal,
-		UndecodedByType:   undecodedByType,
-		LegacyEmptySystem: legacyEmpty,
+		Status:              "ok",
+		JournalMode:         JournalMode(s.db),
+		Version:             "0.3.0",
+		DBEncrypted:         s.cfg.EncryptDB,
+		SchemaVer:           schemaVer,
+		Timestamp:           time.Now().Unix(),
+		Transcription:       tx,
+		AliasCoverage:       cov,
+		UndecodedTotal:      st.UndecodedTotal,
+		UndecodedByType:     st.UndecodedByType,
+		LegacyEmptySystem:   st.LegacyEmptySystem,
+		UndecryptableTotal:  st.UndecryptableTotal,
+		UndecryptableByMode: st.UndecryptableByMode,
 	})
 }
 
@@ -419,12 +443,12 @@ func (s *Server) handleAuthReconnect(w http.ResponseWriter, r *http.Request) {
 }
 
 type chatRow struct {
-	JID              string `json:"jid"`
-	ChatType         string `json:"chat_type"`
-	Name             string `json:"name"`
-	LastMessageTime  int64  `json:"last_message_time"`
+	JID                string `json:"jid"`
+	ChatType           string `json:"chat_type"`
+	Name               string `json:"name"`
+	LastMessageTime    int64  `json:"last_message_time"`
 	LastMessagePreview string `json:"last_message_preview"`
-	UnreadCount      int    `json:"unread_count"`
+	UnreadCount        int    `json:"unread_count"`
 }
 
 type chatListResponse struct {
@@ -472,16 +496,16 @@ func (s *Server) handleListChats(w http.ResponseWriter, r *http.Request) {
 }
 
 type messageRow struct {
-	ID             string  `json:"id"`
-	ChatJID        string  `json:"chat_jid"`
-	SenderJID      string  `json:"sender_jid"`
-	SenderDisplay  string  `json:"sender_display"`
-	Timestamp      int64   `json:"timestamp"`
-	Type           string  `json:"type"`
-	ContentText    string  `json:"content_text"`
-	IsFromMe       bool    `json:"is_from_me"`
-	Transcript     *string `json:"voice_note_transcript,omitempty"`
-	QuotedID       string  `json:"quoted_message_id,omitempty"`
+	ID            string  `json:"id"`
+	ChatJID       string  `json:"chat_jid"`
+	SenderJID     string  `json:"sender_jid"`
+	SenderDisplay string  `json:"sender_display"`
+	Timestamp     int64   `json:"timestamp"`
+	Type          string  `json:"type"`
+	ContentText   string  `json:"content_text"`
+	IsFromMe      bool    `json:"is_from_me"`
+	Transcript    *string `json:"voice_note_transcript,omitempty"`
+	QuotedID      string  `json:"quoted_message_id,omitempty"`
 }
 
 type messageListResponse struct {
@@ -572,8 +596,8 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 }
 
 type contactRow struct {
-	JID  string `json:"jid"`
-	LID  string `json:"lid,omitempty"`
+	JID   string `json:"jid"`
+	LID   string `json:"lid,omitempty"`
 	Phone string `json:"phone,omitempty"`
 	// FullName is the name from the USER's address book; PushName is the one
 	// the contact chose for themselves. Both are reported rather than collapsed:
@@ -632,7 +656,7 @@ func (s *Server) handleSearchContacts(w http.ResponseWriter, r *http.Request) {
 
 	// Buffer initial matches; we'll expand and dedupe before responding.
 	type match struct {
-		c    contactRow
+		c     contactRow
 		isBiz int
 	}
 	var matches []match
@@ -733,6 +757,91 @@ func parseIntDefault(s string, def int) int {
 	}
 	n, err := strconv.Atoi(s)
 	if err != nil {
+		return def
+	}
+	return n
+}
+
+// handleBackfillDecode drives the MYC-3284 content backfill: it asks WhatsApp
+// to re-deliver history for the chats still holding empty rows. The repair
+// lands asynchronously as those chunks arrive (processHistorySyncEvent ->
+// backfillDecodedContent), so the response reports what was REQUESTED plus the
+// outstanding count — deliberately not "fixed N", which this handler cannot
+// know yet. Poll /healthcheck decoding.legacy_empty_system to watch it fall.
+func (s *Server) handleBackfillDecode(w http.ResponseWriter, r *http.Request) {
+	if s.bridge == nil {
+		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "bridge not configured"})
+		return
+	}
+	maxChats := atoiDefaultPositive(r.URL.Query().Get("max_chats"), 20)
+	perChat := atoiDefaultPositive(r.URL.Query().Get("per_chat"), 100)
+	walkBudget := atoiDefaultPositive(r.URL.Query().Get("walk_budget"), defaultWalkBudget)
+	maxRounds := atoiDefaultPositive(r.URL.Query().Get("max_rounds"), defaultMaxWalkRounds)
+
+	requested, skipped, remaining, err := s.bridge.SweepDecodeBackfill(r.Context(), DecodeBackfillOptions{
+		ChatJID:    r.URL.Query().Get("chat_jid"),
+		MaxChats:   maxChats,
+		PerChat:    perChat,
+		WalkBudget: walkBudget,
+		MaxRounds:  maxRounds,
+	})
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "decode backfill sweep failed", Details: err.Error()})
+		return
+	}
+	active, spent, budget, stopped := s.bridge.WalkStats()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"chats_requested": requested,
+		"chats_skipped":   skipped,
+		"empty_rows_now":  remaining,
+		"per_chat":        perChat,
+		"walk": map[string]any{
+			"active_chats":    active,
+			"requests_spent":  spent,
+			"request_budget":  budget,
+			"max_rounds":      maxRounds,
+			"stopped_reasons": stopped,
+		},
+		"note":      "each delivered chunk anchors the next step backwards; poll GET /api/admin/backfill-decode/status",
+		"timestamp": time.Now().Unix(),
+	})
+}
+
+// handleBackfillDecodeStatus reports walk progress WITHOUT starting a sweep.
+// A sweep is otherwise the only way to learn where the walk reached, and using
+// one to check progress would itself spend request budget — so observing has to
+// be separable from acting.
+func (s *Server) handleBackfillDecodeStatus(w http.ResponseWriter, r *http.Request) {
+	if s.bridge == nil {
+		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "bridge not configured"})
+		return
+	}
+	remaining, err := s.bridge.CountEmptySystemRows(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "count failed", Details: err.Error()})
+		return
+	}
+	active, spent, budget, stopped := s.bridge.WalkStats()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"empty_rows_now": remaining,
+		"walk": map[string]any{
+			"active_chats":    active,
+			"requests_spent":  spent,
+			"request_budget":  budget,
+			"stopped_reasons": stopped,
+		},
+		"timestamp": time.Now().Unix(),
+	})
+}
+
+// atoiDefaultPositive parses a positive query-string integer, falling back on
+// anything missing or invalid.
+func atoiDefaultPositive(s string, def int) int {
+	if s == "" {
+		return def
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n <= 0 {
 		return def
 	}
 	return n
