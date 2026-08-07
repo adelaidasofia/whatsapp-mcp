@@ -1,0 +1,471 @@
+package main
+
+import (
+	"encoding/base64"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waE2E"
+	"google.golang.org/protobuf/proto"
+)
+
+// A minimal but real PNG. Used where the test needs bytes that content
+// sniffing will actually recognise as an image, rather than a string that
+// only looks like one.
+var tinyPNG = []byte{
+	0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A,
+	0x00, 0x00, 0x00, 0x0D, 'I', 'H', 'D', 'R',
+	0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+	0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+	0x89,
+}
+
+func testConfig(t *testing.T) *Config {
+	t.Helper()
+	return &Config{MediaPath: t.TempDir()}
+}
+
+// --- pickMediaType ----------------------------------------------------------
+
+func TestPickMediaType(t *testing.T) {
+	tests := []struct {
+		name       string
+		sendType   string
+		mime       string
+		asDocument bool
+		want       whatsmeow.MediaType
+	}{
+		{"image goes as photo by default", "file", "image/jpeg", false, whatsmeow.MediaImage},
+		{"image forced to document", "file", "image/jpeg", true, whatsmeow.MediaDocument},
+		{"video goes as video", "file", "video/mp4", false, whatsmeow.MediaVideo},
+		{"video forced to document", "file", "video/mp4", true, whatsmeow.MediaDocument},
+		{"pdf is a document", "file", "application/pdf", false, whatsmeow.MediaDocument},
+		{"unknown type falls back to document", "file", "application/octet-stream", false, whatsmeow.MediaDocument},
+		{"audio ignores mime", "audio", "audio/mpeg", false, whatsmeow.MediaAudio},
+		// as_document is rejected for audio at the validator, but the mapping
+		// must still not silently turn a voice note into a document if it
+		// ever slipped through.
+		{"audio ignores as_document", "audio", "audio/ogg", true, whatsmeow.MediaAudio},
+		{"empty mime is a document", "file", "", false, whatsmeow.MediaDocument},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pickMediaType(tc.sendType, tc.mime, tc.asDocument); got != tc.want {
+				t.Fatalf("pickMediaType(%q,%q,%v) = %q, want %q",
+					tc.sendType, tc.mime, tc.asDocument, got, tc.want)
+			}
+		})
+	}
+}
+
+// --- resolveMIME ------------------------------------------------------------
+
+func TestResolveMIMEPrecedence(t *testing.T) {
+	// An explicit type must beat both the extension and the bytes: the caller
+	// knows things the file does not, and a .bin full of PDF is still a PDF.
+	if got := resolveMIME("application/pdf", "thing.png", tinyPNG); got != "application/pdf" {
+		t.Fatalf("explicit mime should win, got %q", got)
+	}
+	// Extension beats sniffing.
+	if got := resolveMIME("", "doc.pdf", []byte("not really a pdf")); !strings.HasPrefix(got, "application/pdf") {
+		t.Fatalf("extension should win over sniffing, got %q", got)
+	}
+	// Sniffing is the last resort.
+	if got := resolveMIME("", "noextension", tinyPNG); got != "image/png" {
+		t.Fatalf("sniffing should identify png, got %q", got)
+	}
+	// Case and padding from a caller-supplied value are normalised.
+	if got := resolveMIME("  IMAGE/JPEG  ", "", nil); got != "image/jpeg" {
+		t.Fatalf("explicit mime should be trimmed and lowercased, got %q", got)
+	}
+}
+
+// --- checkSizeLimit ---------------------------------------------------------
+
+func TestCheckSizeLimit(t *testing.T) {
+	tests := []struct {
+		name     string
+		sendType string
+		mime     string
+		size     int
+		wantErr  bool
+	}{
+		{"small image ok", "file", "image/jpeg", 1024, false},
+		{"image at the limit ok", "file", "image/jpeg", maxImageBytes, false},
+		{"image over the limit", "file", "image/jpeg", maxImageBytes + 1, true},
+		{"document may exceed the image limit", "file", "application/pdf", maxImageBytes + 1, false},
+		{"document at the limit ok", "file", "application/pdf", maxDocumentBytes, false},
+		{"document over the limit", "file", "application/pdf", maxDocumentBytes + 1, true},
+		{"audio over the limit", "audio", "audio/mpeg", maxAudioBytes + 1, true},
+		// An image sent as a document is checked against the image ceiling
+		// here because the limit is chosen from the MIME type. Documented as
+		// deliberate: WhatsApp applies the stricter ceiling to image content
+		// regardless of the envelope.
+		{"image bytes as document still image-limited", "file", "image/png", maxImageBytes + 1, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkSizeLimit(tc.sendType, tc.mime, tc.size)
+			if tc.wantErr && err == nil {
+				t.Fatalf("expected an error for size %d", tc.size)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+// --- materializeOutboundFile ------------------------------------------------
+
+func TestMaterializeFromPath(t *testing.T) {
+	cfg := testConfig(t)
+	src := filepath.Join(t.TempDir(), "photo.png")
+	if err := os.WriteFile(src, tinyPNG, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got1, err := materializeOutboundFile(t.Context(), cfg, "draft-1", createDraftRequest{
+		SendType: "file",
+		FilePath: src,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got1.MIME != "image/png" {
+		t.Fatalf("mime = %q, want image/png", got1.MIME)
+	}
+	// The name the recipient sees comes from the source file, not from the
+	// draft id the bytes are stored under.
+	if got1.Filename != "photo.png" {
+		t.Fatalf("filename = %q, want photo.png", got1.Filename)
+	}
+	// The bytes must be copied into the bridge's own directory, not merely
+	// referenced: the caller is free to delete or overwrite their file
+	// between draft and confirm.
+	if !strings.HasPrefix(got1.Path, outboundDir(cfg)) {
+		t.Fatalf("file should live under the outbound dir, got %q", got1.Path)
+	}
+	got, err := os.ReadFile(got1.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(tinyPNG) {
+		t.Fatal("copied bytes differ from the source")
+	}
+}
+
+func TestMaterializeFromBase64(t *testing.T) {
+	cfg := testConfig(t)
+	got, err := materializeOutboundFile(t.Context(), cfg, "draft-2", createDraftRequest{
+		SendType:   "file",
+		FileBase64: base64.StdEncoding.EncodeToString(tinyPNG),
+		Filename:   "recibo.png",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.MIME != "image/png" {
+		t.Fatalf("mime = %q, want image/png", got.MIME)
+	}
+	if filepath.Ext(got.Path) != ".png" {
+		t.Fatalf("extension should come from the filename, got %q", got.Path)
+	}
+}
+
+func TestMaterializeRejectsBadInput(t *testing.T) {
+	cfg := testConfig(t)
+	existing := filepath.Join(t.TempDir(), "f.png")
+	if err := os.WriteFile(existing, tinyPNG, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name string
+		req  createDraftRequest
+		want string
+	}{
+		{
+			"no source at all",
+			createDraftRequest{SendType: "file"},
+			"required",
+		},
+		{
+			"both path and bytes",
+			createDraftRequest{SendType: "file", FilePath: existing, FileBase64: "aGk="},
+			"exactly one",
+		},
+		{
+			"both path and url",
+			createDraftRequest{SendType: "file", FilePath: existing, FileURL: "https://example.com/a.png"},
+			"exactly one",
+		},
+		{
+			"all three sources",
+			createDraftRequest{
+				SendType: "file", FilePath: existing, FileBase64: "aGk=",
+				FileURL: "https://example.com/a.png",
+			},
+			"exactly one",
+		},
+		{
+			"missing file",
+			createDraftRequest{SendType: "file", FilePath: filepath.Join(t.TempDir(), "nope.png")},
+			"file_path",
+		},
+		{
+			"directory instead of file",
+			createDraftRequest{SendType: "file", FilePath: t.TempDir()},
+			"directory",
+		},
+		{
+			"invalid base64",
+			createDraftRequest{SendType: "file", FileBase64: "!!!not base64!!!"},
+			"base64",
+		},
+		{
+			"empty payload",
+			createDraftRequest{SendType: "file", FileBase64: ""},
+			"required",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := materializeOutboundFile(t.Context(), cfg, "d", tc.req)
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			if !strings.Contains(strings.ToLower(err.Error()), tc.want) {
+				t.Fatalf("error %q should mention %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestMaterializeRejectsEmptyFile(t *testing.T) {
+	cfg := testConfig(t)
+	empty := filepath.Join(t.TempDir(), "empty.pdf")
+	if err := os.WriteFile(empty, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// An empty file uploads "successfully" and arrives as an unopenable
+	// attachment, so it is worth failing before the network call.
+	if _, err := materializeOutboundFile(t.Context(), cfg, "d", createDraftRequest{
+		SendType: "file", FilePath: empty,
+	}); err == nil {
+		t.Fatal("expected an empty file to be rejected")
+	}
+}
+
+func TestMaterializeEnforcesSizeLimit(t *testing.T) {
+	cfg := testConfig(t)
+	// Declared as an image so the 16 MiB ceiling applies rather than the
+	// document one, keeping the allocation modest.
+	big := make([]byte, maxImageBytes+1)
+	_, err := materializeOutboundFile(t.Context(), cfg, "d", createDraftRequest{
+		SendType:   "file",
+		FileBase64: base64.StdEncoding.EncodeToString(big),
+		Filename:   "huge.jpg",
+	})
+	if err == nil {
+		t.Fatal("expected the size limit to reject this")
+	}
+	if !strings.Contains(err.Error(), "WhatsApp") {
+		t.Fatalf("the error should explain the limit is WhatsApp's: %v", err)
+	}
+}
+
+// --- how a sent message gets archived ---------------------------------------
+
+// TestSentMessageClassification pins the fix for outbound rows being archived
+// as text.
+//
+// The confirm handler used to write the literal 'text' into messages.type, so
+// every image, document and voice note the bridge sent was recorded in the
+// user's own history as a text message. Nothing could correct it afterwards:
+// the insert is ON CONFLICT DO NOTHING, and WhatsApp does not echo a message
+// back to the device that originated it, so that row is the only record that
+// will ever exist. A message sent from the phone came out as type=image while
+// the same message sent through the bridge came out as type=text.
+//
+// The fix classifies the outbound protobuf with the SAME extractor the receive
+// path uses. So what this test asserts is that the two agree by construction —
+// not that some parallel mapping table happens to be correct today.
+func TestSentMessageClassification(t *testing.T) {
+	const url, dpath = "https://mmg.whatsapp.net/d", "/v/t62/f"
+	key, encSHA, sha := []byte("mediakey"), []byte("encsha"), []byte("sha")
+
+	tests := []struct {
+		name      string
+		msg       *waE2E.Message
+		wantType  string
+		wantMedia bool
+	}{
+		{
+			name: "image",
+			msg: &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
+				Mimetype: proto.String("image/png"), URL: proto.String(url), DirectPath: proto.String(dpath),
+				MediaKey: key, FileEncSHA256: encSHA, FileSHA256: sha, FileLength: proto.Uint64(2150029),
+			}},
+			wantType: "image", wantMedia: true,
+		},
+		{
+			name: "video",
+			msg: &waE2E.Message{VideoMessage: &waE2E.VideoMessage{
+				Mimetype: proto.String("video/mp4"), URL: proto.String(url), DirectPath: proto.String(dpath),
+				MediaKey: key, FileEncSHA256: encSHA, FileSHA256: sha,
+			}},
+			wantType: "video", wantMedia: true,
+		},
+		{
+			name: "document",
+			msg: &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{
+				FileName: proto.String("contrato.pdf"), Mimetype: proto.String("application/pdf"),
+				URL: proto.String(url), DirectPath: proto.String(dpath),
+				MediaKey: key, FileEncSHA256: encSHA, FileSHA256: sha,
+			}},
+			wantType: "document", wantMedia: true,
+		},
+		{
+			name: "audio attachment",
+			msg: &waE2E.Message{AudioMessage: &waE2E.AudioMessage{
+				Mimetype: proto.String("audio/mpeg"), PTT: proto.Bool(false),
+				URL: proto.String(url), DirectPath: proto.String(dpath),
+				MediaKey: key, FileEncSHA256: encSHA, FileSHA256: sha,
+			}},
+			wantType: "audio", wantMedia: true,
+		},
+		{
+			// The PTT flag is the only thing separating these two, and it is the
+			// bit send_audio's voice_note parameter exists to set.
+			name: "voice note",
+			msg: &waE2E.Message{AudioMessage: &waE2E.AudioMessage{
+				Mimetype: proto.String("audio/ogg; codecs=opus"), PTT: proto.Bool(true),
+				URL: proto.String(url), DirectPath: proto.String(dpath),
+				MediaKey: key, FileEncSHA256: encSHA, FileSHA256: sha,
+			}},
+			wantType: "voice", wantMedia: true,
+		},
+		{
+			// The one case where 'text' is the right answer.
+			name:     "plain text",
+			msg:      &waE2E.Message{Conversation: proto.String("hola")},
+			wantType: "text", wantMedia: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, gotType := extractContentFromProto(tc.msg)
+			if gotType != tc.wantType {
+				t.Fatalf("type = %q, want %q", gotType, tc.wantType)
+			}
+			if gotType == "text" && tc.wantType != "text" {
+				t.Fatal("this is the regression: media archived as a text message")
+			}
+
+			fields, ok := extractDownloadableFieldsFromProto(tc.msg)
+			if ok != tc.wantMedia {
+				t.Fatalf("media fields present = %v, want %v", ok, tc.wantMedia)
+			}
+			if !tc.wantMedia {
+				return
+			}
+			// Without these the row is a media message with no way to fetch it,
+			// which is what download_media reports as an orphan.
+			if string(fields.MediaKey) != string(key) {
+				t.Fatalf("media key not carried: %q", fields.MediaKey)
+			}
+			if !fields.MediaDirectPath.Valid || fields.MediaDirectPath.String != dpath {
+				t.Fatalf("direct path not carried: %+v", fields.MediaDirectPath)
+			}
+			if !fields.MediaURL.Valid || fields.MediaURL.String != url {
+				t.Fatalf("url not carried: %+v", fields.MediaURL)
+			}
+		})
+	}
+}
+
+func TestExtractDownloadableFieldsFromProtoHandlesNil(t *testing.T) {
+	// The confirm path calls this on whatever buildMediaMessage returned; a nil
+	// message must be a clean "no media", not a panic mid-send.
+	if _, ok := extractDownloadableFieldsFromProto(nil); ok {
+		t.Fatal("nil message should report no media fields")
+	}
+}
+
+// --- nonEmpty ---------------------------------------------------------------
+
+func TestNonEmptyCaption(t *testing.T) {
+	// An empty caption must be nil, not a pointer to "": WhatsApp renders the
+	// latter as a blank line beneath the media.
+	if nonEmpty("") != nil {
+		t.Fatal("empty caption should be nil")
+	}
+	got := nonEmpty("hola")
+	if got == nil || *got != "hola" {
+		t.Fatalf("caption not preserved: %v", got)
+	}
+}
+
+// --- removeOutboundFile -----------------------------------------------------
+
+func TestRemoveOutboundFile(t *testing.T) {
+	f := filepath.Join(t.TempDir(), "x.bin")
+	if err := os.WriteFile(f, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeOutboundFile(f); err != nil {
+		t.Fatalf("removing an existing file: %v", err)
+	}
+	if _, err := os.Stat(f); !os.IsNotExist(err) {
+		t.Fatal("file should be gone")
+	}
+	// Idempotent: expiry sweeps and the insert-failure path can both target
+	// the same draft, and the second one must not report a failure.
+	if err := removeOutboundFile(f); err != nil {
+		t.Fatalf("removing a missing file should be a no-op: %v", err)
+	}
+	if err := removeOutboundFile(""); err != nil {
+		t.Fatalf("empty path should be a no-op: %v", err)
+	}
+}
+
+// --- voice notes ------------------------------------------------------------
+
+func TestOpusOggRecognised(t *testing.T) {
+	// These skip transcoding entirely; getting the set wrong means every
+	// voice note pays for an ffmpeg round trip, or worse, fails on a machine
+	// without ffmpeg despite already being in the right format.
+	for _, m := range []string{"audio/ogg", "audio/opus"} {
+		if !opusOggMIMEs[m] {
+			t.Fatalf("%q should be accepted as-is for a voice note", m)
+		}
+	}
+	for _, m := range []string{"audio/mpeg", "audio/mp4", "audio/wav", ""} {
+		if opusOggMIMEs[m] {
+			t.Fatalf("%q should require transcoding", m)
+		}
+	}
+}
+
+func TestTranscodeReportsMissingFFmpeg(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "a.mp3")
+	if err := os.WriteFile(src, []byte("fake"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := transcodeToOpusOgg(t.Context(), "definitely-not-a-real-binary-xyz", src)
+	if err == nil {
+		t.Fatal("expected an error when ffmpeg is absent")
+	}
+	// The message has to tell the user how to proceed, not just what broke.
+	if !strings.Contains(err.Error(), "voice_note=false") {
+		t.Fatalf("the error should offer the no-transcode escape hatch: %v", err)
+	}
+	if !strings.Contains(err.Error(), "WHATSAPP_FFMPEG_BIN_PATH") {
+		t.Fatalf("the error should name the config var: %v", err)
+	}
+}
