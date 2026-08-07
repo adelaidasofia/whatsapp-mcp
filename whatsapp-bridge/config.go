@@ -35,6 +35,10 @@ type Config struct {
 	WhisperModelPath string
 	WhisperAPIKey    string
 	FFmpegBinPath    string
+	// WhisperExcludeChats: normalized (lowercase, accent-stripped) substrings
+	// matched against chat JID and chat name; matching chats are never
+	// transcribed (privacy filter for personal chats).
+	WhisperExcludeChats []string
 
 	ScrubPromptInjection bool
 	AuditLog             bool
@@ -85,6 +89,7 @@ func LoadConfig() (*Config, error) {
 		WhisperBinPath:       getenv("WHATSAPP_WHISPER_BIN_PATH", ""),
 		WhisperModelPath:     expandPath(getenv("WHATSAPP_WHISPER_MODEL_PATH", ""), home),
 		WhisperAPIKey:        getenv("WHATSAPP_WHISPER_API_KEY", ""),
+		WhisperExcludeChats:  splitNormalizedCSV(getenv("WHATSAPP_WHISPER_EXCLUDE_CHATS", "")),
 		FFmpegBinPath:        getenv("WHATSAPP_FFMPEG_BIN_PATH", ""),
 		ScrubPromptInjection: getenvBool("WHATSAPP_SCRUB_PROMPT_INJECTION", true),
 		AuditLog:             getenvBool("WHATSAPP_AUDIT_LOG", true),
@@ -141,6 +146,18 @@ func (c *Config) Validate() error {
 
 func isLoopback(host string) bool {
 	return host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]"
+}
+
+// splitNormalizedCSV parses a comma-separated env value into normalized
+// (lowercase, accent-stripped via Normalize) non-empty patterns.
+func splitNormalizedCSV(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.ToLower(Normalize(strings.TrimSpace(p))); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func getenv(key, def string) string {

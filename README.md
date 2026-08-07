@@ -101,7 +101,30 @@ Key variables:
 | `WHATSAPP_SCRUB_PROMPT_INJECTION` | `true` | Strip known prompt-injection patterns from incoming messages before Claude sees them |
 | `WHATSAPP_AUDIT_LOG` | `true` | Log every tool call to `audit.log` |
 | `WHATSAPP_ENCRYPT_DB` | `true` | Enable SQLCipher DB encryption; key in the platform secret store (macOS Keychain / Windows Credential Manager / libsecret) |
-| `WHATSAPP_DB_KEY` | empty | Explicit 64-hex-char SQLCipher key override for headless/CI/custom secret managers (skips the platform store) |
+| `WHATSAPP_DB_KEY` | empty | Explicit 64-hex-char SQLCipher key override (skips the platform store). Escape hatch for headless/CI/custom secret managers, and the recovery path when the secret store cannot be read — see below |
+
+### The DB key and `WHATSAPP_DB_KEY`
+
+With `WHATSAPP_ENCRYPT_DB=true` (the default), the bridge encrypts the message
+store with a 256-bit SQLCipher key kept in the platform secret store. The key
+lifecycle is deliberately conservative, because a wrong key silently orphans
+every stored message:
+
+- A fresh key is minted **only** when the secret store definitively answers
+  "no such item" (macOS `errSecItemNotFound`, Windows `ERROR_NOT_FOUND`,
+  libsecret clean miss) **and** no non-empty store database exists yet.
+- Any other failed read — locked keychain, no D-Bus session, revoked access —
+  makes the bridge exit with an error instead of minting: the key may still
+  exist, and overwriting it would make the encrypted store permanently
+  undecryptable. The error names the fix (e.g. `security unlock-keychain`).
+- If the secret store has no key but a populated store database exists, the
+  bridge also refuses to mint and asks you to supply the original key.
+
+`WHATSAPP_DB_KEY` (64 hex chars = 32 bytes, e.g. `openssl rand -hex 32`) is
+the escape hatch for all of these: when set, it is used directly and the
+platform secret store is never touched. Use it for headless/CI machines,
+custom secret managers, restoring a store on a new machine, or booting while
+the platform store is unavailable.
 
 ## Security
 
