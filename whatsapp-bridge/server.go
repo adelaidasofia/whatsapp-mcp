@@ -618,9 +618,15 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 }
 
 type contactRow struct {
-	JID          string   `json:"jid"`
-	LID          string   `json:"lid,omitempty"`
-	Phone        string   `json:"phone,omitempty"`
+	JID   string `json:"jid"`
+	LID   string `json:"lid,omitempty"`
+	Phone string `json:"phone,omitempty"`
+	// FullName is the name from the USER's address book; PushName is the one
+	// the contact chose for themselves. Both are reported rather than collapsed:
+	// they routinely disagree ("Mi Amor" versus "Dra Ivette De La Vega") and a
+	// caller deciding who to message needs to see the label it was asked about,
+	// not a merged best guess.
+	FullName     string   `json:"full_name,omitempty"`
 	PushName     string   `json:"push_name"`
 	VerifiedName string   `json:"verified_name,omitempty"`
 	IsBusiness   bool     `json:"is_business"`
@@ -651,13 +657,20 @@ func (s *Server) handleSearchContacts(w http.ResponseWriter, r *http.Request) {
 	// jid_aliases so callers see every JID known to refer to the same human
 	// (LID + phone-JID forms). Without this, a name search returns only the
 	// row whose stored push_name happens to match exactly, hiding the alias.
+	//
+	// normalized_full_name is searched alongside normalized_name because the
+	// address-book label is usually the only name the user knows. While that
+	// column went unread, searching "Mi Amor" returned zero and the caller was
+	// pushed into supplying a phone number from memory — which is exactly the
+	// job an address book exists to do. See contacts_sync.go.
 	rows, err := s.db.QueryContext(r.Context(), `
-		SELECT jid, COALESCE(lid, ''), COALESCE(phone, ''), COALESCE(push_name, ''), COALESCE(verified_name, ''), is_business
+		SELECT jid, COALESCE(lid, ''), COALESCE(phone, ''), COALESCE(full_name, ''),
+		       COALESCE(push_name, ''), COALESCE(verified_name, ''), is_business
 		FROM contacts
-		WHERE normalized_name LIKE ? OR phone LIKE ? OR lid LIKE ?
+		WHERE normalized_name LIKE ? OR normalized_full_name LIKE ? OR phone LIKE ? OR lid LIKE ?
 		ORDER BY updated_at DESC
 		LIMIT ?
-	`, "%"+norm+"%", "%"+query+"%", "%"+query+"%", limit)
+	`, "%"+norm+"%", "%"+norm+"%", "%"+query+"%", "%"+query+"%", limit)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "query failed", Details: err.Error()})
 		return
@@ -671,7 +684,7 @@ func (s *Server) handleSearchContacts(w http.ResponseWriter, r *http.Request) {
 	var matches []match
 	for rows.Next() {
 		var m match
-		if err := rows.Scan(&m.c.JID, &m.c.LID, &m.c.Phone, &m.c.PushName, &m.c.VerifiedName, &m.isBiz); err != nil {
+		if err := rows.Scan(&m.c.JID, &m.c.LID, &m.c.Phone, &m.c.FullName, &m.c.PushName, &m.c.VerifiedName, &m.isBiz); err != nil {
 			continue
 		}
 		m.c.IsBusiness = m.isBiz == 1
@@ -727,9 +740,10 @@ func loadContactRow(ctx context.Context, db *sql.DB, jid string) (contactRow, bo
 	var c contactRow
 	var isBiz int
 	err := db.QueryRowContext(ctx, `
-		SELECT jid, COALESCE(lid, ''), COALESCE(phone, ''), COALESCE(push_name, ''), COALESCE(verified_name, ''), is_business
+		SELECT jid, COALESCE(lid, ''), COALESCE(phone, ''), COALESCE(full_name, ''),
+		       COALESCE(push_name, ''), COALESCE(verified_name, ''), is_business
 		FROM contacts WHERE jid = ?
-	`, jid).Scan(&c.JID, &c.LID, &c.Phone, &c.PushName, &c.VerifiedName, &isBiz)
+	`, jid).Scan(&c.JID, &c.LID, &c.Phone, &c.FullName, &c.PushName, &c.VerifiedName, &isBiz)
 	if err != nil {
 		return c, false
 	}

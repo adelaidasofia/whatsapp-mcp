@@ -218,6 +218,10 @@ func (b *Bridge) handleEvent(raw interface{}) {
 		// Backfill media-key fields for any historical image/video/document/
 		// sticker messages WhatsApp re-delivers. See history_sync.go.
 		b.processHistorySyncEvent(evt)
+	case *events.Contact:
+		// The user renamed someone in their address book on another device.
+		// Without this the new label waits for the next restart's sync sweep.
+		b.onContactUpdate(evt)
 	case *events.CallOffer:
 		b.onCallOffer(evt)
 	case *events.CallTerminate:
@@ -255,8 +259,13 @@ func (b *Bridge) onMessage(evt *events.Message) {
 	// The two name columns go in as NULL rather than "" when the message is not
 	// entitled to name the chat, so the COALESCE above has something to fall
 	// through on. An empty string would satisfy COALESCE and blank the name.
+	//
+	// chatNameFor consults the user's address book before falling back to the
+	// push name, so the value written here is already the best one known — which
+	// is what keeps the COALESCE above from overwriting "Mi Amor" with the push
+	// name on the next inbound message. See contacts_sync.go.
 	var chatName, chatNameNorm sql.NullString
-	if n := chatNameFromMessage(evt.Info.IsGroup, evt.Info.IsFromMe, evt.Info.PushName); n != "" {
+	if n := b.chatNameFor(evt); n != "" {
 		chatName = sql.NullString{String: n, Valid: true}
 		chatNameNorm = sql.NullString{String: Normalize(n), Valid: true}
 	}
