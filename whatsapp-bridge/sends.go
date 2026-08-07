@@ -40,11 +40,14 @@ type createDraftRequest struct {
 	ReactionEmoji   string `json:"reaction_emoji,omitempty"`   // for reaction: the emoji (e.g., "❤️")
 	ReactionTarget  string `json:"reaction_target,omitempty"`  // for reaction: the message ID being reacted to
 
-	// Media (send_type "file" or "audio"). Exactly one of FilePath or
-	// FileBase64 must be set: a local client can name a path on this machine,
-	// but a remote one has no filesystem here and can only send bytes inline.
+	// Media (send_type "file" or "audio"). Exactly one of FilePath, FileBase64
+	// or FileURL must be set: a local client can name a path on this machine, a
+	// remote one has no filesystem here and can only send small content inline,
+	// and anything larger than the context can carry arrives as a URL the
+	// bridge downloads itself (see fetch_url.go).
 	FilePath   string `json:"file_path,omitempty"`
 	FileBase64 string `json:"file_base64,omitempty"`
+	FileURL    string `json:"file_url,omitempty"`
 	Filename   string `json:"filename,omitempty"`   // shown to the recipient; required with file_base64 for documents
 	MediaMIME  string `json:"media_mime,omitempty"` // overrides extension/sniffing when the caller knows better
 	Caption    string `json:"caption,omitempty"`    // rendered under an image or video
@@ -106,16 +109,18 @@ func (s *Server) handleCreateDraft(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	case "file", "audio":
-		if req.FilePath == "" && req.FileBase64 == "" {
+		switch fileSourceCount(req) {
+		case 0:
 			writeJSON(w, http.StatusBadRequest, errorResponse{
-				Error:   fmt.Sprintf("file_path or file_base64 required for send_type=%s", req.SendType),
-				Details: "file_path names a file on the bridge host; file_base64 carries the bytes inline for clients with no filesystem here",
+				Error:   fmt.Sprintf("file_path, file_base64 or file_url required for send_type=%s", req.SendType),
+				Details: "file_path names a file on the bridge host; file_base64 carries the bytes inline for clients with no filesystem here; file_url is an https link the bridge downloads itself",
 			})
 			return
-		}
-		if req.FilePath != "" && req.FileBase64 != "" {
+		case 1:
+			// The one valid shape.
+		default:
 			writeJSON(w, http.StatusBadRequest, errorResponse{
-				Error: "pass file_path or file_base64, not both",
+				Error: "pass exactly one of file_path, file_base64 or file_url",
 			})
 			return
 		}
@@ -157,11 +162,13 @@ func (s *Server) handleCreateDraft(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Media drafts land on local disk now and are uploaded only at confirm,
-	// so no bytes reach WhatsApp before the user approves the send.
-	var filePath, mediaMIME string
+	// so no bytes reach WhatsApp before the user approves the send. For
+	// file_url this is also where the download happens, so a fetch that is
+	// refused or oversized fails here — before a row exists.
+	var media outboundFile
 	if req.SendType == "file" || req.SendType == "audio" {
 		var mErr error
-		filePath, mediaMIME, mErr = materializeOutboundFile(s.cfg, draftID, req)
+		media, mErr = materializeOutboundFile(r.Context(), s.cfg, draftID, req)
 		if mErr != nil {
 			writeJSON(w, http.StatusBadRequest, errorResponse{Error: "media rejected", Details: mErr.Error()})
 			return
@@ -177,12 +184,12 @@ func (s *Server) handleCreateDraft(w http.ResponseWriter, r *http.Request) {
 		                   quoted_message_id, reaction_emoji, status, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?)
 	`, draftID, req.RecipientJID, recipientDisplay, req.SendType, contentText,
-		nullString(filePath), nullString(mediaMIME), nullString(req.Filename), boolToInt(req.AsDocument), boolToInt(req.VoiceNote),
+		nullString(media.Path), nullString(media.MIME), nullString(media.Filename), boolToInt(req.AsDocument), boolToInt(req.VoiceNote),
 		nullString(quotedID), nullString(req.ReactionEmoji), now)
 	if err != nil {
 		// Don't leave the bytes behind if the row that would reference them
 		// never existed.
-		if rmErr := removeOutboundFile(filePath); rmErr != nil {
+		if rmErr := removeOutboundFile(media.Path); rmErr != nil {
 			log.Printf("draft %s: insert failed and cleanup failed too: %v", draftID, rmErr)
 		}
 		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "draft insert failed", Details: err.Error()})
@@ -194,22 +201,21 @@ func (s *Server) handleCreateDraft(w http.ResponseWriter, r *http.Request) {
 	case "reaction":
 		preview = fmt.Sprintf("Reaction %s to message %s", req.ReactionEmoji, truncate(req.ReactionTarget, 32))
 	case "file", "audio":
-		kind := mediaMIME
+		kind := media.MIME
 		if req.SendType == "audio" && req.VoiceNote {
-			kind = "voice note (" + mediaMIME + ")"
+			kind = "voice note (" + media.MIME + ")"
 		} else if req.AsDocument {
-			kind = "document (" + mediaMIME + ")"
+			kind = "document (" + media.MIME + ")"
 		}
 		// Show the name the RECIPIENT will see, not the draft_id-based name
 		// the bytes happen to be stored under. The preview exists so the
 		// user can check what they are approving; showing them an internal
-		// identifier instead of the real filename defeats that.
-		shown := req.Filename
-		if shown == "" {
-			shown = filepath.Base(req.FilePath)
-		}
+		// identifier instead of the real filename defeats that. It is the
+		// same string that goes into media_filename, so what is approved and
+		// what is delivered cannot drift apart.
+		shown := media.Filename
 		if shown == "" || shown == "." {
-			shown = filepath.Base(filePath)
+			shown = filepath.Base(media.Path)
 		}
 		preview = fmt.Sprintf("%s, %s", kind, shown)
 		if req.Caption != "" {
@@ -425,18 +431,46 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 		sentAt, whatsappID, draftID)
 
 	// Also persist the sent message in messages table so it shows up in chat history.
+	//
+	// The row is classified by the SAME extractor the receive path uses, rather
+	// than by a literal here. The type used to be hardcoded 'text', so every
+	// image, document and voice note the bridge sent was archived as a text
+	// message — and because the insert is ON CONFLICT DO NOTHING, nothing could
+	// ever correct it. WhatsApp does not echo a message back to the device that
+	// sent it, so this row is the only record that will ever exist: whatever it
+	// gets wrong stays wrong.
+	//
+	// extractDownloadableFieldsFromProto reads the upload result back off the
+	// protobuf we just sent, so download_media works on our own sent media
+	// instead of finding a media row with no keys.
 	senderJID := ""
 	if s.bridge.client.Store.ID != nil {
 		senderJID = s.bridge.client.Store.ID.String()
 	}
-	scrubbed, flags := Scrub(contentText)
+	persistText, persistType := extractContentFromProto(msg)
+	mfields, _ := extractDownloadableFieldsFromProto(msg)
+	scrubbed, flags := Scrub(persistText)
 	_, err = s.db.ExecContext(r.Context(), `
-		INSERT INTO messages (id, chat_jid, sender_jid, timestamp, type, content_text, content_normalized, is_from_me, scrubbed_text, scrub_flags_json)
-		VALUES (?, ?, ?, ?, 'text', ?, ?, 1, ?, ?)
+		INSERT INTO messages (id, chat_jid, sender_jid, sender_display, timestamp, type, content_text, content_normalized, is_from_me, scrubbed_text, scrub_flags_json,
+			media_key, media_direct_path, media_url, media_enc_sha256, media_sha256, media_file_length, media_key_timestamp, media_mime)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO NOTHING
-	`, whatsappID, recipientJID, senderJID, sentAt, contentText, Normalize(contentText), scrubbed, ScrubFlagsJSON(flags))
+	`, whatsappID, recipientJID, senderJID, nullString(s.bridge.client.Store.PushName), sentAt, persistType,
+		persistText, Normalize(persistText), scrubbed, ScrubFlagsJSON(flags),
+		mfields.MediaKey, mfields.MediaDirectPath, mfields.MediaURL,
+		mfields.MediaEncSHA, mfields.MediaSHA, mfields.MediaFileLength,
+		mfields.MediaKeyTimestamp, mfields.MediaMime)
 	if err != nil {
 		log.Printf("sent-message persist failed: %v", err)
+	}
+
+	// The draft's bytes have served their purpose: Upload happened above, and a
+	// confirmed draft can never be sent again. Nothing else deletes them —
+	// removeOutboundFile is otherwise only reached by a failed insert or by an
+	// attempt to confirm an already-expired draft — so without this every file
+	// ever sent accumulates in the outbound directory forever.
+	if rmErr := removeOutboundFile(mediaPath); rmErr != nil {
+		log.Printf("draft %s sent; removing %s failed: %v", draftID, mediaPath, rmErr)
 	}
 
 	writeJSON(w, http.StatusOK, confirmResponse{

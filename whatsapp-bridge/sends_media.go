@@ -13,8 +13,15 @@
 //     provide. So drafts only ever touch the local disk; Upload runs in
 //     confirm.
 //
-//  2. Nothing here mutates a draft's stored bytes. A draft that expires or is
-//     abandoned leaves a file behind, so expiry sweeps delete it.
+//  2. Nothing here mutates a draft's stored bytes; deletion is the caller's
+//     job, and sends.go does it at three points: a failed draft insert, a
+//     confirm that finds the draft already expired, and a successful send
+//     (where Upload has already happened, so the file is spent).
+//
+//     One gap remains, stated rather than implied: a draft that is created and
+//     then simply abandoned keeps its bytes until someone tries to confirm it.
+//     There is no periodic sweeper. That path leaks one file per abandoned
+//     draft, unlike the send path, which used to leak one per message sent.
 //
 // Voice notes are the one place a plain file is not enough: WhatsApp renders
 // a message as a voice note (PTT) only when the audio is Opus in an Ogg
@@ -63,33 +70,73 @@ func outboundDir(cfg *Config) string {
 	return filepath.Join(cfg.MediaPath, "outbound")
 }
 
-// materializeOutboundFile writes the draft's bytes to disk and reports the
-// path and MIME type to store on the draft row.
+// outboundFile is what a materialized draft body amounts to: bytes on local
+// disk, a content type, and the name the recipient should see.
 //
-// Accepts either a path already on this machine or inline base64. Both exist
-// for a reason: a local stdio client can pass a path, but a remote client
-// (claude.ai) has no filesystem here, so anything it generates can only
-// arrive inline.
-func materializeOutboundFile(cfg *Config, draftID string, req createDraftRequest) (string, string, error) {
+// Filename is carried out of here rather than read back off the request
+// because a URL download is the one input mode that can discover a name the
+// caller never supplied — from Content-Disposition. Without it a document
+// fetched from Drive would reach the recipient named after the draft id.
+type outboundFile struct {
+	Path     string
+	MIME     string
+	Filename string
+}
+
+// fileSourceCount reports how many of the three input modes the caller used.
+// Exactly one is valid; the count is what lets "none" and "more than one" give
+// different messages.
+func fileSourceCount(req createDraftRequest) int {
+	n := 0
+	for _, src := range []string{req.FilePath, req.FileBase64, req.FileURL} {
+		if src != "" {
+			n++
+		}
+	}
+	return n
+}
+
+// fetchCeiling is the size limit applied while a file_url download streams,
+// chosen before the content type is known. It is deliberately the most
+// permissive limit that could apply: checkSizeLimit below applies the exact one
+// once resolveMIME has run.
+func fetchCeiling(sendType string) int64 {
+	if sendType == "audio" {
+		return maxAudioBytes
+	}
+	return maxDocumentBytes
+}
+
+// materializeOutboundFile writes the draft's bytes to disk and reports what to
+// store on the draft row.
+//
+// Three input modes, each covering a client the others cannot. A local stdio
+// client can name a path on this machine. A remote client (claude.ai) has no
+// filesystem here, so small generated content arrives inline as base64 — but
+// base64 crosses the model's context, which caps out around a hundred
+// kilobytes. file_url is how anything larger gets here: the bridge fetches it
+// itself, which is why fetch_url.go exists and why its address guard is not
+// optional.
+func materializeOutboundFile(ctx context.Context, cfg *Config, draftID string, req createDraftRequest) (outboundFile, error) {
 	var data []byte
 	var nameHint string
 
 	switch {
-	case req.FilePath != "" && req.FileBase64 != "":
-		return "", "", fmt.Errorf("pass file_path or file_base64, not both")
+	case fileSourceCount(req) > 1:
+		return outboundFile{}, fmt.Errorf("pass exactly one of file_path, file_base64 or file_url")
 
 	case req.FilePath != "":
 		clean := filepath.Clean(req.FilePath)
 		info, err := os.Stat(clean)
 		if err != nil {
-			return "", "", fmt.Errorf("file_path %q: %w", req.FilePath, err)
+			return outboundFile{}, fmt.Errorf("file_path %q: %w", req.FilePath, err)
 		}
 		if info.IsDir() {
-			return "", "", fmt.Errorf("file_path %q is a directory", req.FilePath)
+			return outboundFile{}, fmt.Errorf("file_path %q is a directory", req.FilePath)
 		}
 		data, err = os.ReadFile(clean)
 		if err != nil {
-			return "", "", fmt.Errorf("reading file_path %q: %w", req.FilePath, err)
+			return outboundFile{}, fmt.Errorf("reading file_path %q: %w", req.FilePath, err)
 		}
 		nameHint = filepath.Base(clean)
 
@@ -97,16 +144,25 @@ func materializeOutboundFile(cfg *Config, draftID string, req createDraftRequest
 		var err error
 		data, err = base64.StdEncoding.DecodeString(req.FileBase64)
 		if err != nil {
-			return "", "", fmt.Errorf("file_base64 is not valid base64: %w", err)
+			return outboundFile{}, fmt.Errorf("file_base64 is not valid base64: %w", err)
 		}
 		nameHint = req.Filename
 
+	case req.FileURL != "":
+		var err error
+		// The zero fetcher is the guarded one; see the type's doc comment.
+		data, nameHint, err = fetchRemoteFile(ctx, req.FileURL, fetchCeiling(req.SendType), fetcher{})
+		if err != nil {
+			return outboundFile{}, err
+		}
+
 	default:
-		return "", "", fmt.Errorf("file_path or file_base64 required for send_type=%q", req.SendType)
+		return outboundFile{}, fmt.Errorf(
+			"file_path, file_base64 or file_url required for send_type=%q", req.SendType)
 	}
 
 	if len(data) == 0 {
-		return "", "", fmt.Errorf("the file is empty")
+		return outboundFile{}, fmt.Errorf("the file is empty")
 	}
 	if req.Filename != "" {
 		nameHint = req.Filename
@@ -114,12 +170,12 @@ func materializeOutboundFile(cfg *Config, draftID string, req createDraftRequest
 
 	mimeType := resolveMIME(req.MediaMIME, nameHint, data)
 	if err := checkSizeLimit(req.SendType, mimeType, len(data)); err != nil {
-		return "", "", err
+		return outboundFile{}, err
 	}
 
 	dir := outboundDir(cfg)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", "", fmt.Errorf("creating outbound dir: %w", err)
+		return outboundFile{}, fmt.Errorf("creating outbound dir: %w", err)
 	}
 
 	ext := filepath.Ext(nameHint)
@@ -130,9 +186,9 @@ func materializeOutboundFile(cfg *Config, draftID string, req createDraftRequest
 	}
 	out := filepath.Join(dir, draftID+ext)
 	if err := os.WriteFile(out, data, 0o600); err != nil {
-		return "", "", fmt.Errorf("writing outbound file: %w", err)
+		return outboundFile{}, fmt.Errorf("writing outbound file: %w", err)
 	}
-	return out, mimeType, nil
+	return outboundFile{Path: out, MIME: mimeType, Filename: nameHint}, nil
 }
 
 // resolveMIME picks the most trustworthy answer available: an explicit
