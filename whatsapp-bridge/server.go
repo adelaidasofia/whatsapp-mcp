@@ -555,16 +555,38 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 		)
 	}
 
-	args := append(jidsToArgs(allJIDs), limit)
+	// Keyset pagination. `before` is a message ID; return messages strictly
+	// older than it, ordered by (timestamp, id) so messages sharing a
+	// one-second WhatsApp timestamp are neither skipped nor repeated across
+	// pages. `before` was already sent by the Python MCP layer but silently
+	// ignored here, so every page returned the newest slice and any chat past
+	// `limit` messages was unreachable.
+	where := fmt.Sprintf("chat_jid IN (%s)", inClausePlaceholders(len(allJIDs)))
+	args := jidsToArgs(allJIDs)
+	if before := q.Get("before"); before != "" {
+		var beforeTS int64
+		anchorArgs := append(jidsToArgs(allJIDs), before)
+		anchorQ := fmt.Sprintf("SELECT timestamp FROM messages WHERE chat_jid IN (%s) AND id = ? LIMIT 1",
+			inClausePlaceholders(len(allJIDs)))
+		if err := s.db.QueryRowContext(r.Context(), anchorQ, anchorArgs...).Scan(&beforeTS); err == nil {
+			where += " AND (timestamp < ? OR (timestamp = ? AND id < ?))"
+			args = append(args, beforeTS, beforeTS, before)
+		} else {
+			// Unknown anchor id → treat as end-of-history (return no older
+			// rows) rather than silently restarting from the newest page.
+			where += " AND 1 = 0"
+		}
+	}
+	args = append(args, limit)
 	query := fmt.Sprintf(`
 		SELECT id, chat_jid, COALESCE(sender_jid, ''), COALESCE(sender_display, ''), timestamp, type,
 		       COALESCE(scrubbed_text, COALESCE(content_text, '')),
 		       is_from_me, voice_note_transcript, COALESCE(quoted_message_id, '')
 		FROM messages
-		WHERE chat_jid IN (%s)
-		ORDER BY timestamp DESC
+		WHERE %s
+		ORDER BY timestamp DESC, id DESC
 		LIMIT ?
-	`, inClausePlaceholders(len(allJIDs)))
+	`, where)
 
 	rows, err := s.db.QueryContext(r.Context(), query, args...)
 	if err != nil {
