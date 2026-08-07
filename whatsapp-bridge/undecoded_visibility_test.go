@@ -28,12 +28,20 @@ func undecodedTestDB(t *testing.T) *sql.DB {
 	return db
 }
 
+// insertTestMessage writes a row the way a REAL writer does, deriving raw_type
+// through the same shared helper (MYC-3577). That is not incidental. Since the
+// counters now read the indexed raw_type column, any writer that sets
+// content_text without setting raw_type produces a row that is INVISIBLE to
+// /healthcheck. A helper that skipped it would model a broken writer and
+// quietly assert the wrong thing. TestEveryMarkerRowHasRawType guards the real
+// writers against the same mistake.
 func insertTestMessage(t *testing.T, db *sql.DB, id, chatJID, msgType, contentText string, ts int64) {
 	t.Helper()
 	_, err := db.Exec(
-		`INSERT INTO messages (id, chat_jid, sender_jid, sender_display, timestamp, type, content_text, is_from_me)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
-		id, chatJID, "31628239888478:3@lid", "Martha", ts, msgType, contentText)
+		`INSERT INTO messages (id, chat_jid, sender_jid, sender_display, timestamp, type, content_text, is_from_me, raw_type)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+		id, chatJID, "31628239888478:3@lid", "Martha", ts, msgType, contentText,
+		rawTypeNullable(msgType, contentText))
 	if err != nil {
 		t.Fatalf("insert message %s: %v", id, err)
 	}
@@ -117,21 +125,21 @@ func TestUndecodedStatsCountsCaughtAndLegacyRows(t *testing.T) {
 	insertTestMessage(t, db, "B8", jid, "system", "group name changed", 1784846607)
 
 	s := &Server{db: db}
-	total, byType, legacyEmpty := s.undecodedStats(context.Background())
+	st := s.undecodedStats(context.Background())
 
-	if total != 4 {
-		t.Fatalf("undecoded_total: want 4, got %d", total)
+	if st.UndecodedTotal != 4 {
+		t.Fatalf("undecoded_total: want 4, got %d", st.UndecodedTotal)
 	}
-	if byType["eventMessage"] != 2 {
-		t.Fatalf("undecoded_by_type[eventMessage]: want 2, got %d (%v)", byType["eventMessage"], byType)
+	if st.UndecodedByType["eventMessage"] != 2 {
+		t.Fatalf("undecoded_by_type[eventMessage]: want 2, got %d (%v)", st.UndecodedByType["eventMessage"], st.UndecodedByType)
 	}
-	if byType["pollUpdateMessage"] != 1 {
-		t.Fatalf("undecoded_by_type[pollUpdateMessage]: want 1, got %d (%v)", byType["pollUpdateMessage"], byType)
+	if st.UndecodedByType["pollUpdateMessage"] != 1 {
+		t.Fatalf("undecoded_by_type[pollUpdateMessage]: want 1, got %d (%v)", st.UndecodedByType["pollUpdateMessage"], st.UndecodedByType)
 	}
-	if byType["unknown"] != 1 {
-		t.Fatalf("an unsupported row with no marker must count as \"unknown\", got %v", byType)
+	if st.UndecodedByType["unknown"] != 1 {
+		t.Fatalf("an unsupported row with no marker must count as \"unknown\", got %v", st.UndecodedByType)
 	}
-	if legacyEmpty != 2 {
-		t.Fatalf("legacy_empty_system: want 2 (the backfill size), got %d", legacyEmpty)
+	if st.LegacyEmptySystem != 2 {
+		t.Fatalf("legacy_empty_system: want 2 (the backfill size), got %d", st.LegacyEmptySystem)
 	}
 }
