@@ -2,13 +2,16 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"os"
 	"regexp"
 	"strings"
 	"time"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/store"
 )
 
 // AuthState is the pairing lifecycle exposed over /api/status so a supervisor
@@ -80,6 +83,20 @@ func (b *Bridge) RunAuth(ctx context.Context) error {
 // emits ~6 rotating codes per batch then a terminal "timeout"; each timeout
 // gets a fresh batch after a short pause instead of killing the process (the
 // old behavior — users came back to a dead bridge and a stale QR).
+//
+// pairConnectTimeout bounds only the initial handshake (GetQRChannel + the
+// Connect that follows it), not the whole multi-round wait for a human to
+// scan. Connect()'s default (cli.BackgroundEventCtx) never expires on its
+// own, which is what let a real incident hang for two days: WhatsApp force-
+// logged this device out from another device, whatsmeow deleted the local
+// device row (see connectionevents.go — that deletion is unconditional for
+// any logged-out connect-failure reason), and the very next automatic
+// re-login attempt raced the delete, got a client mid-transition, and blocked
+// inside Connect() forever — no error, no log line, nothing to act on. A
+// bounded ConnectContext here guarantees this step always returns within
+// pairConnectTimeout, whatever the cause.
+const pairConnectTimeout = 45 * time.Second
+
 func (b *Bridge) loginLoop(ctx context.Context) error {
 	b.mu.Lock()
 	if b.loginRunning {
@@ -110,7 +127,10 @@ func (b *Bridge) loginLoop(ctx context.Context) error {
 			}
 			return fmt.Errorf("qr channel: %w", err)
 		}
-		if err := b.client.Connect(); err != nil {
+		connectCtx, cancel := context.WithTimeout(ctx, pairConnectTimeout)
+		err = b.client.ConnectContext(connectCtx)
+		cancel()
+		if err != nil {
 			return fmt.Errorf("connect for pairing: %w", err)
 		}
 		if round == 1 {
@@ -194,6 +214,38 @@ func (b *Bridge) loginLoop(ctx context.Context) error {
 	}
 }
 
+// isDeviceDeleted reports whether err means b.client itself is permanently
+// unusable — split out from exitIfDeviceDeleted so the matching logic is
+// testable without actually exiting the test binary.
+//
+// store.ErrDeviceDeleted is whatsmeow's own sentinel (store/store.go): once
+// Store.Delete has run, Store.Deleted latches true and every subsequent call on
+// this *whatsmeow.Client — Connect, GetQRChannel, all of it — fails the same
+// way. There is no reset; whatsmeow's own fix is a brand new device, and the
+// only place that constructs one is main.go's container.GetFirstDevice at
+// startup. Restarting the process is that fix, applied without rearchitecting
+// every direct b.client read across the codebase (sends.go, presence.go,
+// backfill.go, history_sync.go, media_download.go) into a mutex-guarded
+// accessor just to support swapping the client in place.
+//
+// Any OTHER loginLoop error (a slow network, a bad QR scan, the ordinary batch
+// timeout) does not match the sentinel and falls through untouched — this must
+// stay narrow, or a transient failure would restart the bridge for no reason.
+func isDeviceDeleted(err error) bool {
+	return err != nil && errors.Is(err, store.ErrDeviceDeleted)
+}
+
+// exitIfDeviceDeleted ends the process when loginLoop's error means b.client
+// itself is permanently unusable, so the scheduled task's crash-restart policy
+// relaunches with a fresh device instead of the loop sitting logged-out forever.
+func exitIfDeviceDeleted(err error) {
+	if !isDeviceDeleted(err) {
+		return
+	}
+	log.Printf("FATAL: %v — this device's WhatsApp session was deleted (logged out from another device) and cannot be reused; exiting so the scheduled task restarts with a fresh device (see whatsapp-autostart/start-bridge.cmd)", err)
+	os.Exit(1)
+}
+
 // SetPairPhoneOnStart arms the --pair-phone flow: the login loop requests a
 // typed pairing code for this number as soon as the pairing socket is live.
 func (b *Bridge) SetPairPhoneOnStart(phone string) {
@@ -271,6 +323,7 @@ func (b *Bridge) Reconnect(ctx context.Context) (AuthSnapshot, error) {
 	if !running {
 		go func() {
 			if err := b.loginLoop(b.rootCtx); err != nil && b.rootCtx.Err() == nil {
+				exitIfDeviceDeleted(err)
 				log.Printf("login loop ended: %v", err)
 			}
 		}()
