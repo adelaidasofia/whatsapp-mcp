@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -126,7 +125,7 @@ func (b *Bridge) loginLoop(ctx context.Context) (err error) {
 	// per-caller check is reachable only by whichever goroutine happens to own
 	// it, and after a restart that is RunAuth's, which had no check at all. One
 	// check at the source covers all three unconditionally.
-	defer func() { exitIfDeviceDeleted(err) }()
+	defer func() { b.fatalIfDeviceDeleted(err) }()
 
 	attempt := 0
 	for round := 1; ; round++ {
@@ -269,22 +268,23 @@ func isDeviceDeleted(err error) bool {
 	return err != nil && errors.Is(err, store.ErrDeviceDeleted)
 }
 
-// exitProcess is os.Exit in production. A package-level var only so a test can
-// assert that the sentinel actually reaches the exit and that a transient
-// error does not — otherwise this function is untestable by construction and
-// the wiring, which is the part that was wrong once already, goes unchecked.
-var exitProcess = os.Exit
-
-// exitIfDeviceDeleted ends the process when loginLoop's error means b.client
-// itself is permanently unusable, so the supervisor in
+// fatalIfDeviceDeleted asks for a process restart when loginLoop's error means
+// b.client is permanently unusable, so the supervisor in
 // whatsapp-autostart/start-bridge.cmd relaunches with a fresh device instead of
 // the loop sitting logged-out forever.
-func exitIfDeviceDeleted(err error) {
+//
+// It REQUESTS a shutdown rather than calling os.Exit. os.Exit would skip every
+// deferred db.Close/transcriber.Close/bridge.Disconnect in main and kill
+// in-flight HTTP handlers mid-write — including a confirm that has already
+// delivered a message to WhatsApp but not yet recorded it, which is exactly the
+// divergence sends_reconcile.go exists to clean up. Going through main's normal
+// shutdown means those defers run and the HTTP server drains first.
+func (b *Bridge) fatalIfDeviceDeleted(err error) {
 	if !isDeviceDeleted(err) {
 		return
 	}
-	log.Printf("FATAL: %v — this device's WhatsApp session was deleted (logged out from another device) and cannot be reused; exiting so the scheduled task restarts with a fresh device (see whatsapp-autostart/start-bridge.cmd)", err)
-	exitProcess(1)
+	log.Printf("FATAL: %v — this device's WhatsApp session was deleted (logged out from another device) and cannot be reused; shutting down so the supervisor restarts with a fresh device (see whatsapp-autostart/start-bridge.cmd)", err)
+	b.requestFatalShutdown()
 }
 
 // SetPairPhoneOnStart arms the --pair-phone flow: the login loop requests a

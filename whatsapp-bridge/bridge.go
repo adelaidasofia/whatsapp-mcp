@@ -38,6 +38,18 @@ type Bridge struct {
 	// holding a request-scoped ctx.
 	rootCtx context.Context
 
+	// fatal is closed once when the bridge decides it cannot continue in this
+	// process and needs a restart to recover — currently only when WhatsApp has
+	// deleted this device server-side, which permanently poisons the whatsmeow
+	// client (see fatalIfDeviceDeleted in auth.go).
+	//
+	// A channel rather than os.Exit so main() can unwind properly: os.Exit skips
+	// every deferred db.Close/transcriber.Close/bridge.Disconnect and kills
+	// in-flight HTTP handlers mid-write, including a confirm that has already
+	// delivered a message to WhatsApp but not yet recorded it.
+	fatal     chan struct{}
+	fatalOnce sync.Once
+
 	// walker drives the MYC-3284 backfill's backwards walk through chat
 	// history. See backfill_walk.go.
 	walker *backfillWalker
@@ -96,6 +108,7 @@ func NewBridge(ctx context.Context, cfg *Config, db *sql.DB, dbKey string, trans
 		rootCtx:     ctx,
 		authState:   AuthStateUnauthenticated,
 		walker:      newBackfillWalker(),
+		fatal:       make(chan struct{}),
 	}
 	client.AddEventHandler(b.handleEvent)
 	return b, nil
@@ -137,6 +150,20 @@ func (b *Bridge) DeviceJID() string {
 // in spirit, but the whatsmeow client itself is not.
 func (b *Bridge) Client() *whatsmeow.Client {
 	return b.client
+}
+
+// Fatal is closed when the bridge needs the process to restart to recover.
+// main() selects on it alongside SIGINT/SIGTERM and runs the same graceful
+// shutdown, so the exit is orderly and the exit code is non-zero.
+func (b *Bridge) Fatal() <-chan struct{} {
+	return b.fatal
+}
+
+// requestFatalShutdown closes Fatal exactly once. Safe from any goroutine and
+// safe to call repeatedly — several handlers can reach the same conclusion
+// concurrently, and a second close would panic.
+func (b *Bridge) requestFatalShutdown() {
+	b.fatalOnce.Do(func() { close(b.fatal) })
 }
 
 // IsConnected returns true when the bridge has an active whatsmeow connection
