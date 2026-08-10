@@ -185,15 +185,15 @@ func (b *Bridge) handleEvent(raw interface{}) {
 		b.pairingCode = ""
 		b.mu.Unlock()
 		log.Printf("whatsmeow: logged out; reason=%v — starting a fresh pairing flow (scan the new QR, or POST /api/auth/pair-phone)", evt.Reason)
-		// Try re-pairing on this same client first — cheap, and works when the
-		// server-side device delete (see connectionevents.go, unconditional for
-		// any logged-out reason) has already finished by the time we get here.
-		// The small delay gives that a head start, but it's a race either way:
-		// exitIfDeviceDeleted (auth.go) is what actually guarantees recovery
-		// when we lose that race and the client is left permanently unusable —
-		// a real incident hung here for two days with no error logged, because
-		// Connect() blocked forever on a client mid-transition instead of
-		// failing. See loginLoop's pairConnectTimeout comment for the timeline.
+		// whatsmeow deletes the local device row for EVERY logged-out reason
+		// (connectionevents.go calls Store.Delete right after dispatching this
+		// event), and that delete is a single local SQLite write while we wait
+		// 2s — so by the time loginLoop runs, this client is almost always
+		// already permanently unusable. Re-pairing on it is the cheap attempt,
+		// not the expected path. loginLoop's own exitIfDeviceDeleted is what
+		// guarantees recovery; it is checked there rather than here because
+		// loginLoop returns nil to this caller whenever another goroutine
+		// already owns the loop.
 		go func() {
 			select {
 			case <-b.rootCtx.Done():
@@ -201,7 +201,6 @@ func (b *Bridge) handleEvent(raw interface{}) {
 			case <-time.After(2 * time.Second):
 			}
 			if err := b.loginLoop(b.rootCtx); err != nil && b.rootCtx.Err() == nil {
-				exitIfDeviceDeleted(err)
 				log.Printf("re-login after logout failed: %v (POST /api/auth/reconnect to retry)", err)
 			}
 		}()

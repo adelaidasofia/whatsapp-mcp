@@ -84,20 +84,29 @@ func (b *Bridge) RunAuth(ctx context.Context) error {
 // gets a fresh batch after a short pause instead of killing the process (the
 // old behavior — users came back to a dead bridge and a stale QR).
 //
-// pairConnectTimeout bounds only the initial handshake (GetQRChannel + the
-// Connect that follows it), not the whole multi-round wait for a human to
-// scan. Connect()'s default (cli.BackgroundEventCtx) never expires on its
-// own, which is what let a real incident hang for two days: WhatsApp force-
-// logged this device out from another device, whatsmeow deleted the local
-// device row (see connectionevents.go — that deletion is unconditional for
-// any logged-out connect-failure reason), and the very next automatic
-// re-login attempt raced the delete, got a client mid-transition, and blocked
-// inside Connect() forever — no error, no log line, nothing to act on. A
-// bounded ConnectContext here guarantees this step always returns within
-// pairConnectTimeout, whatever the cause.
-const pairConnectTimeout = 45 * time.Second
-
-func (b *Bridge) loginLoop(ctx context.Context) error {
+// Do NOT wrap the Connect below in a bounded ConnectContext. That was tried,
+// and it broke pairing outright while every test stayed green.
+//
+// ConnectContext's ctx is the CONNECTION's lifetime context, not a handshake
+// deadline. whatsmeow stores it as framesocket.parentCtx, derives cancelCtx
+// from it for every outbound write, and passes it to readPump -> conn.Read(ctx)
+// — where coder/websocket registers context.AfterFunc(ctx, close) per read, so
+// cancelling HARD-CLOSES the socket. It also hands that ctx to
+// handlerQueueLoop, which passes it to every node handler, including the
+// pair-device and pair-success handlers whose Store.Save(ctx) is a ctx-bound
+// DB write.
+//
+// Cancelling it right after ConnectContext returns therefore kills the socket
+// ~10ms later, before the <iq> carrying the QR refs arrives one RTT away. Not
+// one QR code is ever emitted: the channel sees events.Disconnected, qrchan
+// maps that to QRChannelTimeout, and this loop logs "QR batch expired" every
+// 5s forever. Deferring the cancel to the end of the round does not help — a
+// QR batch is 60s + 5x20s = 160s, so any bound short enough to act as a
+// handshake timeout kills a legitimate human scan.
+//
+// A bound is not needed: whatsmeow already caps this step internally (30s
+// dial, 10s TLS, NoiseHandshakeResponseTimeout = 20s).
+func (b *Bridge) loginLoop(ctx context.Context) (err error) {
 	b.mu.Lock()
 	if b.loginRunning {
 		b.mu.Unlock()
@@ -111,6 +120,14 @@ func (b *Bridge) loginLoop(ctx context.Context) error {
 		b.mu.Unlock()
 	}()
 
+	// Checked here rather than at each call site. loginLoop has THREE callers
+	// (RunAuth, the LoggedOut handler in bridge.go, Reconnect) and it returns
+	// nil to a caller when another goroutine already owns the loop — so a
+	// per-caller check is reachable only by whichever goroutine happens to own
+	// it, and after a restart that is RunAuth's, which had no check at all. One
+	// check at the source covers all three unconditionally.
+	defer func() { exitIfDeviceDeleted(err) }()
+
 	attempt := 0
 	for round := 1; ; round++ {
 		select {
@@ -119,18 +136,35 @@ func (b *Bridge) loginLoop(ctx context.Context) error {
 		default:
 		}
 
-		qrChan, err := b.client.GetQRChannel(ctx)
-		if err != nil {
-			// Already-logged-in race (e.g. pairing finished between rounds).
-			if b.client.Store.ID != nil {
+		qrChan, qrErr := b.client.GetQRChannel(ctx)
+		if qrErr != nil {
+			// Returning nil here is correct ONLY for the genuine race where
+			// pairing completed between rounds — which means paired AND live.
+			// The old code checked Store.ID alone, and that is how a forced
+			// logout produced two days of total silence: Store.Delete had not
+			// landed yet, so Store.ID was still set, GetQRChannel returned
+			// ErrQRStoreContainsID, and this reported SUCCESS to a caller that
+			// then logged nothing at all.
+			if b.client.Store.ID != nil && b.client.IsConnected() {
+				b.setAuthState(AuthStatePaired)
 				return nil
 			}
-			return fmt.Errorf("qr channel: %w", err)
+			// A socket from the dead session is still up, which is why
+			// GetQRChannel refused. Drop it and take a fresh round rather than
+			// abandoning the loop.
+			if errors.Is(qrErr, whatsmeow.ErrQRAlreadyConnected) {
+				log.Printf("pairing round %d: a stale socket was still connected; dropping it and retrying", round)
+				b.client.Disconnect()
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(5 * time.Second):
+				}
+				continue
+			}
+			return fmt.Errorf("qr channel: %w", qrErr)
 		}
-		connectCtx, cancel := context.WithTimeout(ctx, pairConnectTimeout)
-		err = b.client.ConnectContext(connectCtx)
-		cancel()
-		if err != nil {
+		if err := b.client.Connect(); err != nil {
 			return fmt.Errorf("connect for pairing: %w", err)
 		}
 		if round == 1 {
@@ -235,15 +269,22 @@ func isDeviceDeleted(err error) bool {
 	return err != nil && errors.Is(err, store.ErrDeviceDeleted)
 }
 
+// exitProcess is os.Exit in production. A package-level var only so a test can
+// assert that the sentinel actually reaches the exit and that a transient
+// error does not — otherwise this function is untestable by construction and
+// the wiring, which is the part that was wrong once already, goes unchecked.
+var exitProcess = os.Exit
+
 // exitIfDeviceDeleted ends the process when loginLoop's error means b.client
-// itself is permanently unusable, so the scheduled task's crash-restart policy
-// relaunches with a fresh device instead of the loop sitting logged-out forever.
+// itself is permanently unusable, so the supervisor in
+// whatsapp-autostart/start-bridge.cmd relaunches with a fresh device instead of
+// the loop sitting logged-out forever.
 func exitIfDeviceDeleted(err error) {
 	if !isDeviceDeleted(err) {
 		return
 	}
 	log.Printf("FATAL: %v — this device's WhatsApp session was deleted (logged out from another device) and cannot be reused; exiting so the scheduled task restarts with a fresh device (see whatsapp-autostart/start-bridge.cmd)", err)
-	os.Exit(1)
+	exitProcess(1)
 }
 
 // SetPairPhoneOnStart arms the --pair-phone flow: the login loop requests a
@@ -322,8 +363,9 @@ func (b *Bridge) Reconnect(ctx context.Context) (AuthSnapshot, error) {
 	b.mu.RUnlock()
 	if !running {
 		go func() {
+			// No exitIfDeviceDeleted here: loginLoop checks it internally for
+			// all three of its callers, including the ones this short-circuits.
 			if err := b.loginLoop(b.rootCtx); err != nil && b.rootCtx.Err() == nil {
-				exitIfDeviceDeleted(err)
 				log.Printf("login loop ended: %v", err)
 			}
 		}()

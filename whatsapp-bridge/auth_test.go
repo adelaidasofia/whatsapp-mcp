@@ -48,3 +48,31 @@ func TestIsDeviceDeleted(t *testing.T) {
 		})
 	}
 }
+
+// TestExitIfDeviceDeletedWiring covers the half TestIsDeviceDeleted cannot
+// reach: that the predicate is actually wired to the exit. An adversarial
+// review pointed out that asserting errors.Is on a sentinel is close to
+// tautological — the standard library guarantees it — while the thing that had
+// genuinely been wrong in this change was the wiring around it.
+func TestExitIfDeviceDeletedWiring(t *testing.T) {
+	orig := exitProcess
+	t.Cleanup(func() { exitProcess = orig })
+
+	var codes []int
+	exitProcess = func(c int) { codes = append(codes, c) }
+
+	// Must NOT exit: nil, and transients that would otherwise restart the
+	// bridge on every flaky network blip or stale-socket round.
+	exitIfDeviceDeleted(nil)
+	exitIfDeviceDeleted(context.DeadlineExceeded)
+	exitIfDeviceDeleted(errors.New("qr channel: already connected"))
+	if len(codes) != 0 {
+		t.Fatalf("exited on a non-sentinel error: codes=%v", codes)
+	}
+
+	// Must exit, wrapped exactly the way loginLoop wraps it.
+	exitIfDeviceDeleted(fmt.Errorf("connect for pairing: %w", store.ErrDeviceDeleted))
+	if len(codes) != 1 || codes[0] != 1 {
+		t.Fatalf("expected one exit with code 1, got %v", codes)
+	}
+}
