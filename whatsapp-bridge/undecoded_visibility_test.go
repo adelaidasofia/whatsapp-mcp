@@ -73,8 +73,16 @@ func TestExportRendersUnsupportedPlaceholder(t *testing.T) {
 	insertTestMessage(t, db, "A2", jid, "system", unsupportedMarker("eventMessage"), 1784846683)
 
 	outDir := t.TempDir()
-	if _, err := exportOneChat(db, outDir, jid, "group", "Family", 3, 1784846683, "2026-07-24"); err != nil {
-		t.Fatalf("exportOneChat: %v", err)
+	unit := exportUnit{
+		members:       []string{jid},
+		primary:       jid,
+		chatType:      "group",
+		display:       "Family",
+		lastMessageTs: 1784846683,
+		filename:      "Family (group).md",
+	}
+	if _, err := exportOneUnit(db, outDir, unit, "2026-07-24"); err != nil {
+		t.Fatalf("exportOneUnit: %v", err)
 	}
 
 	var body string

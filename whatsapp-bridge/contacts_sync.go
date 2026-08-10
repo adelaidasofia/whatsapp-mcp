@@ -194,10 +194,20 @@ func (b *Bridge) addressBookNameFor(jid types.JID) string {
 //
 // Order matches what the WhatsApp client itself shows: the user's own label
 // wins, the contact's self-chosen push name is the fallback, and nothing is an
-// acceptable answer. Groups always return "" — their subject comes from history
-// sync, and a participant's name is never a group's name.
+// acceptable answer. Non-direct chats always return "" — their subject comes
+// from history sync / SyncGroupMetadata, and a participant's name is never a
+// group's (or broadcast's, or newsletter's) name.
+//
+// Gated on chatTypeFromJID rather than evt.Info.IsGroup deliberately (MYC-3555):
+// whatsmeow's IsGroup flag only covers the group-server case, but
+// chatTypeFromJID — the same function that decides the chat_type column two
+// lines below in onMessage, and the same boundary export_vault.go
+// disambiguates filenames on — treats broadcast and newsletter chats as
+// equally non-direct. A broadcast/newsletter chat named after whoever's
+// message the bridge happened to see first is the identical
+// collides-with-a-direct-chat failure a group named that way was.
 func (b *Bridge) chatNameFor(evt *events.Message) string {
-	if evt.Info.IsGroup {
+	if chatTypeFromJID(evt.Info.Chat) != "direct" {
 		return ""
 	}
 	// Keyed on the CHAT, not the sender, which is why this works where
