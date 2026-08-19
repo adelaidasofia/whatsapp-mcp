@@ -13,6 +13,12 @@ name: release-binaries
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to build and attach binaries to (e.g. v0.4.0)'
+        required: true
+        type: string
 
 permissions:
   contents: write # gh release upload
@@ -31,9 +37,16 @@ jobs:
             artifact: whatsapp-bridge-darwin-arm64
             binary: whatsapp-bridge
           # Intel Macs had NO prebuilt binary, so the "no compiler needed"
-          # install path silently did not exist for them. macos-13 is the
-          # last x86_64 image.
-          - os: macos-13
+          # install path silently did not exist for them.
+          #
+          # The label matters and is a moving target: macos-13 (the old last
+          # x86_64 image) was RETIRED in December 2025, and a job requesting a
+          # retired label does not fail — it queues forever, so the release
+          # completes with the other three binaries attached and this one
+          # simply missing. macos-15-intel is the supported x86_64 label and
+          # is scheduled to remain available until August 2027; revisit before
+          # then or Intel users silently lose their binary again.
+          - os: macos-15-intel
             artifact: whatsapp-bridge-darwin-amd64
             binary: whatsapp-bridge
           - os: windows-latest
@@ -81,7 +94,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
           ARTIFACT: ${{ matrix.artifact }}
           BINARY: ${{ matrix.binary }}
         run: |
