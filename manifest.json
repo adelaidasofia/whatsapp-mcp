@@ -2,7 +2,7 @@
   "manifest_version": "0.4",
   "name": "whatsapp-mcp",
   "display_name": "Personal WhatsApp MCP for Claude, built directly on whatsmeow",
-  "version": "0.1.0",
+  "version": "0.4.0",
   "description": "Personal WhatsApp MCP for Claude, built directly on whatsmeow. Encrypted-at-rest storage, Whisper voice-note transcription, accent-insensitive Spanish search, vault-native CRM integration, send-confirmation safety.",
   "author": {
     "name": "adelaidasofia",
@@ -27,19 +27,14 @@
     "type": "python",
     "entry_point": "whatsapp-mcp-server/main.py",
     "mcp_config": {
-      "command": "python3",
+      "command": "uv",
       "args": [
-        "${__dirname}/whatsapp-mcp-server/main.py"
+        "--directory",
+        "${__dirname}/whatsapp-mcp-server",
+        "run",
+        "main.py"
       ],
-      "env": {},
-      "platform_overrides": {
-        "win32": {
-          "command": "python",
-          "args": [
-            "${__dirname}/whatsapp-mcp-server/main.py"
-          ]
-        }
-      }
+      "env": {}
     }
   },
   "tools_generated": true,

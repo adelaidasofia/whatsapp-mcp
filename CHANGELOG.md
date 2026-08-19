@@ -6,19 +6,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-19
+
 ### Fixed
+
+- **A control character in a chat name failed the ENTIRE vault export on Windows.** `sanitizeFilename` replaced the Win32 forbidden punctuation set, appended `_` to reserved device stems, trimmed trailing dots/spaces and NFC-folded for APFS — but never stripped C0 controls. A WhatsApp group SUBJECT and a contact PUSH NAME can both contain a newline, and both are set by other people. On macOS/Linux `Team
+Standup.md` is a legal filename, so the export wrote it and the run was green; Windows rejects the path outright, the unit lands in `errs[]`, and reconciliation counts a dropped chat — which fails the whole export by design. One awkward group subject took every other chat down with it. Measured on the same commit: FAIL on Windows, `ok` on Linux.
+- **A sender-chosen message ID wrote files outside the media directory.** `media_download.go` built its output path as `filepath.Join(MediaPath, messageID+ext)` with no validation, and that ID is not ours — whatsmeow lifts it verbatim off the wire and the bridge stores it unmodified, so the SENDING client chooses it. `filepath.Join` cleans a path; it does not confine one, so `..\..\evil` escaped (and on Windows `\` separates too). `safeMediaStem` now reduces the ID to an allowlisted stem, appending a hash of the original whenever anything changed so two hostile IDs cannot collide onto one file. Benign IDs pass through byte-identical, so media already on disk still resolves.
+- **A keychain authorization prompt could hang the bridge at startup, forever (macOS/Linux).** No secret-store subprocess had a timeout, and `GetOrCreateDBKey` runs before the HTTP server binds — so a `security` or `secret-tool` call that decided it needed user authorization waited for a human indefinitely, with nothing in the log to say why. Measured on the macOS CI runner: `security add-generic-password` blocked and was killed after 9m56s. Every such call now runs under a deadline (`WHATSAPP_KEYCHAIN_TIMEOUT_SECONDS`, default 120s) — generous enough for a human to answer a real dialog, bounded so headless installs get a named error pointing at `WHATSAPP_DB_KEY`. Windows is unaffected (CredReadW/CredWriteW syscalls, not a subprocess).
+- **`scripts/check_prerequisites.sh` told people they needed Go when they did not.** It treated Go as required and exited on the FIRST miss, so anyone installing the documented way — prebuilt binary, no compiler — met the project with a red `FAIL Go not found`, and never saw the python/uv checks that actually matter. Now matches `check_prerequisites.ps1`: required = python 3.11+ and uv; go and a C compiler are source-build only; reports everything, never stops early.
+- **Shell scripts were CRLF-mangled on every Windows clone, and failed open.** With no `.gitattributes`, Git for Windows' default `core.autocrlf=true` rewrote the tracked scripts, so `set -euo pipefail` never applied and `check_prerequisites.sh` exited 0 having verified nothing. `.gitattributes` now pins `eol=lf` for text and `eol=crlf` for `.ps1`.
+- Loopback is not a trust boundary against the browser (#34): a cross-origin `Content-Type: text/plain` POST is a CORS simple request, so it is never preflighted and every state-changing route ran on the way in. Verified against the running bridge before the fix. An origin guard now refuses non-allowlisted `Origin` headers and pins `Host` to loopback literals against DNS rebinding. Non-browser clients (the Python MCP server, curl, supervisors) send no `Origin` and are unaffected; `WHATSAPP_ALLOWED_ORIGINS` allows a browser-based pairing GUI through.
+- The release smoke test could not fail — `--help 2>&1 | head -5 || true` discarded the exit status twice, so a binary that crashed on startup still shipped. It now captures the output and asserts on it.
+- `manifest.json` launched `python main.py` with no dependency resolution, failing on any machine without fastmcp/httpx/python-frontmatter/unidecode already installed. Now uses `uv run`, matching `.mcp.json`.
+- `.mcp.json` set `WHATSAPP_WHISPER_BACKEND=local-cpp` on the MCP server process, which never reads that variable (it belongs to the Go bridge) — inert, contradicting the documented `off` default, and naming a backend unavailable on Windows. Removed.
+- `.gitignore` covered `whatsapp-bridge/whatsapp-bridge` but not the Windows `.exe`, so `go build ./...` left a 45 MB untracked binary.
+
+### Added
+
+- **Prebuilt binaries for Intel Macs (`darwin-amd64`).** The release matrix built only `darwin-arm64`, so the "no compiler needed" install path silently did not exist for Intel Macs — those users were routed into a Go + Xcode source build without being told.
+- Real-Keychain round-trip test on the macOS CI leg (`keychain_darwin_test.go`), mirroring the existing Windows one. The macOS and Linux keychain tests use a PATH shim, which proves the exit-code classification but never touches a real store — so the only key store proven end to end was the one fewest users run. This test is what surfaced the startup hang above.
+- `gofmt` CI gate. Nothing checked formatting, which is how 21 of 91 tracked `.go` files drifted; all swept.
+- `WHATSAPP_ALLOWED_ORIGINS` and `WHATSAPP_KEYCHAIN_TIMEOUT_SECONDS` (both documented in `.env.example`).
+
+### Changed
+
+- Version is now sourced from one place (`whatsapp-bridge/version.go`, overridable via `-ldflags`). `/healthcheck` reported `0.3.0` while the newest tag was `v0.3.1`, `plugin.json` said `1.0.0`, `manifest.json` `0.1.0` and `pyproject.toml` `0.1.1` — five numbers, no two alike. All aligned on 0.4.0.
 
 - **A transient secret-store read failure can no longer destroy the DB key (MYC-3694).** The bridge minted a fresh SQLCipher key on ANY failed keychain read and wrote it with overwrite semantics (`security add-generic-password -U`), so a locked keychain (exit 51) silently replaced the real key and permanently orphaned the encrypted message store. Reads are now classified on all three platforms — macOS exit 44 / Windows `ERROR_NOT_FOUND` / libsecret silent miss are the only "mint" states; every other failure exits loudly, writes nothing, and names the remedy (unlock the store, or set `WHATSAPP_DB_KEY`). The macOS write dropped `-U` (create-only), and minting is refused outright while a non-empty store database exists.
 - **Vault export dropped entire direct chats and filed group chats under person names, while exiting 0 (MYC-3555).** Three interacting defects: output filenames were keyed on display name alone, so a group whose stored name was a person's push name collided with that person's direct chat on one path; the unchanged-skip trusted the `last_message_ts` of whatever file sat at the path without checking whose `jid` it carried, so an active group occupying a person's filename suppressed that person's export forever (counted as "skipped-unchanged", rc=0); and the exporter never consulted `jid_aliases`, so the LID and phone forms of the same human exported as two colliding files each holding half the history. Now: one human = one file with both JID forms merged (`alias_jids` frontmatter lists the other forms), non-direct chats always carry their type in the filename (`Name (group).md`, JID digits appended on residual collisions), the unchanged-skip only fires when the existing file provably belongs to the chat, files left under pre-fix names are healed by rename, `--export-min-messages` counts across a person's merged forms, and a run that drops any enumerated chat exits non-zero NAMING the dropped chats plus logs a machine-checkable `export: reconcile ...` counts line. rc=0 now means complete.
 - Group chats born from a live message are no longer named after whichever member sent the first message the bridge saw; the real subject and participant count now come from group metadata (startup sync + JoinedGroup event).
 - Exported group files no longer fabricate a `phone:` from the group JID (and LID digits are never rendered as a phone); `participants_count` is now populated from stored group metadata, with a distinct-sender floor as fallback instead of the old constant 0 that slid under every group-size policy.
 
-### Added
-
 - `--reconcile-vault <dir>`: offline audit of an exported vault against the bridge DB. Prints greppable `MISSING` / `MISFILED` / `DRIFT` / `DUPLICATE` / `ORPHAN` findings (chat with messages but no file; group sitting in a person-named file; file whose `message_count` disagrees with the DB; one JID claimed by two files; file whose JID left the DB) and exits non-zero when any exist. Honors the same `--export-include-groups` / `--export-min-messages` filters as the export.
 - Startup group-metadata sync (`SyncGroupMetadata`) writing every joined group's real subject + participant count into `chats`, healing rows the old live path had person-named.
-
-### Changed
 
 - `scripts/check_prerequisites.sh` no longer hard-fails on `ffmpeg` or the `sqlcipher` CLI: transcription is off by default (ffmpeg is only needed for `local-cpp`), and the bridge compiles its own SQLCipher (the CLI was never a runtime requirement — the checker itself was a leftover stuck-point). Both downgraded to warnings with accurate guidance, matching `check_prerequisites.ps1`.
 - The bridge logs one line at startup when transcription is off, so users upgrading from the old `local-cpp` default see the behavior change instead of losing transcripts silently.
@@ -27,6 +48,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Removed
 
 - Tracked `whatsapp-mcp.mcpb` at the repo root — it was a stale v0.1.x build that nothing referenced; the canonical bundle is the release asset (`releases/latest/download/whatsapp-mcp.mcpb`), rebuilt per release.
+
+### Known issues
+
+- **macOS: a Keychain prompt on the second and later boots (#70).** The stored key item is created with `-T ""` (an empty trusted-application list), which per `security(1)` removes the default trust the creating app would get — so `/usr/bin/security` may not read the key back without the user approving it. First boot mints the key and works; later boots raise a Keychain dialog. Clicking **Always Allow** once resolves it permanently. Headless installs should set `WHATSAPP_DB_KEY`. Whether to keep that posture is a security tradeoff tracked in #70; the timeout above makes either answer survivable.
 
 ## [0.2.0] - 2026-07-13
 

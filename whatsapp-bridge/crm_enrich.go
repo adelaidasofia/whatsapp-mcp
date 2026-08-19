@@ -16,8 +16,8 @@ import (
 // so WhatsApp contacts show the vault-known name instead of a raw phone number.
 //
 // Matching strategy (in order):
-//   1. Exact phone match (digits only, last 10 digits). Most reliable.
-//   2. Filename (sans .md) vs contact push_name case-insensitive substring match.
+//  1. Exact phone match (digits only, last 10 digits). Most reliable.
+//  2. Filename (sans .md) vs contact push_name case-insensitive substring match.
 //
 // Returns count of rows updated.
 //

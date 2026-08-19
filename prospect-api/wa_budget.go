@@ -13,8 +13,8 @@ import (
 // On success, inserts a row. On refusal, returns false — caller should treat
 // the ping as queued (the vault inbox file persists regardless).
 type waPingBudget struct {
-	db       *sql.DB
-	limitPH  int // pings per hour; from cfg.WhatsAppPingsPerHour
+	db      *sql.DB
+	limitPH int // pings per hour; from cfg.WhatsAppPingsPerHour
 }
 
 // CheckAndRecordPing checks the sliding-window budget and, if under the cap,

@@ -1,6 +1,6 @@
 [project]
 name = "adelaidasofia-whatsapp-mcp"
-version = "0.1.1"
+version = "0.4.0"
 description = "Python MCP server for whatsapp-mcp. Consumes the Go bridge REST API and exposes tools to Claude."
 # readme: inline text + Homepage link in [project.urls] below. The full README
 # at the repo root cannot be referenced via `readme = "../README.md"` because

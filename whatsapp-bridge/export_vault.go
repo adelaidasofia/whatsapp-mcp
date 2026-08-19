@@ -1360,6 +1360,19 @@ func sanitizeFilename(name string) string {
 		"/", "-", "\\", "-", "?", "-", "%", "-", "*", "-", ":", "-",
 		"|", "-", "\"", "-", "<", "-", ">", "-", "[", "-", "]", "-",
 	)
+	// C0 controls and DEL are legal in a POSIX filename but Win32 rejects the
+	// whole path (ERROR_INVALID_NAME), so a group subject or push name
+	// carrying a newline exported fine on macOS/Linux and failed the ENTIRE
+	// run on Windows — every such unit lands in errs[], reconciliation counts
+	// it as a dropped chat, and ExportVault returns "export incomplete".
+	// Both sources are attacker-settable, so this folds in here with the
+	// other forbidden characters rather than being trusted upstream.
+	name = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return '-'
+		}
+		return r
+	}, name)
 	cleaned := strings.TrimSpace(replacer.Replace(name))
 	// Windows refuses filenames ending in dots or spaces, and treats
 	// reserved device stems (CON, NUL, COM1…) as devices, not files.

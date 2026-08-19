@@ -14,10 +14,10 @@ type Config struct {
 	BridgeHost string
 	BridgePort int
 
-	DBPath      string
-	MediaPath   string
-	BackupPath  string
-	EncryptDB   bool
+	DBPath     string
+	MediaPath  string
+	BackupPath string
+	EncryptDB  bool
 
 	// DBKey is an explicit SQLCipher key (64 hex chars) from WHATSAPP_DB_KEY.
 	// When set it overrides the platform secret store on every OS. Never logged.
@@ -47,6 +47,12 @@ type Config struct {
 
 	WebhookURL string
 
+	// Browser origins permitted to call the loopback API. Empty by default:
+	// a non-browser client (the Python MCP server, curl, a supervisor) sends
+	// no Origin header and is unaffected. Name an origin here only when a
+	// browser-based UI must drive the bridge — see origin_guard.go.
+	AllowedOrigins []string
+
 	CaptureCalls      bool
 	CaptureReactions  bool
 	AutoDownloadMedia bool
@@ -69,33 +75,34 @@ func LoadConfig() (*Config, error) {
 	defaultRoot := filepath.Join(home, ".claude", "whatsapp-mcp")
 
 	c := &Config{
-		BridgeHost:           getenv("WHATSAPP_BRIDGE_HOST", "127.0.0.1"),
-		BridgePort:           getenvInt("WHATSAPP_BRIDGE_PORT", 8080),
-		DBPath:               expandPath(getenv("WHATSAPP_DB_PATH", filepath.Join(defaultRoot, "store", "messages.db")), home),
-		MediaPath:            expandPath(getenv("WHATSAPP_MEDIA_PATH", filepath.Join(defaultRoot, "media")), home),
-		BackupPath:           expandPath(getenv("WHATSAPP_BACKUP_PATH", filepath.Join(defaultRoot, "store", "backups")), home),
-		EncryptDB:            getenvBool("WHATSAPP_ENCRYPT_DB", true),
-		DBKey:                getenv("WHATSAPP_DB_KEY", ""),
-		KeychainService:      getenv("WHATSAPP_KEYCHAIN_SERVICE", "whatsapp-mcp"),
-		KeychainAccount:      getenv("WHATSAPP_KEYCHAIN_ACCOUNT", "default"),
-		VaultCRMPath:         expandPath(getenv("WHATSAPP_VAULT_CRM_PATH", ""), home),
+		BridgeHost:      getenv("WHATSAPP_BRIDGE_HOST", "127.0.0.1"),
+		BridgePort:      getenvInt("WHATSAPP_BRIDGE_PORT", 8080),
+		DBPath:          expandPath(getenv("WHATSAPP_DB_PATH", filepath.Join(defaultRoot, "store", "messages.db")), home),
+		MediaPath:       expandPath(getenv("WHATSAPP_MEDIA_PATH", filepath.Join(defaultRoot, "media")), home),
+		BackupPath:      expandPath(getenv("WHATSAPP_BACKUP_PATH", filepath.Join(defaultRoot, "store", "backups")), home),
+		EncryptDB:       getenvBool("WHATSAPP_ENCRYPT_DB", true),
+		DBKey:           getenv("WHATSAPP_DB_KEY", ""),
+		KeychainService: getenv("WHATSAPP_KEYCHAIN_SERVICE", "whatsapp-mcp"),
+		KeychainAccount: getenv("WHATSAPP_KEYCHAIN_ACCOUNT", "default"),
+		VaultCRMPath:    expandPath(getenv("WHATSAPP_VAULT_CRM_PATH", ""), home),
 		// "off" by default so a fresh install boots with zero config. The
 		// old default (local-cpp) demanded a ~3 GB whisper model at startup
 		// — Config.Validate refused to boot without it, stranding every new
 		// install. Transcription stays fail-loud once explicitly enabled.
-		WhisperBackend:       getenv("WHATSAPP_WHISPER_BACKEND", "off"),
-		WhisperModel:         getenv("WHATSAPP_WHISPER_MODEL", "large-v3"),
-		WhisperLanguage:      getenv("WHATSAPP_WHISPER_LANGUAGE", "es"),
-		WhisperBinPath:       getenv("WHATSAPP_WHISPER_BIN_PATH", ""),
-		WhisperModelPath:     expandPath(getenv("WHATSAPP_WHISPER_MODEL_PATH", ""), home),
-		WhisperAPIKey:        getenv("WHATSAPP_WHISPER_API_KEY", ""),
-		WhisperExcludeChats:  splitNormalizedCSV(getenv("WHATSAPP_WHISPER_EXCLUDE_CHATS", "")),
-		FFmpegBinPath:        getenv("WHATSAPP_FFMPEG_BIN_PATH", ""),
-		ScrubPromptInjection: getenvBool("WHATSAPP_SCRUB_PROMPT_INJECTION", true),
-		AuditLog:             getenvBool("WHATSAPP_AUDIT_LOG", true),
-		AuditLogPath:         expandPath(getenv("WHATSAPP_AUDIT_LOG_PATH", filepath.Join(defaultRoot, "audit.log")), home),
-		AuditLogRetention:    getenvInt("WHATSAPP_AUDIT_LOG_RETENTION_DAYS", 30),
-		WebhookURL:           getenv("WHATSAPP_WEBHOOK_URL", ""),
+		WhisperBackend:          getenv("WHATSAPP_WHISPER_BACKEND", "off"),
+		WhisperModel:            getenv("WHATSAPP_WHISPER_MODEL", "large-v3"),
+		WhisperLanguage:         getenv("WHATSAPP_WHISPER_LANGUAGE", "es"),
+		WhisperBinPath:          getenv("WHATSAPP_WHISPER_BIN_PATH", ""),
+		WhisperModelPath:        expandPath(getenv("WHATSAPP_WHISPER_MODEL_PATH", ""), home),
+		WhisperAPIKey:           getenv("WHATSAPP_WHISPER_API_KEY", ""),
+		WhisperExcludeChats:     splitNormalizedCSV(getenv("WHATSAPP_WHISPER_EXCLUDE_CHATS", "")),
+		FFmpegBinPath:           getenv("WHATSAPP_FFMPEG_BIN_PATH", ""),
+		ScrubPromptInjection:    getenvBool("WHATSAPP_SCRUB_PROMPT_INJECTION", true),
+		AuditLog:                getenvBool("WHATSAPP_AUDIT_LOG", true),
+		AuditLogPath:            expandPath(getenv("WHATSAPP_AUDIT_LOG_PATH", filepath.Join(defaultRoot, "audit.log")), home),
+		AuditLogRetention:       getenvInt("WHATSAPP_AUDIT_LOG_RETENTION_DAYS", 30),
+		WebhookURL:              getenv("WHATSAPP_WEBHOOK_URL", ""),
+		AllowedOrigins:          splitCSV(getenv("WHATSAPP_ALLOWED_ORIGINS", "")),
 		CaptureCalls:            getenvBool("WHATSAPP_CAPTURE_CALLS", true),
 		CaptureReactions:        getenvBool("WHATSAPP_CAPTURE_REACTIONS", true),
 		AutoDownloadMedia:       getenvBool("WHATSAPP_AUTO_DOWNLOAD_MEDIA", false),
@@ -150,6 +157,19 @@ func isLoopback(host string) bool {
 
 // splitNormalizedCSV parses a comma-separated env value into normalized
 // (lowercase, accent-stripped via Normalize) non-empty patterns.
+// splitCSV splits a comma-separated list WITHOUT running Normalize over it.
+// splitNormalizedCSV exists for chat names, where accent folding is the point;
+// applying it to a URL is semantically wrong and would corrupt an IDN origin.
+func splitCSV(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 func splitNormalizedCSV(s string) []string {
 	var out []string
 	for _, p := range strings.Split(s, ",") {
