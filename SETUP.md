@@ -189,6 +189,31 @@ The 8-character code prints in the terminal; on the phone use Settings › Linke
 
 The first boot also provisions the SQLCipher key (macOS shows a one-time Keychain prompt) and starts syncing message history. Leave the bridge running; it must be active whenever Claude calls the MCP.
 
+### macOS: expect one Keychain prompt on your SECOND start
+
+This is normal and it is not a failure. The bridge stores the database key in
+your login Keychain, and the item is created so that nothing can read it back
+without your say-so. Your first start mints the key and just works. The next
+time you start the bridge, macOS asks:
+
+> `security` wants to access key "whatsapp-mcp-db-key" in your keychain.
+
+Click **Always Allow** (not just "Allow" — that only covers this one start).
+You will not be asked again.
+
+If you are running the bridge somewhere with no desktop to show a dialog — over
+ssh, under launchd, in a container — nothing can answer that prompt. Set
+`WHATSAPP_DB_KEY` to a 64-hex-char key instead and the Keychain is skipped
+entirely:
+
+```bash
+openssl rand -hex 32          # generate once, then keep it somewhere safe
+export WHATSAPP_DB_KEY=<the 64 characters>
+```
+
+Losing that key makes an existing encrypted message store unreadable, so save it
+before you use it. Background and the open tradeoff: issue #70.
+
 ## 6. Register the MCP in Claude Code
 
 Add this block to your project `.mcp.json` (at the root of the project you use Claude Code in) or register user-scoped via `claude mcp add`:
