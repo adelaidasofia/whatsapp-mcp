@@ -8,7 +8,7 @@ import (
 
 // NegotiatorRequest is the public surface for /api/get-negotiator-terms.
 type NegotiatorRequest struct {
-	Category    string `json:"category"`
+	Category     string `json:"category"`
 	GuestContext string `json:"guestContext,omitempty"`
 }
 

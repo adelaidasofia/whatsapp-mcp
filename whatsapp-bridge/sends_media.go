@@ -58,9 +58,9 @@ const (
 
 // opusOggMIMEs are the containers WhatsApp accepts for a voice note as-is.
 var opusOggMIMEs = map[string]bool{
-	"audio/ogg":       true,
+	"audio/ogg":              true,
 	"audio/ogg; codecs=opus": true,
-	"audio/opus":      true,
+	"audio/opus":             true,
 }
 
 // outboundDir is where draft bytes wait between create and confirm. Kept
@@ -380,11 +380,11 @@ func transcodeToOpusOgg(ctx context.Context, ffmpegBin, src string) (string, err
 	cmd := exec.CommandContext(ctx, ffmpegBin,
 		"-y",
 		"-i", src,
-		"-vn",              // discard any cover art; a video stream breaks the ogg
-		"-ac", "1",         // WhatsApp voice notes are mono
-		"-ar", "48000",     // Opus's native rate; anything else gets resampled anyway
+		"-vn",      // discard any cover art; a video stream breaks the ogg
+		"-ac", "1", // WhatsApp voice notes are mono
+		"-ar", "48000", // Opus's native rate; anything else gets resampled anyway
 		"-c:a", "libopus",
-		"-b:a", "32k",      // what the WhatsApp client itself records at
+		"-b:a", "32k", // what the WhatsApp client itself records at
 		dst,
 	)
 	if out, err := cmd.CombinedOutput(); err != nil {

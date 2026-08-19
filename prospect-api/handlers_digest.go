@@ -39,11 +39,11 @@ type digestNoteEntry struct {
 
 // inboxFrontmatter is the minimal frontmatter we read from each inbox file.
 type inboxFrontmatter struct {
-	Category  string `yaml:"category"`
-	Urgency   string `yaml:"urgency"`
+	Category   string `yaml:"category"`
+	Urgency    string `yaml:"urgency"`
 	GuestEmail string `yaml:"guestEmail"`
 	GuestPhone string `yaml:"guestPhone"`
-	ArrivedAt string `yaml:"arrivedAt"`
+	ArrivedAt  string `yaml:"arrivedAt"`
 }
 
 // handleMorningDigest serves POST /api/morning-digest.

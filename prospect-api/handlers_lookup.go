@@ -20,8 +20,8 @@ type LookupRequest struct {
 // LookupMatch is one hit. The schema deliberately excludes lastTopic / notesPublic /
 // raw message bodies. Categorization is bounded to the Category enum.
 type LookupMatch struct {
-	Confidence int           `json:"confidence"` // 0..100
-	Record     LookupRecord  `json:"record"`
+	Confidence int          `json:"confidence"` // 0..100
+	Record     LookupRecord `json:"record"`
 }
 
 type LookupRecord struct {
@@ -42,12 +42,13 @@ type LookupResponse struct {
 
 // confidenceFor returns the rule-driven confidence given which fields matched.
 // Schema:
-//   exact email      99
-//   exact phone      95
-//   name + company   85
-//   name + WA contact 80
-//   exact name       60
-//   fuzzy name       40
+//
+//	exact email      99
+//	exact phone      95
+//	name + company   85
+//	name + WA contact 80
+//	exact name       60
+//	fuzzy name       40
 type matchKind int
 
 const (

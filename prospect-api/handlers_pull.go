@@ -15,11 +15,11 @@ import (
 // Both phone AND email (or name + email) must match the same CRM record exactly.
 // If they don't match, return 403 ErrIdentityMismatch.
 type PullContextRequest struct {
-	Phone         string `json:"phone,omitempty"`
-	Email         string `json:"email,omitempty"`
-	Name          string `json:"name,omitempty"`
-	LookbackDays  int    `json:"lookbackDays,omitempty"`
-	MaxMessages   int    `json:"maxMessages,omitempty"`
+	Phone        string `json:"phone,omitempty"`
+	Email        string `json:"email,omitempty"`
+	Name         string `json:"name,omitempty"`
+	LookbackDays int    `json:"lookbackDays,omitempty"`
+	MaxMessages  int    `json:"maxMessages,omitempty"`
 }
 
 type WhatsappContext struct {
@@ -188,10 +188,10 @@ func buildWhatsappContext(ctx context.Context, db *sql.DB, jid string, lookbackD
 	defer rows.Close()
 
 	var (
-		latestTs    int64
-		count       int
-		freq        = map[string]int{}
-		contents    []string
+		latestTs int64
+		count    int
+		freq     = map[string]int{}
+		contents []string
 	)
 	for rows.Next() {
 		var ts int64

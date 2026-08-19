@@ -140,8 +140,8 @@ func TestScrubberCleanText(t *testing.T) {
 		"happy birthday!",
 		"see you at the venue at 7",
 		"the contract terms look good to me",
-		"the assistant we hired starts monday", // contains "assistant" but not "assistant:"
-		"i was told to disregard the typo on page 4", // contains "disregard" but not the trigger phrase
+		"the assistant we hired starts monday",        // contains "assistant" but not "assistant:"
+		"i was told to disregard the typo on page 4",  // contains "disregard" but not the trigger phrase
 		"the system runs on go and python",            // contains "system" but not "system:"
 		"please reveal the price when you have a sec", // contains "reveal" but not the trigger phrase
 		"the meeting is in our system of record",      // false-positive trap
