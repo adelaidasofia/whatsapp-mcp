@@ -72,9 +72,8 @@ jobs:
         run: |
           set -uo pipefail
           out=$(./bin/${{ matrix.binary }} --help 2>&1) || true
-          printf '%s
-' "$out" | head -20
-          if ! printf '%s' "$out" | grep -q -- '-export-to-vault'; then
+          echo "$out" | head -20
+          if ! echo "$out" | grep -q -- '-export-to-vault'; then
             echo "::error::binary did not print its usage; it likely failed to start"
             exit 1
           fi
