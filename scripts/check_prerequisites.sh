@@ -1,98 +1,122 @@
 #!/usr/bin/env bash
-# check_prerequisites.sh: validate every dependency the MCP needs.
-# Exits 0 if OK, non-zero with a clear message on the first missing prereq.
+# check_prerequisites.sh: report what's present, what's required, and what's
+# only needed for source builds. Unix twin of check_prerequisites.ps1.
+#
+# Exit code: 1 if a REQUIRED tool (python 3.11+, uv) is missing; 0 otherwise.
+# Go and a C compiler are needed ONLY to build the bridge from source — the
+# prebuilt release binary needs neither.
+#
+# This deliberately does NOT stop at the first problem. The previous version
+# exited on the first missing tool, and because it also treated Go as
+# required, anyone installing from a release binary got a red "FAIL Go not
+# found" and exit 1 as their very first experience — and never saw the checks
+# for the two things they actually needed.
 
-set -euo pipefail
+set -uo pipefail
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+DIM='\033[2m'
 NC='\033[0m'
 
-ok() { echo -e "${GREEN}OK${NC} $1"; }
-warn() { echo -e "${YELLOW}WARN${NC} $1"; }
-fail() { echo -e "${RED}FAIL${NC} $1"; exit 1; }
+failures=0
 
-# Go
-if ! command -v go >/dev/null 2>&1; then
-  fail "Go not found. Install via 'brew install go' (macOS) or your platform equivalent."
-fi
-GO_VERSION=$(go version | awk '{print $3}' | sed 's/go//')
-GO_MAJOR=$(echo "$GO_VERSION" | cut -d. -f1)
-GO_MINOR=$(echo "$GO_VERSION" | cut -d. -f2)
-if [ "$GO_MAJOR" -lt 1 ] || { [ "$GO_MAJOR" -eq 1 ] && [ "$GO_MINOR" -lt 24 ]; }; then
-  fail "Go $GO_VERSION too old. Need 1.24+."
-fi
-ok "Go $GO_VERSION"
+ok()      { echo -e "  ${GREEN}OK${NC}       $1"; }
+missing() { echo -e "  ${RED}MISSING${NC}  $1"; failures=$((failures + 1)); }
+absent()  { echo -e "  ${DIM}absent${NC}   $1"; }
+note()    { echo -e "  ${YELLOW}note${NC}     $1"; }
 
-# Python
-if ! command -v python3 >/dev/null 2>&1; then
-  fail "python3 not found."
-fi
-PY_VERSION=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-PY_MAJOR=$(echo "$PY_VERSION" | cut -d. -f1)
-PY_MINOR=$(echo "$PY_VERSION" | cut -d. -f2)
-if [ "$PY_MAJOR" -lt 3 ] || { [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -lt 11 ]; }; then
-  fail "Python $PY_VERSION too old. Need 3.11+."
-fi
-ok "Python $PY_VERSION"
+# Resolve a python interpreter: python3 everywhere, python as the fallback
+# for MSYS/Git Bash where python3 often does not exist.
+PYBIN=""
+for cand in python3 python; do
+  if command -v "$cand" >/dev/null 2>&1; then PYBIN="$cand"; break; fi
+done
 
-# uv
-if ! command -v uv >/dev/null 2>&1; then
-  fail "uv not found. Install: curl -LsSf https://astral.sh/uv/install.sh | sh"
-fi
-UV_VERSION=$(uv --version | awk '{print $2}')
-ok "uv $UV_VERSION"
+echo "whatsapp-mcp prerequisites ($(uname -s))"
+echo
+echo "Required for the MCP server:"
 
-# FastMCP (via uv or system Python)
-if ! python3 -c "import fastmcp" >/dev/null 2>&1; then
-  warn "fastmcp not importable by system python3. It will be installed in the uv environment when the MCP runs; not fatal."
+if [ -z "$PYBIN" ]; then
+  missing "python    (required) -> install Python 3.11+"
 else
-  FM_VERSION=$(python3 -c "import fastmcp; print(fastmcp.__version__)")
-  ok "fastmcp $FM_VERSION (system)"
+  PY_VERSION=$("$PYBIN" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "0.0")
+  PY_MAJOR=${PY_VERSION%%.*}
+  PY_MINOR=${PY_VERSION#*.}
+  if [ "$PY_MAJOR" -lt 3 ] || { [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -lt 11 ]; }; then
+    missing "python    $PY_VERSION is too old (need 3.11+)"
+  else
+    ok "python    $PY_VERSION"
+  fi
 fi
 
-# FFmpeg (optional: only needed when WHATSAPP_WHISPER_BACKEND=local-cpp;
-# transcription defaults to off since v0.2.0)
-if ! command -v ffmpeg >/dev/null 2>&1; then
-  warn "ffmpeg not found. Only needed for voice-note transcription (WHATSAPP_WHISPER_BACKEND=local-cpp). Install via 'brew install ffmpeg' when you enable it."
+if command -v uv >/dev/null 2>&1; then
+  ok "uv        $(uv --version 2>/dev/null | awk '{print $2}')"
 else
-  FFMPEG_VERSION=$(ffmpeg -version 2>&1 | head -1 | awk '{print $3}')
-  ok "ffmpeg $FFMPEG_VERSION"
+  missing "uv        (required) -> curl -LsSf https://astral.sh/uv/install.sh | sh"
 fi
 
-# SQLCipher CLI (optional: the bridge compiles its own SQLCipher via
-# go-sqlcipher; the CLI is only a convenience for inspecting the DB by hand)
-if ! command -v sqlcipher >/dev/null 2>&1; then
-  warn "sqlcipher CLI not found (optional — the bridge bundles SQLCipher itself; the CLI just lets you inspect the encrypted DB manually)."
+echo
+echo "Required only when building the bridge from source (prebuilt release binary needs neither):"
+
+if command -v go >/dev/null 2>&1; then
+  GO_VERSION=$(go version | awk '{print $3}' | sed 's/go//')
+  GO_MAJOR=${GO_VERSION%%.*}
+  GO_REST=${GO_VERSION#*.}
+  GO_MINOR=${GO_REST%%.*}
+  if [ "$GO_MAJOR" -lt 1 ] || { [ "$GO_MAJOR" -eq 1 ] && [ "$GO_MINOR" -lt 24 ]; }; then
+    note "go        $GO_VERSION is too old for a source build (need 1.24+)"
+  else
+    ok "go        $GO_VERSION"
+  fi
 else
-  SC_VERSION=$(sqlcipher --version 2>&1 | head -1 | awk '{print $1}')
-  ok "sqlcipher $SC_VERSION"
+  absent "go        (optional) -> https://go.dev/dl/ , or 'brew install go' on macOS"
 fi
 
-# whisper.cpp (optional: only needed when WHATSAPP_WHISPER_BACKEND=local-cpp)
+if command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1 || command -v clang >/dev/null 2>&1; then
+  ok "C compiler present (needed by go-sqlcipher's cgo build)"
+else
+  absent "C compiler (optional) -> macOS: xcode-select --install ; Linux: install build-essential"
+fi
+
+echo
+echo "Optional (voice-note transcription only; off by default):"
+
+if command -v ffmpeg >/dev/null 2>&1; then
+  ok "ffmpeg    $(ffmpeg -version 2>&1 | head -1 | awk '{print $3}')"
+else
+  absent "ffmpeg    (optional) -> only for WHATSAPP_WHISPER_BACKEND=local-cpp"
+fi
+
 if command -v whisper-cli >/dev/null 2>&1; then
-  WC_VERSION=$(whisper-cli --help 2>&1 | head -1 | awk '{print $NF}' || echo "unknown")
-  ok "whisper-cli ($WC_VERSION)"
+  ok "whisper-cli present"
 elif command -v whisper-cpp >/dev/null 2>&1; then
   ok "whisper-cpp present"
 else
-  warn "whisper.cpp not found. Only needed if you enable WHATSAPP_WHISPER_BACKEND=local-cpp (off by default). Install via 'brew install whisper-cpp' then."
+  absent "whisper   (optional) -> 'brew install whisper-cpp' when you enable local-cpp"
 fi
 
-# gh (optional, only for contributors)
-if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
-  ok "gh (GitHub CLI) authenticated"
+if command -v sqlcipher >/dev/null 2>&1; then
+  ok "sqlcipher $(sqlcipher --version 2>&1 | head -1 | awk '{print $1}') (CLI, for inspecting the DB by hand)"
+else
+  absent "sqlcipher (optional) -> the bridge bundles its own; the CLI is only for manual inspection"
 fi
 
-# macOS Keychain access (only relevant on Darwin)
 if [ "$(uname -s)" = "Darwin" ]; then
+  echo
+  echo "macOS:"
   if command -v security >/dev/null 2>&1; then
-    ok "macOS 'security' CLI present (Keychain access for SQLCipher key)"
+    ok "security  CLI present (Keychain access for the SQLCipher key)"
   else
-    fail "macOS 'security' CLI not found. Expected part of macOS base system."
+    missing "security  CLI not found — expected as part of the macOS base system"
   fi
 fi
 
 echo
-ok "All prerequisites satisfied."
+if [ "$failures" -gt 0 ]; then
+  echo -e "${RED}$failures required tool(s) missing.${NC} Install them and re-run."
+  exit 1
+fi
+echo -e "${GREEN}All required tools present.${NC}"
+exit 0
