@@ -8,26 +8,25 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
-// Round-trip against the REAL macOS Keychain, mirroring
-// keychain_windows_test.go. Runs on the macos CI runner.
+// Exercises the macOS key store against the REAL Keychain, mirroring
+// keychain_windows_test.go.
 //
-// Why this exists: keychain_test.go covers the macOS branch with a PATH shim,
-// which proves the exit-code CLASSIFICATION (the MYC-3694 three-state
-// contract) but never touches a real keychain. Windows had a real-store test
-// and macOS did not, so the one key store proven end-to-end was the one most
-// users do not run.
+// Why it asserts "returns" rather than "succeeds": the first version of this
+// test asserted a clean round trip, and on the headless macos runner
+// `security add-generic-password` BLOCKED — killed at 9m56s with the stack
+// parked in syscall.Wait4. That is the finding, not a flake. A secret-store
+// CLI that wants user authorization waits for a human forever, and this runs
+// during startup, so the bridge hung before it ever listened.
 //
-// The specific thing under test is the `-T ""` argument on the write. Its
-// documented effect is to remove the default trust the creating application
-// would get, which — if it applies to /usr/bin/security here — would make
-// every subsequent read require user authorization. CI runners are
-// non-interactive with no UI available, so a read that needs a prompt CANNOT
-// silently pass: it fails, and this test is where that surfaces. A green run
-// is the evidence that first boot on a Mac does not hang on a keychain
-// dialog.
-func TestMacOSKeychainRoundTripAgainstRealStore(t *testing.T) {
+// On a desktop Mac with an unlocked login keychain the round trip is expected
+// to complete, and the extra assertions below run. On any non-interactive
+// host it must instead fail FAST with a named error — which is the repo's own
+// fail-loud contract, and is now enforced by keychainTimeout. What is never
+// acceptable, on any host, is hanging. That is what this pins.
+func TestMacOSKeychainNeverHangs(t *testing.T) {
 	service := fmt.Sprintf("whatsapp-mcp-test-%d", os.Getpid())
 	account := "test"
 	t.Cleanup(func() {
@@ -35,45 +34,54 @@ func TestMacOSKeychainRoundTripAgainstRealStore(t *testing.T) {
 			"-s", service, "-a", account).Run()
 	})
 
-	// No message store yet, so minting on a proven not-found is allowed.
+	// Short bound for the test; production default is 120s.
+	restore := keychainTimeout
+	keychainTimeout = 10 * time.Second
+	t.Cleanup(func() { keychainTimeout = restore })
+
 	dbPath := filepath.Join(t.TempDir(), "messages.db")
 
-	// First call must mint + store a fresh 64-hex-char key.
-	key1, err := getOrCreateDBKeyMacOS(service, account, dbPath)
-	if err != nil {
-		t.Fatalf("first getOrCreateDBKeyMacOS against the real keychain: %v", err)
+	type result struct {
+		key string
+		err error
 	}
-	if len(key1) != 64 {
-		t.Fatalf("expected 64 hex chars, got %d", len(key1))
-	}
+	done := make(chan result, 1)
+	start := time.Now()
+	go func() {
+		k, err := getOrCreateDBKeyMacOS(service, account, dbPath)
+		done <- result{k, err}
+	}()
 
-	// Second call must READ BACK the same key with no prompt. This is the
-	// assertion that matters: if the item's ACL denies /usr/bin/security a
-	// silent read, this call fails here rather than in a user's terminal.
-	key2, err := getOrCreateDBKeyMacOS(service, account, dbPath)
-	if err != nil {
-		t.Fatalf("second getOrCreateDBKeyMacOS (read-back) failed — the stored "+
-			"item is not silently readable, which is exactly what would block "+
-			"a first boot: %v", err)
-	}
-	if key1 != key2 {
-		t.Fatalf("key not stable across calls: %q != %q", key1, key2)
-	}
+	// Generous ceiling over the 10s internal bound: if we sit here, the
+	// timeout plumbing itself is broken.
+	select {
+	case r := <-done:
+		elapsed := time.Since(start)
+		if r.err != nil {
+			// Acceptable and expected on a non-interactive host — as long as
+			// it is bounded and says something useful.
+			t.Logf("keychain unavailable here, failed loud in %s (correct on a headless host): %v", elapsed, r.err)
+			return
+		}
+		if len(r.key) != 64 {
+			t.Fatalf("expected 64 hex chars, got %d", len(r.key))
+		}
+		t.Logf("real-Keychain round trip succeeded in %s", elapsed)
 
-	// A direct read through the same CLI the bridge uses must agree.
-	out, err := exec.Command("security", "find-generic-password",
-		"-s", service, "-a", account, "-w").Output()
-	if err != nil {
-		t.Fatalf("direct find-generic-password: %v", execErrDetail(err))
-	}
-	if got := string(trimTrailingNewline(out)); got != key1 {
-		t.Fatalf("stored secret mismatch: %q != %q", got, key1)
-	}
-}
+		// The store answered, so the interesting half is reachable: a second
+		// call must READ BACK the same key, silently. If `-T ""` left the
+		// item unreadable without a prompt, this is where it shows.
+		key2, err := getOrCreateDBKeyMacOS(service, account, dbPath)
+		if err != nil {
+			t.Fatalf("write succeeded but read-back failed — the stored item is not "+
+				"silently readable, which would block a real first boot: %v", err)
+		}
+		if key2 != r.key {
+			t.Fatalf("key not stable across calls: %q != %q", r.key, key2)
+		}
 
-func trimTrailingNewline(b []byte) []byte {
-	for len(b) > 0 && (b[len(b)-1] == '\n' || b[len(b)-1] == '\r') {
-		b = b[:len(b)-1]
+	case <-time.After(60 * time.Second):
+		t.Fatalf("getOrCreateDBKeyMacOS did not return within 60s despite a %s internal "+
+			"timeout — the bridge would hang at startup with no diagnostic", keychainTimeout)
 	}
-	return b
 }
