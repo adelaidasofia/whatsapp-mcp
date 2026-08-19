@@ -60,6 +60,21 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: echo "C:/msys64/ucrt64/bin" >> "$GITHUB_PATH"
+      - name: gofmt check
+        # 21 of 91 tracked .go files had drifted because nothing checked.
+        # Linux only: the check is platform-independent and running it on the
+        # Windows leg would fight core.autocrlf on contributors' clones.
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          unformatted=$(gofmt -l whatsapp-bridge prospect-api)
+          if [ -n "$unformatted" ]; then
+            echo "::error::these files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+          echo "gofmt clean."
+
       - name: Run go test
         working-directory: whatsapp-bridge
         shell: bash

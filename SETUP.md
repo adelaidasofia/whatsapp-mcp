@@ -14,6 +14,7 @@ Either way you'll also need **Python 3.11+** and **uv** for the MCP server layer
 Grab the binary for your OS from the [latest release](https://github.com/adelaidasofia/whatsapp-mcp/releases/latest) (releases v0.2.0 and newer carry binaries + SHA256 files):
 
 - `whatsapp-bridge-darwin-arm64` — macOS (Apple Silicon)
+- `whatsapp-bridge-darwin-amd64` — macOS (Intel)
 - `whatsapp-bridge-windows-amd64.exe` — Windows
 - `whatsapp-bridge-linux-amd64` — Linux
 
