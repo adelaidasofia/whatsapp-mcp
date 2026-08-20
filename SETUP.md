@@ -156,6 +156,12 @@ With `local-cpp` enabled, the bridge refuses to boot if the model, `whisper-cli`
 
 ## 5. Authenticate
 
+> **Do this yourself, in your own terminal.** Not through Claude, not through
+> any coding agent. The QR refreshes about every 20 seconds and typed pairing
+> codes expire just as fast, so a round trip through a chat loses the race
+> almost every time. Agents have reported "the pairing code expired" here over
+> and over for exactly this reason. It takes about thirty seconds by hand.
+
 Start the bridge in a terminal:
 
 ```bash
@@ -216,7 +222,46 @@ before you use it. Background and the open tradeoff: issue #70.
 
 ## 6. Register the MCP in Claude Code
 
-Add this block to your project `.mcp.json` (at the root of the project you use Claude Code in) or register user-scoped via `claude mcp add`:
+Use the CLI. One command, no JSON to hand-edit:
+
+```bash
+# macOS / Linux
+claude mcp add whatsapp --scope user -- uv --directory "$HOME/.claude/whatsapp-mcp/whatsapp-mcp-server" run main.py
+```
+
+```powershell
+# Windows PowerShell
+claude mcp add whatsapp --scope user -- uv --directory "$env:USERPROFILE\.claude\whatsapp-mcp\whatsapp-mcp-server" run main.py
+```
+
+Then restart Claude Code and confirm with `/mcp` — you should see `whatsapp`
+listed with its tools.
+
+`--scope user` registers it for every project, so it works no matter which
+folder you start Claude Code in. Drop it to register only for the current
+project. Everything after `--` is the launch command, passed through untouched.
+
+The bridge defaults (`127.0.0.1:8080`) already match what the MCP server
+expects, so no environment variables are needed unless you changed the port. If
+you did, or you want vault CRM injection, add them with `--env` placed after the
+server name and before `--`:
+
+```bash
+claude mcp add whatsapp --scope user --env WHATSAPP_BRIDGE_PORT=8090 -- uv --directory "$HOME/.claude/whatsapp-mcp/whatsapp-mcp-server" run main.py
+```
+
+> Why the CLI rather than the JSON below: writing to `.mcp.json` /
+> `~/.claude.json` is a file edit, and agents doing an install on your behalf
+> routinely get that blocked by a permission guardrail — correctly. The result
+> is a half-finished install where the bridge runs but Claude sees no WhatsApp
+> tools at all. `claude mcp add` writes the config itself and sidesteps that
+> whole class of failure.
+
+<details>
+<summary>Fallback: hand-write the JSON</summary>
+
+If you would rather edit the file directly, add this block to your project
+`.mcp.json` (at the root of the project you use Claude Code in):
 
 ```json
 {
@@ -252,6 +297,8 @@ Validate the JSON parses (any OS; use `python3` on macOS/Linux if `python` isn't
 python -c "import json; json.load(open('.mcp.json')); print('OK')"
 ```
 
+</details>
+
 ## 7. Restart Claude Code
 
 Close and reopen Claude Code. Verify the tools appear:
@@ -274,6 +321,61 @@ Ask Claude:
 > List my 10 most recent WhatsApp chats.
 
 Claude calls `list_chats`, the Python MCP hits the Go bridge, the bridge queries SQLite, you get a list back. If the list is empty, history is still syncing; wait a few minutes.
+
+## Keep the bridge running
+
+The bridge is an ordinary foreground process. Close the terminal and it stops,
+and every WhatsApp tool in Claude goes dead until you start it again. For
+day-to-day use, install it as a per-user background service that starts when
+you log in and restarts itself if it crashes.
+
+**Pair first** (step 5). A background service has nowhere to show a QR code.
+The installers refuse to run against a store that has never been paired; pass
+`-Force` / `--force` only if you know what you are doing.
+
+```powershell
+# Windows
+powershell -ExecutionPolicy ByPass -File scripts\install-bridge-autostart.ps1
+```
+
+```bash
+# macOS / Linux
+./scripts/install-bridge-autostart.sh
+```
+
+Check it or remove it:
+
+```powershell
+powershell -ExecutionPolicy ByPass -File scripts\install-bridge-autostart.ps1 -Status
+powershell -ExecutionPolicy ByPass -File scripts\install-bridge-autostart.ps1 -Uninstall
+```
+
+```bash
+./scripts/install-bridge-autostart.sh --status
+./scripts/install-bridge-autostart.sh --uninstall
+```
+
+Neither needs administrator rights or `sudo`; both are per-user. Windows uses a
+Scheduled Task triggered at logon, macOS a launchd LaunchAgent, Linux a systemd
+user unit. Output goes to `bridge.log` next to the store in every case.
+
+Details worth knowing:
+
+- **Windows.** The task is configured to start and keep running on battery.
+  That is not the default: a stock task refuses to start on battery power and
+  is killed when a laptop unplugs, which looks exactly like an install that
+  worked and then silently never ran.
+- **macOS.** Do one interactive start after pairing and click **Always Allow**
+  on the Keychain prompt before installing the agent (see step 5's note and
+  issue #70). A service started at login may have no way to get that dialog
+  answered, and the bridge will wait on it.
+- **Linux.** A systemd *user* unit only runs while you are logged in. For a
+  headless box that should run unattended: `sudo loginctl enable-linger $USER`.
+- **Voice notes.** Background runners inherit a stripped `PATH`, which is why
+  transcription can fail under a service with `ffmpeg: executable file not
+  found` even though ffmpeg is installed. Both installers bake a working
+  `PATH` into the service definition; if yours lives somewhere unusual, set
+  `WHATSAPP_FFMPEG_BIN_PATH` to an absolute path.
 
 ## Re-authentication
 
