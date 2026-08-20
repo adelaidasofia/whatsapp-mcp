@@ -8,7 +8,21 @@ description = "Python MCP server for whatsapp-mcp. Consumes the Go bridge REST A
 # docs/TROUBLESHOOTING.md "uv sync fails on the Python MCP server"). The
 # publish pipeline includes its own staging; this field is what local CI sees.
 readme = { text = "Python MCP server for whatsapp-mcp. The Go bridge ships separately; see the full README at https://github.com/adelaidasofia/whatsapp-mcp for install + threat model + tool reference.", content-type = "text/markdown" }
-requires-python = ">=3.11"
+# Upper bound is deliberate and load-bearing: fastmcp and python-frontmatter
+# both stop declaring support at 3.13, and the CI matrix exercises exactly this
+# range. Without a bound, `uv run` picks the newest interpreter on the machine,
+# which is how an untested 3.14 would silently become the runtime for every
+# user. Widening this range means widening the `python:` matrix in
+# .github/workflows/tests.yml in the same commit, or the new version ships
+# declared-but-never-run.
+#
+# Do NOT reintroduce a .python-version file here. One pinning 3.11 shipped from
+# the initial scaffold until 2026-08-19: because it is an exact request rather
+# than a floor, uv refused any other interpreter and downloaded a managed 3.11
+# even on machines already running 3.12. When that download failed (corporate
+# network), the MCP simply never started, with no whatsapp entry in /mcp and no
+# error pointing here. Let this range do the work instead.
+requires-python = ">=3.11,<3.14"
 license = "MIT"
 authors = [
     { name = "Adelaida Diaz-Roa" },
