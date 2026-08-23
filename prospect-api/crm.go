@@ -51,10 +51,10 @@ type CRMRecord struct {
 type CRMStore struct {
 	root string
 
-	mu        sync.RWMutex
-	byPhone   map[string]string // last-10-digits -> file path
-	byEmail   map[string]string // lowercased -> file path
-	loadedAt  time.Time
+	mu       sync.RWMutex
+	byPhone  map[string]string // last-10-digits -> file path
+	byEmail  map[string]string // lowercased -> file path
+	loadedAt time.Time
 }
 
 // NewCRMStore opens a store rooted at the configured CRM folder.
@@ -161,8 +161,9 @@ func (s *CRMStore) FindByEmail(email string) (*CRMRecord, error) {
 }
 
 // FindByName tries to locate a CRM record by name. Two passes:
-//   1. exact filename match (vault convention)
-//   2. aliases substring match within frontmatter aliases array
+//  1. exact filename match (vault convention)
+//  2. aliases substring match within frontmatter aliases array
+//
 // Returns nil, nil when nothing matches. This is the lowest-confidence match path.
 func (s *CRMStore) FindByName(name string) (*CRMRecord, error) {
 	if name == "" {
@@ -362,7 +363,7 @@ const (
 // to the handler so it can write a JSONL sidecar entry per event without
 // the CRM layer needing to know about audit infrastructure.
 type ReplaceEvent struct {
-	Field    string `json:"field"`    // "email" or "phone"
+	Field    string `json:"field"` // "email" or "phone"
 	OldValue string `json:"oldValue"`
 	NewValue string `json:"newValue"`
 }

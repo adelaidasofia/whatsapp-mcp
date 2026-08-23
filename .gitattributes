@@ -1,0 +1,16 @@
+# Git for Windows defaults to core.autocrlf=true. Without this file a Windows
+# clone rewrites every tracked text file to CRLF, which:
+#   - breaks the shipped shell scripts ("$'\r': command not found", and
+#     `set -euo pipefail` silently fails to apply so they exit 0 doing nothing),
+#   - makes `gofmt -l` report the entire tree as unformatted.
+* text=auto eol=lf
+
+*.sh    text eol=lf
+*.go    text eol=lf
+*.py    text eol=lf
+*.sql   text eol=lf
+*.ps1   text eol=crlf
+
+*.png   binary
+*.jpg   binary
+*.exe   binary

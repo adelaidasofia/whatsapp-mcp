@@ -13,6 +13,12 @@ name: release-binaries
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to build and attach binaries to (e.g. v0.4.0)'
+        required: true
+        type: string
 
 permissions:
   contents: write # gh release upload
@@ -29,6 +35,19 @@ jobs:
             binary: whatsapp-bridge
           - os: macos-latest
             artifact: whatsapp-bridge-darwin-arm64
+            binary: whatsapp-bridge
+          # Intel Macs had NO prebuilt binary, so the "no compiler needed"
+          # install path silently did not exist for them.
+          #
+          # The label matters and is a moving target: macos-13 (the old last
+          # x86_64 image) was RETIRED in December 2025, and a job requesting a
+          # retired label does not fail — it queues forever, so the release
+          # completes with the other three binaries attached and this one
+          # simply missing. macos-15-intel is the supported x86_64 label and
+          # is scheduled to remain available until August 2027; revisit before
+          # then or Intel users silently lose their binary again.
+          - os: macos-15-intel
+            artifact: whatsapp-bridge-darwin-amd64
             binary: whatsapp-bridge
           - os: windows-latest
             artifact: whatsapp-bridge-windows-amd64.exe
@@ -59,13 +78,23 @@ jobs:
       - name: Smoke the binary (runs and exits without crashing)
         working-directory: whatsapp-bridge
         shell: bash
+        # The old form was `... --help 2>&1 | head -5 || true`, which discarded
+        # the exit status twice — through the pipe and again through `|| true`.
+        # A binary that crashed on startup still shipped. Capture, then assert
+        # on content so the step can genuinely fail.
         run: |
-          ./bin/${{ matrix.binary }} --help 2>&1 | head -5 || true
+          set -uo pipefail
+          out=$(./bin/${{ matrix.binary }} --help 2>&1) || true
+          echo "$out" | head -20
+          if ! echo "$out" | grep -q -- '-export-to-vault'; then
+            echo "::error::binary did not print its usage; it likely failed to start"
+            exit 1
+          fi
       - name: Attach binary to the release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
           ARTIFACT: ${{ matrix.artifact }}
           BINARY: ${{ matrix.binary }}
         run: |

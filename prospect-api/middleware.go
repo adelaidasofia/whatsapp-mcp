@@ -88,10 +88,10 @@ func constantTimeEq(a, b string) bool {
 //   - per token (60 req/min default, applies to all endpoints)
 //   - per phone (lower; lookup-prospect only, prevents enumeration)
 type rateLimiter struct {
-	mu       sync.Mutex
-	hits     map[string][]time.Time
-	limit    int
-	window   time.Duration
+	mu     sync.Mutex
+	hits   map[string][]time.Time
+	limit  int
+	window time.Duration
 }
 
 func newRateLimiter(limit int, window time.Duration) *rateLimiter {

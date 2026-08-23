@@ -12,16 +12,16 @@ import (
 
 // InboxFileParams holds all data needed to write one inbox file.
 type InboxFileParams struct {
-	Category      string
-	GuestName     string
-	GuestEmail    string
-	GuestPhone    string
-	GuestContext  string
+	Category       string
+	GuestName      string
+	GuestEmail     string
+	GuestPhone     string
+	GuestContext   string
 	OneLineSummary string
-	Urgency       string
-	CRMRecordID   string
+	Urgency        string
+	CRMRecordID    string
 	ReasoningBrief *ReasoningBrief
-	NegTerms      *NegotiatorSection // populated by relay-note; drives Negotiation log section
+	NegTerms       *NegotiatorSection // populated by relay-note; drives Negotiation log section
 	HighConfidence bool               // true when confidence ≥ 95 AND lean = accept
 }
 

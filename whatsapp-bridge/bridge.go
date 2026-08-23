@@ -260,6 +260,13 @@ func (b *Bridge) handleEvent(raw interface{}) {
 		b.onCallOffer(evt)
 	case *events.CallTerminate:
 		b.onCallTerminate(evt)
+	case *events.JoinedGroup:
+		// Record the group's real subject + participant count the moment we
+		// join, so a group born mid-session never sits nameless (or worse,
+		// person-named) until the next startup sync. See UpsertGroupChat.
+		if err := UpsertGroupChat(b.db, &evt.GroupInfo); err != nil {
+			log.Printf("JoinedGroup: %v", err)
+		}
 	}
 }
 
@@ -297,7 +304,13 @@ func (b *Bridge) onMessage(evt *events.Message) {
 	// chatNameFor consults the user's address book before falling back to the
 	// push name, so the value written here is already the best one known — which
 	// is what keeps the COALESCE above from overwriting "Mi Amor" with the push
-	// name on the next inbound message. See contacts_sync.go.
+	// name on the next inbound message. See contacts_sync.go. Its own gate is
+	// the full non-direct surface (group, broadcast, newsletter) via
+	// chatTypeFromJID, not just IsGroup — the same boundary chatTypeFromJID
+	// draws two lines down and export_vault.go disambiguates on. MYC-3555 was
+	// a group named after a message sender colliding with that sender's own
+	// direct chat; a broadcast/newsletter chat named the same way is the
+	// identical failure shape, so it gets the identical guard.
 	var chatName, chatNameNorm sql.NullString
 	if n := b.chatNameFor(evt); n != "" {
 		chatName = sql.NullString{String: n, Valid: true}

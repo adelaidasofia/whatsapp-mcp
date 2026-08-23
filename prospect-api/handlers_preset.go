@@ -71,9 +71,9 @@ type CheckPresetRequest struct {
 }
 
 type CheckPresetResponse struct {
-	Matched   bool         `json:"matched"`
-	Preset    *PresetView  `json:"preset,omitempty"`
-	LatencyMs int64        `json:"latencyMs"`
+	Matched   bool        `json:"matched"`
+	Preset    *PresetView `json:"preset,omitempty"`
+	LatencyMs int64       `json:"latencyMs"`
 }
 
 type PresetView struct {

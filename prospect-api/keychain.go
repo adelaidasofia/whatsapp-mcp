@@ -20,7 +20,9 @@ import (
 // session). The env var path lets the user paste the key once at startup and avoid the prompt.
 //
 // To grab the key from Keychain manually for one-time env paste:
-//   security find-generic-password -s whatsapp-mcp -a default -w
+//
+//	security find-generic-password -s whatsapp-mcp -a default -w
+//
 // Then export PROSPECT_DB_KEY=<that-hex>.
 func ReadDBKey(service, account string) (string, error) {
 	if v := strings.TrimSpace(os.Getenv("PROSPECT_DB_KEY")); v != "" {

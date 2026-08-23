@@ -26,28 +26,28 @@ type createMissingCRMMode struct {
 type actionKind string
 
 const (
-	actionBackfillPhone   actionKind = "BACKFILL-PHONE"
-	actionCreate          actionKind = "CREATE"
-	actionSkipCRMPhone    actionKind = "SKIP-CRM-PHONE"
-	actionSkipLowVolume   actionKind = "SKIP-LOW-VOLUME"
-	actionSkipNotInBook   actionKind = "SKIP-NOT-IN-CONTACTS"
-	actionSkipCollision   actionKind = "SKIP-COLLISION"
-	actionSkipPathEscape  actionKind = "SKIP-PATH-ESCAPE"
+	actionBackfillPhone  actionKind = "BACKFILL-PHONE"
+	actionCreate         actionKind = "CREATE"
+	actionSkipCRMPhone   actionKind = "SKIP-CRM-PHONE"
+	actionSkipLowVolume  actionKind = "SKIP-LOW-VOLUME"
+	actionSkipNotInBook  actionKind = "SKIP-NOT-IN-CONTACTS"
+	actionSkipCollision  actionKind = "SKIP-COLLISION"
+	actionSkipPathEscape actionKind = "SKIP-PATH-ESCAPE"
 )
 
 // phoneChannel holds per-phone WhatsApp + iMessage stats for a single E.164 number.
 // One mergedContact carries 1+ phoneChannels (one per phone the person has).
 type phoneChannel struct {
-	E164      string
-	WAJID     string
+	E164       string
+	WAJID      string
 	WAPushName string
 	WAVerified string
-	WAMsgs    int
-	WALastTS  int64
-	IMHandle  string
-	IMService string // "iMessage" | "SMS"
-	IMMsgs    int
-	IMLastTS  int64
+	WAMsgs     int
+	WALastTS   int64
+	IMHandle   string
+	IMService  string // "iMessage" | "SMS"
+	IMMsgs     int
+	IMLastTS   int64
 }
 
 func (c *phoneChannel) totalMsgs() int { return c.WAMsgs + c.IMMsgs }
@@ -61,11 +61,11 @@ func (c *phoneChannel) lastTS() int64 {
 // mergedContact is one human being, identified by macOS Contacts UUID when
 // possible (so all of their phone numbers roll up to a single CRM note).
 type mergedContact struct {
-	MergeKey   string          // ZUNIQUEID if known, else phone-tail
-	PersonUUID string          // empty if not in macOS Contacts
-	SavedName  string          // canonical name from macOS Contacts.app
-	AllSavedPhones []string    // ALL phones for this person from macOS Contacts (may include numbers we have no messages on)
-	Channels   []*phoneChannel // one per E.164 we actually have messages on
+	MergeKey       string          // ZUNIQUEID if known, else phone-tail
+	PersonUUID     string          // empty if not in macOS Contacts
+	SavedName      string          // canonical name from macOS Contacts.app
+	AllSavedPhones []string        // ALL phones for this person from macOS Contacts (may include numbers we have no messages on)
+	Channels       []*phoneChannel // one per E.164 we actually have messages on
 }
 
 func (m *mergedContact) totalMessages() int {
@@ -223,9 +223,10 @@ func firstNonEmpty(ss ...string) string {
 
 // nameKey heavily normalizes a name for matching: lowercase, accent-folded,
 // emoji- and punctuation-stripped, single-spaced.
-//   "Firi 🫶🏼🫶🏼🫶🏼"     → "firi"
-//   "Angélica Barón"     → "angelica baron"
-//   "María-Paula"        → "maria paula"
+//
+//	"Firi 🫶🏼🫶🏼🫶🏼"     → "firi"
+//	"Angélica Barón"     → "angelica baron"
+//	"María-Paula"        → "maria paula"
 func nameKey(s string) string {
 	if s == "" {
 		return ""
@@ -291,16 +292,16 @@ func phoneTail(phone string) string {
 // RunCreateMissingCRM is the unified-channel CRM bootstrap subcommand.
 //
 // Pipeline:
-//   1. Load macOS Contacts → tailToPerson (phone-tail → MacPerson) and
-//      personIndex (UUID → MacPerson). One person, many phones.
-//   2. Load 1:1 WhatsApp contacts.
-//   3. Load 1:1 iMessage contacts (skipped if FDA not granted).
-//   4. Merge by macOS Contacts UUID (or phone-tail when not saved).
-//      Multiple phone numbers for one person collapse into ONE mergedContact
-//      with multiple phoneChannels.
-//   5. For each mergedContact: name-match → BACKFILL-PHONE; phone-match → SKIP;
-//      ≥6 total msgs and saved in Contacts → CREATE; else SKIP.
-//   6. Print plan + (in --apply mode) write files.
+//  1. Load macOS Contacts → tailToPerson (phone-tail → MacPerson) and
+//     personIndex (UUID → MacPerson). One person, many phones.
+//  2. Load 1:1 WhatsApp contacts.
+//  3. Load 1:1 iMessage contacts (skipped if FDA not granted).
+//  4. Merge by macOS Contacts UUID (or phone-tail when not saved).
+//     Multiple phone numbers for one person collapse into ONE mergedContact
+//     with multiple phoneChannels.
+//  5. For each mergedContact: name-match → BACKFILL-PHONE; phone-match → SKIP;
+//     ≥6 total msgs and saved in Contacts → CREATE; else SKIP.
+//  6. Print plan + (in --apply mode) write files.
 func RunCreateMissingCRM(ctx context.Context, cfg *Config, messageDB *sql.DB, crm *CRMStore, mode createMissingCRMMode) error {
 	today := time.Now().Format("2006-01-02")
 

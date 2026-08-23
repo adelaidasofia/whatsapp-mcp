@@ -53,10 +53,10 @@ func countRows(t *testing.T, db *sql.DB, table string) int {
 // Fictional JID user-portions for tests. Using the US 555-reserved range for
 // the phone form, opaque hex for the LID form. No real number referenced.
 const (
-	testPhoneUser = "15555550100"
+	testPhoneUser  = "15555550100"
 	testPhoneUser2 = "15555550101"
-	testLIDUser  = "0a1b2c3d4e5f60718293a4b5c6d7e8f9"
-	testLIDUser2 = "9f8e7d6c5b4a39281706f5e4d3c2b1a0"
+	testLIDUser    = "0a1b2c3d4e5f60718293a4b5c6d7e8f9"
+	testLIDUser2   = "9f8e7d6c5b4a39281706f5e4d3c2b1a0"
 )
 
 // --- Pure helper tests ------------------------------------------------------

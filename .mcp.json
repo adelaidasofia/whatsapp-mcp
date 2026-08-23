@@ -10,8 +10,7 @@
       ],
       "env": {
         "WHATSAPP_BRIDGE_HOST": "127.0.0.1",
-        "WHATSAPP_BRIDGE_PORT": "8080",
-        "WHATSAPP_WHISPER_BACKEND": "local-cpp"
+        "WHATSAPP_BRIDGE_PORT": "8080"
       }
     }
   }

@@ -16,9 +16,9 @@ import (
 // vault CRM notes (which mostly do not) and writes the matched phone back to the
 // CRM file's YAML frontmatter when:
 //
-//   1. The CRM record has no existing phone, AND
-//   2. The WhatsApp contact's push_name (or verified_name) matches the CRM filename
-//      OR an entry in the CRM aliases array. Match is normalized (NFD, lowercase, ASCII-fold).
+//  1. The CRM record has no existing phone, AND
+//  2. The WhatsApp contact's push_name (or verified_name) matches the CRM filename
+//     OR an entry in the CRM aliases array. Match is normalized (NFD, lowercase, ASCII-fold).
 //
 // Default mode is dry-run: prints what WOULD be written, makes zero changes. Pass
 // --apply to write. Pass --include-weak to include substring fuzzy matches (off by
@@ -40,12 +40,12 @@ const (
 )
 
 type backfillCandidate struct {
-	CRMFilePath  string
-	CRMName      string
-	WAJID        string
-	WAPushName   string
-	WAPhone      string
-	MatchKind    matchKindBackfill
+	CRMFilePath   string
+	CRMName       string
+	WAJID         string
+	WAPushName    string
+	WAPhone       string
+	MatchKind     matchKindBackfill
 	ExistingPhone string
 }
 

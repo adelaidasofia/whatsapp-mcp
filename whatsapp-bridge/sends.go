@@ -37,8 +37,8 @@ type createDraftRequest struct {
 	RecipientJID    string `json:"recipient_jid"`
 	Text            string `json:"text,omitempty"`
 	QuotedMessageID string `json:"quoted_message_id,omitempty"`
-	ReactionEmoji   string `json:"reaction_emoji,omitempty"`   // for reaction: the emoji (e.g., "❤️")
-	ReactionTarget  string `json:"reaction_target,omitempty"`  // for reaction: the message ID being reacted to
+	ReactionEmoji   string `json:"reaction_emoji,omitempty"`  // for reaction: the emoji (e.g., "❤️")
+	ReactionTarget  string `json:"reaction_target,omitempty"` // for reaction: the message ID being reacted to
 
 	// Media (send_type "file" or "audio"). Exactly one of FilePath, FileBase64
 	// or FileURL must be set: a local client can name a path on this machine, a
@@ -236,13 +236,13 @@ func (s *Server) handleCreateDraft(w http.ResponseWriter, r *http.Request) {
 // --- Confirm (commits the send) ---------------------------------------------
 
 type confirmResponse struct {
-	DraftID            string `json:"draft_id"`
-	Status             string `json:"status"`
-	WhatsAppMessageID  string `json:"whatsapp_message_id,omitempty"`
-	SentAt             int64  `json:"sent_at,omitempty"`
-	RecipientJID       string `json:"recipient_jid"`
-	RecipientDisplay   string `json:"recipient_display"`
-	Error              string `json:"error,omitempty"`
+	DraftID           string `json:"draft_id"`
+	Status            string `json:"status"`
+	WhatsAppMessageID string `json:"whatsapp_message_id,omitempty"`
+	SentAt            int64  `json:"sent_at,omitempty"`
+	RecipientJID      string `json:"recipient_jid"`
+	RecipientDisplay  string `json:"recipient_display"`
+	Error             string `json:"error,omitempty"`
 }
 
 func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {

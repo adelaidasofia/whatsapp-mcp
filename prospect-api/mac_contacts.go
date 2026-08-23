@@ -11,8 +11,8 @@ import (
 // MacPerson is a single contact card from macOS Contacts.app, with all of
 // their phone numbers grouped under one stable identity (ZUNIQUEID).
 type MacPerson struct {
-	UUID  string   // ZUNIQUEID — stable across the address book DB lifetime
-	Name  string   // best display name (FIRST + LAST → FIRST → LAST → NICKNAME → ORG)
+	UUID   string   // ZUNIQUEID — stable across the address book DB lifetime
+	Name   string   // best display name (FIRST + LAST → FIRST → LAST → NICKNAME → ORG)
 	Phones []string // unique E.164-with-leading-+ phone numbers attached to this person
 }
 

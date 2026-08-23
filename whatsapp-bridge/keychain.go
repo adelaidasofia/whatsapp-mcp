@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -10,6 +11,8 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"sync"
+	"time"
 )
 
 // GetOrCreateDBKey returns a hex-encoded 256-bit key for SQLCipher.
@@ -133,11 +136,11 @@ func getOrCreateDBKeyMacOS(service, account, dbPath string) (string, error) {
 		name:   "macOS Keychain",
 		remedy: "unlock the login keychain (`security unlock-keychain`) and retry, or set WHATSAPP_DB_KEY to the original key",
 		read: func() (string, keyReadResult, error) {
-			out, err := exec.Command("security", "find-generic-password",
+			out, err := outputWithTimeout(keychainCmd("security", "find-generic-password",
 				"-s", service,
 				"-a", account,
 				"-w",
-			).Output()
+			))
 			if err == nil {
 				return strings.TrimSpace(string(out)), keyReadOK, nil
 			}
@@ -151,7 +154,7 @@ func getOrCreateDBKeyMacOS(service, account, dbPath string) (string, error) {
 			// after a PROVEN not-found; if an item appears concurrently,
 			// exit 45 (errSecDuplicateItem) fails the write instead of
 			// silently overwriting a key we never read.
-			return runWithStderr(exec.Command("security", "add-generic-password",
+			return runWithStderr(keychainCmd("security", "add-generic-password",
 				"-s", service,
 				"-a", account,
 				"-w", key,
@@ -177,7 +180,7 @@ func getOrCreateDBKeyLinux(service, account, dbPath string) (string, error) {
 		name:   "libsecret",
 		remedy: "make sure the session keyring is unlocked and D-Bus is reachable, or set WHATSAPP_DB_KEY to the original key",
 		read: func() (string, keyReadResult, error) {
-			out, err := exec.Command("secret-tool", "lookup", "service", service, "account", account).Output()
+			out, err := outputWithTimeout(keychainCmd("secret-tool", "lookup", "service", service, "account", account))
 			if err == nil {
 				return strings.TrimSpace(string(out)), keyReadOK, nil
 			}
@@ -191,7 +194,7 @@ func getOrCreateDBKeyLinux(service, account, dbPath string) (string, error) {
 			// Reachable only after a proven not-found. secret-tool store has
 			// no create-only mode; the classification above is the guard
 			// against ever storing over an unread key.
-			cmd := exec.Command("secret-tool", "store",
+			cmd := keychainCmd("secret-tool", "store",
 				"--label", fmt.Sprintf("%s db key", service),
 				"service", service, "account", account)
 			cmd.Stdin = strings.NewReader(key)
@@ -229,10 +232,92 @@ func execErrDetail(err error) error {
 func runWithStderr(cmd *exec.Cmd) error {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		if tErr := timeoutError(cmd, err); tErr != nil {
+			return tErr
+		}
 		if msg := strings.TrimSpace(string(out)); msg != "" {
 			return fmt.Errorf("%w (%s)", err, msg)
 		}
 		return err
 	}
 	return nil
+}
+
+// keychainTimeout bounds every secret-store subprocess.
+//
+// Nothing bounded these before, and the failure that exposed it was not
+// theoretical: on a headless macOS runner `security add-generic-password`
+// BLOCKED — the test harness killed it after 9m56s, stack parked in
+// syscall.Wait4. A secret-store CLI that decides it needs user authorization
+// waits for a human forever, and because this runs during startup the whole
+// bridge hangs before it ever listens, with nothing in the log to say why.
+//
+// The window is generous on purpose: on a desktop Mac an authorization dialog
+// is a legitimate reason to wait, and a human needs time to click it. It is
+// bounded so that headless installs (launchd, systemd, containers, CI) get a
+// named error and the WHATSAPP_DB_KEY escape hatch instead of a silent hang.
+// Override with WHATSAPP_KEYCHAIN_TIMEOUT_SECONDS; tests set it low.
+var keychainTimeout = time.Duration(getenvInt("WHATSAPP_KEYCHAIN_TIMEOUT_SECONDS", 120)) * time.Second
+
+// keychainCmd builds a secret-store command whose context expires after
+// keychainTimeout. The context is kept alongside the Cmd so the failure can
+// be classified afterwards: ctx.Err() == DeadlineExceeded is the ONLY reliable
+// "it never answered" signal. ProcessState is not — a killed process still
+// reports an exit status, and a binary that does not exist never produces a
+// ProcessState at all, so classifying on it mislabels both.
+func keychainCmd(name string, args ...string) *exec.Cmd {
+	ctx, cancel := context.WithTimeout(context.Background(), keychainTimeout)
+	cmd := exec.CommandContext(ctx, name, args...)
+	// Make the kill effective even if the child ignores the first signal.
+	cmd.WaitDelay = 5 * time.Second
+	keychainCtxs.Store(cmd, &keychainCtx{ctx: ctx, cancel: cancel})
+	return cmd
+}
+
+type keychainCtx struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+var keychainCtxs sync.Map // *exec.Cmd -> *keychainCtx
+
+// releaseKeychainCtx drops the Cmd's context and reports whether the deadline
+// was what ended it.
+func releaseKeychainCtx(cmd *exec.Cmd) (deadlineExceeded bool) {
+	v, ok := keychainCtxs.LoadAndDelete(cmd)
+	if !ok {
+		return false
+	}
+	kc := v.(*keychainCtx)
+	defer kc.cancel()
+	return errors.Is(kc.ctx.Err(), context.DeadlineExceeded)
+}
+
+// timeoutError converts "we killed it because the clock ran out" into an
+// actionable message, and returns nil for every other kind of failure so the
+// caller's own error handling still applies.
+func timeoutError(cmd *exec.Cmd, _ error) error {
+	if !releaseKeychainCtx(cmd) {
+		return nil
+	}
+	return fmt.Errorf(
+		"%s did not respond within %s and was killed — the secret store is most likely "+
+			"waiting on an authorization prompt that nothing can answer here. Set "+
+			"WHATSAPP_DB_KEY to the 64-hex-char key to bypass the platform store, or run "+
+			"this once from an interactive desktop session so the prompt can be approved "+
+			"(raise WHATSAPP_KEYCHAIN_TIMEOUT_SECONDS if you need longer)",
+		cmd.Path, keychainTimeout)
+}
+
+// outputWithTimeout is Output() with the same timeout classification.
+func outputWithTimeout(cmd *exec.Cmd) ([]byte, error) {
+	out, err := cmd.Output()
+	if err != nil {
+		if tErr := timeoutError(cmd, err); tErr != nil {
+			return nil, tErr
+		}
+		return out, err
+	}
+	releaseKeychainCtx(cmd)
+	return out, nil
 }

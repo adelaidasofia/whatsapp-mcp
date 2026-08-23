@@ -29,6 +29,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -142,11 +143,11 @@ func extractDownloadableFieldsFromProto(m *waE2E.Message) (mediaFields, bool) {
 // on disk, returns the existing path without re-downloading.
 func (b *Bridge) DownloadMedia(ctx context.Context, messageID string) (path, mimeType string, size int64, err error) {
 	var (
-		msgType                          string
-		mediaPath                        sql.NullString
-		mediaKey, mediaEncSha, mediaSha  []byte
-		directPath, mediaURL, mediaMime  sql.NullString
-		fileLength, mediaKeyTimestamp    sql.NullInt64
+		msgType                         string
+		mediaPath                       sql.NullString
+		mediaKey, mediaEncSha, mediaSha []byte
+		directPath, mediaURL, mediaMime sql.NullString
+		fileLength, mediaKeyTimestamp   sql.NullInt64
 	)
 	row := b.db.QueryRowContext(ctx, `
 		SELECT type, media_path, media_key, media_direct_path, media_url,
@@ -195,7 +196,7 @@ func (b *Bridge) DownloadMedia(ctx context.Context, messageID string) (path, mim
 		return "", "", 0, fmt.Errorf("mkdir media path: %w", err)
 	}
 	ext := extensionForMime(mt, msgType)
-	outPath := filepath.Join(b.cfg.MediaPath, messageID+ext)
+	outPath := filepath.Join(b.cfg.MediaPath, safeMediaStem(messageID)+ext)
 	if err := os.WriteFile(outPath, bytes, 0o600); err != nil {
 		return "", "", 0, fmt.Errorf("write media file: %w", err)
 	}
@@ -414,4 +415,46 @@ func (s *Server) handleDownloadMedia(w http.ResponseWriter, r *http.Request) {
 		Size:      size,
 		CachedHit: cached,
 	})
+}
+
+// safeMediaStem reduces a WhatsApp message ID to a filename component that
+// cannot leave MediaPath.
+//
+// The ID is NOT ours: whatsmeow lifts it verbatim off the wire
+// (message.go `info.ID = types.MessageID(ag.String("id"))`) and bridge.go
+// stores it unmodified, so it is chosen by the SENDING client. Real IDs are
+// hex-ish, but nothing in the protocol enforces that, and filepath.Join
+// CLEANS a path rather than confining it — a stem of `..\..\evil` resolved
+// outside the media directory on Windows (where `\` separates too) and
+// `../../evil` did the same everywhere. Combined with the unauthenticated
+// loopback API (issue #34), that is an arbitrary file write with
+// attacker-supplied bytes.
+//
+// Conservative allowlist rather than a `..` blocklist: anything outside
+// [A-Za-z0-9._-] becomes `_`, leading dots are stripped so no stem can be
+// `.` or `..`, and the result is length-capped. Distinctness is preserved by
+// appending a hash of the original whenever anything changed, so two hostile
+// IDs cannot collide onto one file.
+func safeMediaStem(id string) string {
+	safe := make([]rune, 0, len(id))
+	for _, r := range id {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
+			safe = append(safe, r)
+		default:
+			safe = append(safe, '_')
+		}
+	}
+	stem := strings.TrimLeft(string(safe), ".")
+	if len(stem) > 128 {
+		stem = stem[:128]
+	}
+	if stem != id {
+		sum := sha256.Sum256([]byte(id))
+		if stem == "" {
+			stem = "media"
+		}
+		stem = fmt.Sprintf("%s-%x", stem, sum[:8])
+	}
+	return stem
 }

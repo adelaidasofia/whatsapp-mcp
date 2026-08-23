@@ -284,9 +284,73 @@ def _bridge_error(e: httpx.HTTPStatusError) -> RuntimeError:
     return RuntimeError(msg)
 
 
+def _bridge_unreachable(e: Exception) -> RuntimeError:
+    """Turn a raw socket failure into something a person can act on.
+
+    This is the most common state a fresh install lands in: the MCP server is
+    registered and its tools show up in Claude, but the Go bridge -- a
+    SEPARATE program -- was never started, or ran in a terminal that has since
+    been closed. httpx raises ConnectError for that, which is not an
+    HTTPStatusError, so it used to sail straight past _bridge_error and reach
+    the user as:
+
+        Error calling tool 'list_chats': All connection attempts failed
+
+    That names nothing: not the bridge, not the port, not the fix. The person
+    and the model then both guess, usually at the MCP config, which is the one
+    part that was already correct. Everything needed to recover is known right
+    here, so say it.
+    """
+    if sys.platform == "win32":
+        start = r'"%USERPROFILE%\.claude\whatsapp-mcp\whatsapp-bridge\bin\whatsapp-bridge.exe"'
+        autostart = r"powershell -ExecutionPolicy ByPass -File scripts\install-bridge-autostart.ps1"
+    else:
+        start = '"$HOME/.claude/whatsapp-mcp/whatsapp-bridge/bin/whatsapp-bridge"'
+        autostart = "./scripts/install-bridge-autostart.sh"
+    return RuntimeError(
+        f"Cannot reach the whatsapp-mcp bridge at {BRIDGE_BASE} ({type(e).__name__}). "
+        "The bridge is a separate program from this MCP server, and no WhatsApp tool "
+        "works until it is running.\n"
+        "\n"
+        f"Start it in a terminal:\n"
+        f"  {start}\n"
+        "\n"
+        "On a first run it prints a QR code: scan it with WhatsApp > Settings > Linked "
+        "Devices > Link a Device. Scan it in that terminal -- the code refreshes about "
+        "every 20 seconds, so it cannot be relayed through this chat.\n"
+        "\n"
+        "To stop starting it by hand every time:\n"
+        f"  {autostart}\n"
+        "\n"
+        f"If your bridge listens elsewhere, set WHATSAPP_BRIDGE_HOST / WHATSAPP_BRIDGE_PORT "
+        f"(this server is looking at {BRIDGE_HOST}:{BRIDGE_PORT})."
+    )
+
+
+def _bridge_timeout(e: Exception) -> RuntimeError:
+    """The bridge accepted the connection and then went quiet."""
+    return RuntimeError(
+        f"The whatsapp-mcp bridge at {BRIDGE_BASE} accepted the connection but did not "
+        f"answer in time ({type(e).__name__}). It is running but wedged or very busy. "
+        "Check its log (bridge.log next to the store), then restart it."
+    )
+
+
+def _transport_error(e: httpx.TransportError) -> RuntimeError:
+    """Classify a transport failure. Connect failures mean 'not running'."""
+    if isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout)):
+        return _bridge_unreachable(e)
+    if isinstance(e, httpx.TimeoutException):
+        return _bridge_timeout(e)
+    return _bridge_unreachable(e)
+
+
 async def _bridge_get(path: str, params: dict[str, Any] | None = None) -> Any:
     assert _http is not None, "http client not initialized"
-    r = await _http.get(path, params=params)
+    try:
+        r = await _http.get(path, params=params)
+    except httpx.TransportError as e:
+        raise _transport_error(e) from e
     try:
         r.raise_for_status()
     except httpx.HTTPStatusError as e:
@@ -296,7 +360,10 @@ async def _bridge_get(path: str, params: dict[str, Any] | None = None) -> Any:
 
 async def _bridge_post(path: str, body: dict[str, Any]) -> Any:
     assert _http is not None, "http client not initialized"
-    r = await _http.post(path, json=body)
+    try:
+        r = await _http.post(path, json=body)
+    except httpx.TransportError as e:
+        raise _transport_error(e) from e
     try:
         r.raise_for_status()
     except httpx.HTTPStatusError as e:

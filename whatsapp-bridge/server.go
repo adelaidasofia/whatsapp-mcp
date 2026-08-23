@@ -31,7 +31,7 @@ func NewServer(cfg *Config, db *sql.DB, bridge *Bridge, backfiller *TranscriptBa
 	s.registerRoutes()
 	s.server = &http.Server{
 		Addr:              fmt.Sprintf("%s:%d", cfg.BridgeHost, cfg.BridgePort),
-		Handler:           s.mux,
+		Handler:           newOriginGuard(s.mux, cfg.AllowedOrigins),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      60 * time.Second,
@@ -299,7 +299,7 @@ func (s *Server) handleHealthcheck(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, healthcheckResponse{
 		Status:              "ok",
 		JournalMode:         JournalMode(s.db),
-		Version:             "0.3.0",
+		Version:             bridgeVersion,
 		DBEncrypted:         s.cfg.EncryptDB,
 		SchemaVer:           schemaVer,
 		Timestamp:           time.Now().Unix(),

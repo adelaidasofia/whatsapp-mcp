@@ -21,9 +21,9 @@ const (
 
 // CategorizeContact returns the category for a given WhatsApp contact JID
 // based on:
-//   1. CRM relationship/tags hints (highest signal)
-//   2. Recent message scheduling-keyword scan
-//   3. Recent message volume (low → intro_conversation)
+//  1. CRM relationship/tags hints (highest signal)
+//  2. Recent message scheduling-keyword scan
+//  3. Recent message volume (low → intro_conversation)
 //
 // Pure deterministic. No LLM. No external calls.
 func CategorizeContact(ctx context.Context, db *sql.DB, jid string, crm *CRMRecord) Category {
