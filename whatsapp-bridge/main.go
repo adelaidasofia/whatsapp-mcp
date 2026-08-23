@@ -26,6 +26,15 @@ import (
 )
 
 func main() {
+	os.Exit(run())
+}
+
+// run is main's body, split out so the exit path is a `return` rather than
+// os.Exit. That distinction is load-bearing: os.Exit skips every deferred
+// db.Close / transcriber.Close / bridge.Disconnect below, and the fatal-shutdown
+// path (see Bridge.Fatal) needs them to actually run. main() is now the only
+// place that calls os.Exit, with a code the supervisor records.
+func run() int {
 	importBaileys := flag.String("import-baileys", "",
 		"Path to a baileys_store.json from the prior Baileys sync. If set, the bridge imports that store into SQLite and exits without connecting to WhatsApp.")
 	exportVault := flag.String("export-to-vault", "",
@@ -95,7 +104,7 @@ func main() {
 			log.Fatalf("import failed: %v", err)
 		}
 		log.Println("baileys import done")
-		return
+		return 0
 	}
 
 	// Export-only path: regenerate markdown vault files from SQLite and exit.
@@ -106,7 +115,7 @@ func main() {
 			log.Fatalf("export failed: %v", err)
 		}
 		log.Println("export done")
-		return
+		return 0
 	}
 
 	// Reconcile-only path: audit an exported vault against the DB and exit.
@@ -119,7 +128,7 @@ func main() {
 			log.Fatalf("reconcile: %d finding(s) — see report above", len(findings))
 		}
 		log.Println("reconcile clean: vault matches DB")
-		return
+		return 0
 	}
 
 	// CRM name-enrichment runs asynchronously after startup so it does not block
@@ -148,7 +157,10 @@ func main() {
 
 	bridge, err := NewBridge(ctx, cfg, db, dbKey, transcriber)
 	if err != nil {
-		log.Fatalf("bridge init: %v", err)
+		// Printf + return, not Fatalf: db and transcriber are already open above
+		// and their defers need to run.
+		log.Printf("bridge init: %v", err)
+		return 1
 	}
 	defer bridge.Disconnect()
 	if *pairPhone != "" {
@@ -214,11 +226,31 @@ func main() {
 
 	server := NewServer(cfg, db, bridge, backfiller)
 
+	// Reconcile sends interrupted by a previous run BEFORE serving. A row left
+	// 'confirmed' means the bridge stopped between delivering a message and
+	// recording it; nothing else in the codebase ever reads that state, so it
+	// would stay invisible and permanent. Startup is the only correct moment —
+	// no send can legitimately be in flight yet. See sends_reconcile.go.
+	if n, err := ReconcileInFlightSends(ctx, db); err != nil {
+		log.Printf("in-flight send reconciliation failed (continuing): %v", err)
+	} else if n > 0 {
+		log.Printf("in-flight send reconciliation: %d interrupted send(s) marked failed (NOT resent)", n)
+	}
+
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
-		sig := <-sigs
-		log.Printf("received signal %s; shutting down", sig)
+		// Fatal is the bridge asking for a restart it cannot perform itself —
+		// currently a WhatsApp-side device deletion, which poisons the whatsmeow
+		// client permanently. It takes the SAME path as a signal on purpose, so
+		// the deferred db.Close/transcriber.Close/bridge.Disconnect all run and
+		// the HTTP server drains instead of dying mid-handler.
+		select {
+		case sig := <-sigs:
+			log.Printf("received signal %s; shutting down", sig)
+		case <-bridge.Fatal():
+			log.Println("fatal condition reported; shutting down for a supervisor restart")
+		}
 		cancel()
 		bridge.Disconnect()
 		if err := server.Shutdown(); err != nil {
@@ -238,9 +270,21 @@ func main() {
 
 	log.Printf("HTTP server listening on http://%s:%d", cfg.BridgeHost, cfg.BridgePort)
 	if err := server.ListenAndServe(ctx); err != nil {
-		log.Fatalf("server: %v", err)
+		log.Printf("server: %v", err)
+		return 1
 	}
-	log.Println("bridge stopped cleanly")
+
+	// Reading the closed channel is how the exit code gets out of the shutdown
+	// goroutine without a shared variable and a data race: a channel close is a
+	// synchronisation point, and ListenAndServe has already returned by now.
+	select {
+	case <-bridge.Fatal():
+		log.Println("bridge stopped for a supervisor restart (fatal condition)")
+		return 1
+	default:
+		log.Println("bridge stopped cleanly")
+		return 0
+	}
 }
 
 // truncateForLog returns a short version of a path for logging, redacting if empty.

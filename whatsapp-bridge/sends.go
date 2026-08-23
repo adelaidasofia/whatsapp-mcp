@@ -426,9 +426,31 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 
 	sentAt := time.Now().Unix()
 	whatsappID := sendResp.ID
-	_, _ = s.db.ExecContext(r.Context(),
+
+	// PAST THE POINT OF NO RETURN: the message is delivered. Everything below is
+	// the only record that will ever exist of that, so none of it may be
+	// abandoned because the HTTP client hung up or timed out.
+	//
+	// These writes used to use r.Context(). When that was cancelled mid-send — a
+	// client disconnect, an MCP-layer timeout, or the process exiting — the send
+	// had already succeeded but the `sends` row stayed 'confirmed' forever and no
+	// `messages` row was written: the recipient has a message the local archive
+	// does not know about. This deployment's logs already show `context canceled`
+	// killing other queries, so it was never hypothetical.
+	//
+	// WithoutCancel detaches from the request; the fresh timeout keeps it
+	// bounded, so a wedged DB cannot hang the handler either. What no handler can
+	// prevent is the process stopping here — see ReconcileInFlightSends.
+	persistCtx, cancelPersist := context.WithTimeout(
+		context.WithoutCancel(r.Context()), 15*time.Second)
+	defer cancelPersist()
+
+	if _, err := s.db.ExecContext(persistCtx,
 		`UPDATE sends SET status='sent', sent_at=?, whatsapp_message_id=? WHERE draft_id=?`,
-		sentAt, whatsappID, draftID)
+		sentAt, whatsappID, draftID); err != nil {
+		// Loud: this is the row startup reconciliation will otherwise find stuck.
+		log.Printf("draft %s: SENT as %s but marking it sent FAILED: %v", draftID, whatsappID, err)
+	}
 
 	// Also persist the sent message in messages table so it shows up in chat history.
 	//
@@ -450,7 +472,7 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 	persistText, persistType := extractContentFromProto(msg)
 	mfields, _ := extractDownloadableFieldsFromProto(msg)
 	scrubbed, flags := Scrub(persistText)
-	_, err = s.db.ExecContext(r.Context(), `
+	_, err = s.db.ExecContext(persistCtx, `
 		INSERT INTO messages (id, chat_jid, sender_jid, sender_display, timestamp, type, content_text, content_normalized, is_from_me, scrubbed_text, scrub_flags_json,
 			media_key, media_direct_path, media_url, media_enc_sha256, media_sha256, media_file_length, media_key_timestamp, media_mime)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
