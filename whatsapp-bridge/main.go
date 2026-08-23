@@ -128,7 +128,7 @@ func run() int {
 			log.Fatalf("reconcile: %d finding(s) — see report above", len(findings))
 		}
 		log.Println("reconcile clean: vault matches DB")
-		return
+		return 0
 	}
 
 	// CRM name-enrichment runs asynchronously after startup so it does not block
