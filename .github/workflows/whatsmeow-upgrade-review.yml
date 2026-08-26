@@ -31,6 +31,10 @@ name: whatsmeow-upgrade-review
 
 on:
   pull_request:
+    # `labeled`/`unlabeled` matter: the review-gate job below clears itself when
+    # a maintainer adds `whatsmeow-diff-reviewed`, and without these types that
+    # label would never trigger a re-run, leaving the PR red with no way forward.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
     branches: [main]
     paths:
       - 'whatsapp-bridge/go.mod'
@@ -43,6 +47,15 @@ permissions:
   contents: read
   pull-requests: write
   issues: write
+
+concurrency:
+  # Two new trigger types (labeled/unlabeled) mean a maintainer toggling labels
+  # can queue several full runs, each doing two checkouts and a complete clone
+  # of upstream whatsmeow. Cancel superseded ones. Scoped to pull_request only:
+  # cancelling a push-to-main run would leave its checks never reporting.
+  group: whatsmeow-review-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 
 jobs:
   # The gate's own logic is gated. If the parser regresses, this job goes red
@@ -181,7 +194,10 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Post PR comment + apply review-required label
-        if: steps.pins.outputs.changed == 'yes' && github.event.pull_request.head.repo.full_name == github.repository
+        # `github.event.action` guard: without it a maintainer adding the
+        # reviewed label re-runs this step and posts a SECOND identical
+        # commit-log comment, and every later label change posts another.
+        if: steps.pins.outputs.changed == 'yes' && github.event.pull_request.head.repo.full_name == github.repository && github.event.action != 'labeled' && github.event.action != 'unlabeled'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -233,7 +249,7 @@ jobs:
           gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label whatsmeow-diff-review-required
 
       - name: Indeterminate-pin warning comment
-        if: steps.pins.outputs.changed == 'indeterminate' && github.event.pull_request.head.repo.full_name == github.repository
+        if: steps.pins.outputs.changed == 'indeterminate' && github.event.pull_request.head.repo.full_name == github.repository && github.event.action != 'labeled' && github.event.action != 'unlabeled'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -246,3 +262,63 @@ jobs:
             --description "PR moves the whatsmeow pin; manual diff review required per SECURITY.md item 6" \
             --color B60205 --force --repo "$REPO" 2>/dev/null || true
           gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label whatsmeow-diff-review-required
+
+      # -- Make a skipped gate visibly different from a passing one -----------
+      # Everything above either writes (a PR comment, a label) or writes to the
+      # run summary, and all of it is guarded on
+      # `head.repo.full_name == github.repository`, because `on: pull_request`
+      # gives a FORK PR a read-only GITHUB_TOKEN and `gh pr comment` would
+      # hard-fail. Measured on PR #74 (2026-08-25): a real four-month whatsmeow
+      # bump arrived from a fork, every write step skipped, the 104-commit log
+      # went only to the run summary, and this job reported PASS in 6 seconds.
+      # A skipped gate and a passing gate emitted the same green.
+      #
+      # This step makes those two states differ. It enforces with a READ, so it
+      # needs no token permission and behaves identically on forks and
+      # same-repo PRs. Membership is tested with `contains()` over the label
+      # ARRAY rather than by splitting a joined string in the shell: GitHub
+      # permits a comma inside a label name, so a `join(..., ',')` + split
+      # predicate really asks "does some comma-separated segment equal X",
+      # which a label literally named `zzz,whatsmeow-diff-reviewed` satisfies.
+      # `contains()` compares whole elements. It also keeps the check out of a
+      # pipeline, avoiding a `pipefail` + `grep -q` SIGPIPE hazard.
+      #
+      # WHAT THIS DOES NOT DO -- stated plainly, because a control documented
+      # as stronger than it is was the original bug:
+      #   * It does not BLOCK a merge. `main` carries no branch protection and
+      #     this check is not required, so it produces a visible red X that a
+      #     maintainer can merge straight past. Making it binding needs branch
+      #     protection plus a required check, and this workflow is
+      #     path-filtered -- a required check fed by a path-filtered workflow
+      #     never posts on PRs that miss those paths, and GitHub then parks
+      #     them at "Expected" forever. That needs an always-run shim first.
+      #   * It does not survive its own deletion. `on: pull_request` runs the
+      #     workflow file from the MERGE COMMIT, so a PR may bump the pin and
+      #     delete this step in the same commit and report green. That is a
+      #     property of every `pull_request` workflow in this repo, not of this
+      #     step, and the answer to it is branch protection plus review of
+      #     workflow changes -- not a cleverer step.
+      # Both are tracked. Neither is a reason to leave the silent-green in.
+      - name: Review gate -- pin moved, so require the diff-reviewed label
+        if: >-
+          (steps.pins.outputs.changed == 'yes' || steps.pins.outputs.changed == 'indeterminate')
+          && !contains(github.event.pull_request.labels.*.name, 'whatsmeow-diff-reviewed')
+        env:
+          CHANGED: ${{ steps.pins.outputs.changed }}
+          COMMIT_COUNT: ${{ steps.upstream.outputs.commit_count }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # The commit log lands in the run summary only when the pin parsed
+          # cleanly. On `indeterminate` there is no summary and, on a fork, no
+          # comment either -- so point at the run itself, which always exists,
+          # rather than at a summary that may not.
+          if [ "${CHANGED}" = "yes" ]; then
+            where="the commit log in this run's summary: ${RUN_URL}"
+            detail="${COMMIT_COUNT:-an unknown number of} upstream commits"
+          else
+            where="the diff yourself -- the pin could not be parsed, so no commit log was generated: ${RUN_URL}"
+            detail="an UNPARSEABLE pin (treated as needing review out of caution)"
+          fi
+          echo "::error title=whatsmeow diff review required::The whatsmeow pin moved (changed=${CHANGED}, ${detail}) and no 'whatsmeow-diff-reviewed' label is present. SECURITY.md item 6 requires a maintainer to read the upstream diff before merge. Read ${where} then add the 'whatsmeow-diff-reviewed' label to this PR, which re-runs this check and clears it."
+          exit 1
