@@ -42,6 +42,19 @@ This MCP reads and writes your personal WhatsApp. Treat it as equivalent to your
 
    Enforced by `.github/workflows/whatsmeow-upgrade-review.yml`. Any PR that modifies `whatsapp-bridge/go.mod` or `whatsapp-bridge/go.sum` is intercepted: the workflow extracts the old + new pseudo-version SHAs, clones the upstream `github.com/tulir/whatsmeow` mirror, generates the full commit log + diff stats between the two pins, posts that as a PR comment, and applies the `whatsmeow-diff-review-required` label. Reviewer must read the diff and add the `whatsmeow-diff-reviewed` label to authorize merge.
 
+   **What this control does and does not do — measured, not asserted.** On PR #74 (2026-08-25), the first real four-month bump, the interception step SKIPPED and the job still reported a green check. Cause: that step is guarded by `github.event.pull_request.head.repo.full_name == github.repository`, because `on: pull_request` hands a fork PR a read-only `GITHUB_TOKEN` and an ungated `gh pr comment` would hard-fail. It detected the change correctly (`changed=yes`, `COMMIT_COUNT: 104`) and wrote the commit log only to the run summary, where nobody looks.
+
+   A `Review gate` step now closes that specific hole: when the pin moved and no `whatsmeow-diff-reviewed` label is present, the job goes RED. It enforces with a label READ, so it behaves identically on forks and same-repo PRs, and a fork contributor cannot apply the label (that needs write access here). **A skipped gate and a passing gate no longer emit the same green.**
+
+   Two limits remain, stated plainly because overstating this control is what failed the first time:
+
+   - **It does not block a merge.** `main` carries no branch protection and this check is not required, so the red X is visible, not binding. A maintainer can merge past it.
+   - **It does not survive its own deletion.** `on: pull_request` runs the workflow file from the merge commit, so a PR could move the pin and delete the gate in the same commit. That is a property of every `pull_request` workflow here, not of this step; the answer is branch protection plus reviewing workflow changes.
+
+   **So: a red `diff-review` is real evidence that review is owed. A green one means the pin did not move, or a maintainer recorded that they read the diff — it is not proof anyone read it.**
+
+   **Current pin — disclosures.** The 2026-08-21 pin changes the local data profile in three ways worth stating plainly, given the "no telemetry" claim in item 7: upstream sets `SupportCallLogHistory = true` (`store/clientpayload.go:137`), so WhatsApp now sends **call log history** into the local store; two new secrets are written at rest in the session DB (`whatsmeow_nct_salt.salt`, an HMAC-SHA256 key, and `whatsmeow_device.companion_meta_nonce`); and the dependency gains a `static.whatsapp.net` code path, reachable only through the exported `FetchStickerPack`, which this bridge never calls. Item 7's outbound-endpoint claim is unchanged: the bridge itself still speaks only to WhatsApp's multidevice endpoint.
+
 7. **No telemetry.** Zero external network calls except:
    - WhatsApp's multidevice endpoint (required for the tool to function).
    - OpenAI Whisper API only if `WHATSAPP_WHISPER_BACKEND=openai-api` is explicitly set (default is local `whisper.cpp`).

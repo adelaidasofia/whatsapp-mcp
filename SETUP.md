@@ -77,7 +77,7 @@ sudo apt-get install golang gcc
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-**Required versions:** Go 1.24+ · Python 3.11+ · `uv` (latest). FFmpeg is only needed if you enable voice-note transcription (step 4).
+**Required versions:** Go 1.26+ · Python 3.11+ · `uv` (latest). FFmpeg is only needed if you enable voice-note transcription (step 4).
 
 Verify with the included checker:
 

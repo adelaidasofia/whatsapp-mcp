@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-08-25
+
+### Fixed
+
+- **WhatsApp stopped accepting the bridge entirely: `Client outdated (405)`.** The `whatsmeow` pin had not moved since 2026-04-21, and on 2026-08-24 WhatsApp began refusing that client build outright. The failure is quiet in the worst way: the process stays up, the HTTP API keeps answering from the local database, the device stays paired, and `/api/status` reports `authenticated: true` — only `connected` flips to `false`. whatsmeow classifies 405 as `ConnectFailureClientOutdated` and excludes it from `isRetryableConnectError`, so nothing retries and nothing recovers on its own. Every read kept working and returning real historical data while nothing new arrived. Measured on a running bridge: last ingest 2026-08-24 16:37, one `Client outdated (405) connect failure (client version: 2.3000.1037753511)` line, then no reconnect. Pin moved to `v0.0.0-20260821141805-33cfac511629` (2026-08-21); `connected: true` verified against the live socket after rebuild, with the existing session reused — **no re-pairing and no QR scan required** (#74).
+
+### Security
+
+- The bump closes an **arbitrary-host fetch** reachable from inbound message content. At the previous pin, `Download()` passed `urlable.GetURL()` — an attacker-supplied protobuf field — to `downloadAndDecrypt` for any host except `web.whatsapp.net`. Upstream commit `9ff5508` removes it. The same range adds constant-time `hmac.Equal` at six MAC sites, a Noise certificate validity window, and a fix for a reachable CBC length-check panic. Full 104-commit review recorded on #74 per SECURITY.md item 6.
+- **Disclosure, changed data profile:** upstream flips `SupportCallLogHistory` to `true` (`store/clientpayload.go:137`), so WhatsApp now sends call log history into the local store. Two new secrets are stored at rest in the session DB (`whatsmeow_nct_salt.salt`, an HMAC-SHA256 key, and `whatsmeow_device.companion_meta_nonce`). The dependency also gains a `static.whatsapp.net` code path, which this bridge never calls.
+
+### Changed
+
+- **Minimum Go for a source build is now 1.26**, up from 1.24. Not our choice: `go.mau.fi/whatsmeow` and `go.mau.fi/util` both declare `go 1.26.0`, so the module directive moved to match. `README.md` and `SETUP.md` updated. Installs using a prebuilt release binary need no compiler and are unaffected.
+- Session-store migrations `14-nct-salt.sql` and `15-companion-meta-nonce.sql` run on first start. Both are additive (`CREATE TABLE` / `ADD COLUMN`) and declare `compatible with v8+`, so an older binary still reads the store. There is no down-migration mechanism; a real rollback is a file backup.
+
 ## [0.4.0] - 2026-08-19
 
 ### Fixed
