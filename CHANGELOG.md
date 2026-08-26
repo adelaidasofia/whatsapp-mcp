@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **The `calls` table could never accept a row, on any install, since 001.** `onCallOffer` inserts `result='offered'`, but the column was declared `CHECK (result IN ('answered','missed','rejected','ended','failed'))` — 'offered' is not in that set, so every insert failed the CHECK. The handler logs the error and returns, so nothing surfaced: the process stayed healthy, `/healthcheck` stayed green, `capture_calls` kept reporting `true`, and the feature recorded nothing. Measured on a live bridge (v0.4.1, 2026-08-26): 13 consecutive `onCallOffer: insert failed: CHECK constraint failed: calls` in one startup, with `SELECT COUNT(*) FROM calls` = 0. A second defect sat underneath it: `onCallTerminate` wrote `strings.ToLower(evt.Reason)` into the same CHECKed column, and `Reason` is not an enum — whatsmeow lifts it verbatim off the wire (`call.go:92`, `cag.String("reason")`), so WhatsApp chooses the string. `timeout` and `decline` are both real values and neither was storable; that UPDATE never raised only because, with no row ever inserted, it matched zero rows and returned success. Migration 007 widens the vocabulary with `offered` and `unknown`, adds `result_raw` holding the verbatim wire reason (unconstrained, because it exists to hold what the CHECK cannot), and the terminate path now normalizes through one shared helper — the same bounded-value / preserved-source pairing `messages.raw_type` uses in 006. The CHECK is widened rather than dropped: the constraint was not the mistake, writing an unnormalized wire value into a constrained column was. A terminate with no matching call row is now logged instead of vanishing.
+
 ## [0.4.1] - 2026-08-25
 
 ### Fixed
