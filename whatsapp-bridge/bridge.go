@@ -57,6 +57,13 @@ type Bridge struct {
 	mu            sync.RWMutex
 	connected     bool
 	authenticated bool
+
+	// disconnectedSince is when the socket went down, or the zero time while it
+	// is up. Kept because connected=false alone is not actionable: the same
+	// boolean covers a two-second blip that will heal itself and a day-long
+	// outage nobody has noticed, and on 2026-08-24 it was the latter for
+	// 24 hours with nothing able to tell the difference. See watchdog.go.
+	disconnectedSince time.Time
 	deviceJID     string
 	lastSyncTime  time.Time
 
@@ -139,6 +146,19 @@ func (b *Bridge) Status() (connected, authed bool, deviceJID string, lastSync in
 	return b.connected, b.authenticated, b.deviceJID, ls
 }
 
+// DisconnectedFor returns how long the WhatsApp socket has been down, or 0
+// while it is up (or was never connected). Read by the watchdog and surfaced on
+// /api/status, so a caller asking "is this healthy" gets a duration rather than
+// a boolean that cannot distinguish a blip from a day.
+func (b *Bridge) DisconnectedFor() time.Duration {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.connected || b.disconnectedSince.IsZero() {
+		return 0
+	}
+	return time.Since(b.disconnectedSince)
+}
+
 func (b *Bridge) DeviceJID() string {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
@@ -192,6 +212,7 @@ func (b *Bridge) handleEvent(raw interface{}) {
 	case *events.Connected:
 		b.mu.Lock()
 		b.connected = true
+		b.disconnectedSince = time.Time{}
 		if b.authenticated {
 			b.authState = AuthStatePaired
 		}
@@ -200,6 +221,14 @@ func (b *Bridge) handleEvent(raw interface{}) {
 	case *events.Disconnected:
 		b.mu.Lock()
 		b.connected = false
+		// Only on the FIRST disconnect of an outage. whatsmeow emits this event
+		// repeatedly while it retries, and overwriting the timestamp each time
+		// would restart the clock on every failed attempt — the duration would
+		// never grow past one retry interval, and a day-long outage would look
+		// like a fresh one forever.
+		if b.disconnectedSince.IsZero() {
+			b.disconnectedSince = time.Now()
+		}
 		b.mu.Unlock()
 		log.Println("whatsmeow: disconnected")
 	case *events.LoggedOut:
