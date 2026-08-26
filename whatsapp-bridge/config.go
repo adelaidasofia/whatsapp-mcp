@@ -19,6 +19,12 @@ type Config struct {
 	BackupPath string
 	EncryptDB  bool
 
+	// BackupIntervalHours is how often the store is snapshotted into
+	// BackupPath; 0 disables backups. BackupKeep is how many snapshots survive
+	// retention. See backup.go.
+	BackupIntervalHours int
+	BackupKeep          int
+
 	// DBKey is an explicit SQLCipher key (64 hex chars) from WHATSAPP_DB_KEY.
 	// When set it overrides the platform secret store on every OS. Never logged.
 	DBKey string
@@ -75,16 +81,18 @@ func LoadConfig() (*Config, error) {
 	defaultRoot := filepath.Join(home, ".claude", "whatsapp-mcp")
 
 	c := &Config{
-		BridgeHost:      getenv("WHATSAPP_BRIDGE_HOST", "127.0.0.1"),
-		BridgePort:      getenvInt("WHATSAPP_BRIDGE_PORT", 8080),
-		DBPath:          expandPath(getenv("WHATSAPP_DB_PATH", filepath.Join(defaultRoot, "store", "messages.db")), home),
-		MediaPath:       expandPath(getenv("WHATSAPP_MEDIA_PATH", filepath.Join(defaultRoot, "media")), home),
-		BackupPath:      expandPath(getenv("WHATSAPP_BACKUP_PATH", filepath.Join(defaultRoot, "store", "backups")), home),
-		EncryptDB:       getenvBool("WHATSAPP_ENCRYPT_DB", true),
-		DBKey:           getenv("WHATSAPP_DB_KEY", ""),
-		KeychainService: getenv("WHATSAPP_KEYCHAIN_SERVICE", "whatsapp-mcp"),
-		KeychainAccount: getenv("WHATSAPP_KEYCHAIN_ACCOUNT", "default"),
-		VaultCRMPath:    expandPath(getenv("WHATSAPP_VAULT_CRM_PATH", ""), home),
+		BridgeHost:          getenv("WHATSAPP_BRIDGE_HOST", "127.0.0.1"),
+		BridgePort:          getenvInt("WHATSAPP_BRIDGE_PORT", 8080),
+		DBPath:              expandPath(getenv("WHATSAPP_DB_PATH", filepath.Join(defaultRoot, "store", "messages.db")), home),
+		MediaPath:           expandPath(getenv("WHATSAPP_MEDIA_PATH", filepath.Join(defaultRoot, "media")), home),
+		BackupPath:          expandPath(getenv("WHATSAPP_BACKUP_PATH", filepath.Join(defaultRoot, "store", "backups")), home),
+		BackupIntervalHours: getenvInt("WHATSAPP_BACKUP_INTERVAL_HOURS", 24),
+		BackupKeep:          getenvInt("WHATSAPP_BACKUP_KEEP", 7),
+		EncryptDB:           getenvBool("WHATSAPP_ENCRYPT_DB", true),
+		DBKey:               getenv("WHATSAPP_DB_KEY", ""),
+		KeychainService:     getenv("WHATSAPP_KEYCHAIN_SERVICE", "whatsapp-mcp"),
+		KeychainAccount:     getenv("WHATSAPP_KEYCHAIN_ACCOUNT", "default"),
+		VaultCRMPath:        expandPath(getenv("WHATSAPP_VAULT_CRM_PATH", ""), home),
 		// "off" by default so a fresh install boots with zero config. The
 		// old default (local-cpp) demanded a ~3 GB whisper model at startup
 		// — Config.Validate refused to boot without it, stranding every new
