@@ -90,6 +90,35 @@ jobs:
             echo "::error::binary did not print its usage; it likely failed to start"
             exit 1
           fi
+      - name: Assert the artifact is the architecture its name claims
+        working-directory: whatsapp-bridge
+        shell: bash
+        # A build that silently emits the HOST architecture is the obvious
+        # failure mode here, and it would ship looking perfectly correct:
+        # right filename, right size, runs fine on the machine that built it,
+        # completely broken for the users it was named after. `file` is the
+        # cheapest thing that tells those two apart. Skipped on Windows --
+        # `file` is not on that image, and windows-amd64 has no sibling
+        # architecture it could be confused with.
+        if: runner.os != 'Windows'
+        env:
+          BINARY: ${{ matrix.binary }}
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          set -euo pipefail
+          desc=$(file -b "bin/${BINARY}")
+          echo "file: ${desc}"
+          case "${ARTIFACT}" in
+            *-amd64) want='x86[-_]64' ;;
+            *-arm64) want='arm64|aarch64' ;;
+            *) echo "::error::artifact ${ARTIFACT} has no architecture suffix to verify"; exit 1 ;;
+          esac
+          if ! printf '%s' "${desc}" | grep -qE "${want}"; then
+            echo "::error::${ARTIFACT} is not ${want} -- file reports: ${desc}"
+            exit 1
+          fi
+          echo "architecture matches the artifact name."
+
       - name: Attach binary to the release
         shell: bash
         env:
@@ -101,3 +130,51 @@ jobs:
           cp "whatsapp-bridge/bin/${BINARY}" "${ARTIFACT}"
           shasum -a 256 "${ARTIFACT}" > "${ARTIFACT}.sha256" 2>/dev/null || sha256sum "${ARTIFACT}" > "${ARTIFACT}.sha256"
           gh release upload "${TAG}" "${ARTIFACT}" "${ARTIFACT}.sha256" --clobber
+
+  # -- The release has not happened until every promised asset is attached ----
+  # `fail-fast: false` above is deliberate: one broken target should not deny
+  # the other three their binaries. The cost is that a leg which is cancelled,
+  # times out, or queues forever leaves the release PUBLISHED and looking
+  # healthy with an asset simply absent, while the release notes still promise
+  # it. That is exactly how v0.4.0 shipped without its Intel Mac binary while
+  # SETUP.md and the notes both advertised one: every Intel user following the
+  # documented install path got a 404, and nothing anywhere was red (MYC-4033).
+  #
+  # `if: always()` is load-bearing. Without it this job is SKIPPED whenever a
+  # matrix leg fails, which is precisely the case it exists to catch.
+  verify-release-assets:
+    name: verify every promised asset is attached
+    needs: build
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Assert all four binaries and their checksums are on the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          expected='whatsapp-bridge-linux-amd64 whatsapp-bridge-darwin-arm64 whatsapp-bridge-darwin-amd64 whatsapp-bridge-windows-amd64.exe'
+
+          actual=$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name')
+          echo "attached assets:"
+          printf '%s\n' "$actual" | sed 's/^/  /'
+
+          missing=0
+          for name in $expected; do
+            for want in "$name" "$name.sha256"; do
+              if ! printf '%s\n' "$actual" | grep -qxF "$want"; then
+                echo "::error title=Release asset missing::${want} is promised by the install docs but is not attached to ${TAG}"
+                missing=1
+              fi
+            done
+          done
+
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::Release ${TAG} is incomplete. Re-run the failed matrix leg, or dispatch this workflow with tag=${TAG}, then re-check."
+            exit 1
+          fi
+          echo "all expected assets present on ${TAG}."
