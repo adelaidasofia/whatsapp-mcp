@@ -349,12 +349,21 @@ type statusResponse struct {
 	QRExpiresAt        int64  `json:"qr_expires_at,omitempty"`
 	PairingCodePending bool   `json:"pairing_code_pending,omitempty"`
 	LoggedOutReason    string `json:"logged_out_reason,omitempty"`
+
+	// Last error whatsmeow itself logged. When connected is false — or when
+	// server-side calls fail while auth_state still says paired — this is the
+	// reason. See clientlog.go.
+	LastClientError   string `json:"last_client_error,omitempty"`
+	LastClientErrorAt int64  `json:"last_client_error_at,omitempty"`
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	connected, authed, deviceJID, lastSync := s.bridge.Status()
 	snap := s.bridge.AuthSnapshot()
+	lastErr, lastErrAt := s.bridge.LastClientError()
 	resp := statusResponse{
+		LastClientError:    lastErr,
+		LastClientErrorAt:  lastErrAt,
 		Connected:          connected,
 		Authenticated:      authed,
 		DeviceJID:          deviceJID,
