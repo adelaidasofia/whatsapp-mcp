@@ -27,6 +27,7 @@ import logging
 import os
 import sys
 import time
+import unicodedata
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -430,6 +431,50 @@ async def search_contacts(query: str, limit: int = 10) -> dict[str, Any]:
         raise
 
 
+def _fold(s: str) -> str:
+    """Lowercase, strip accents. /api/groups does no name normalization at
+    all (unlike GET /api/contacts/search, which normalizes server-side), so
+    this reimplements the same fold class locally."""
+    return "".join(
+        c for c in unicodedata.normalize("NFD", s.lower()) if not unicodedata.combining(c)
+    )
+
+
+@mcp.tool()
+async def search_groups(query: str, limit: int = 10) -> dict[str, Any]:
+    """Find WhatsApp groups by name. Accent-insensitive, case-insensitive
+    substring match. Unlike list_chats, this sees every JOINED group, not
+    only ones with recent message history — list_chats only surfaces chats
+    with traffic (often a few dozen), while a real account can belong to
+    hundreds of groups with no recent activity.
+
+    Participant phone numbers are NEVER returned by this tool. GET /api/groups
+    includes every member's phone number for every group in the response;
+    this tool strips that so a name lookup can't leak it. Use list_messages
+    on the matched jid if you need to look inside the chat.
+    """
+    start = time.time()
+    params: dict[str, Any] = {"q": query, "limit": limit}
+    try:
+        result = await _bridge_get("/api/groups")
+        groups = result.get("groups", [])
+        needle = _fold(query)
+        matches = [g for g in groups if needle in _fold(g.get("name") or "")]
+        trimmed = [
+            {
+                "jid": g.get("jid"),
+                "name": g.get("name"),
+                "participant_count": g.get("participant_count"),
+            }
+            for g in matches[: max(limit, 0)]
+        ]
+        _audit("search_groups", params, f"{len(trimmed)} matches", int((time.time() - start) * 1000))
+        return {"groups": trimmed, "count": len(trimmed), "total_joined": len(groups)}
+    except Exception as e:  # noqa: BLE001
+        _audit("search_groups", params, "failed", int((time.time() - start) * 1000), error=str(e))
+        raise
+
+
 @mcp.tool()
 async def list_messages(
     chat_jid: str,
@@ -480,6 +525,64 @@ async def list_messages(
         return result
     except Exception as e:  # noqa: BLE001
         _audit("list_messages", params, "failed", int((time.time() - start) * 1000), error=str(e))
+        raise
+
+
+@mcp.tool()
+async def download_media(message_id: str) -> dict[str, Any]:
+    """Download and decrypt the media (image, document, video) attached to a
+    message, saving it to disk under the bridge's media folder. Returns the
+    LOCAL FILE PATH and mime type, NOT the bytes — read the path with a file
+    tool. cached_hit is true if this message's media was already downloaded
+    by an earlier call.
+
+    Args:
+        message_id: A message ID from list_messages — one with a media type
+            (image/document/video) and no content_text.
+    """
+    start = time.time()
+    body = {"message_id": message_id}
+    try:
+        result = await _bridge_post("/api/media/download", body)
+        _audit("download_media", body, f"{result.get('size', 0)} bytes -> {result.get('path')}",
+               int((time.time() - start) * 1000))
+        return result
+    except Exception as e:  # noqa: BLE001
+        _audit("download_media", body, "failed", int((time.time() - start) * 1000), error=str(e))
+        raise
+
+
+@mcp.tool()
+async def request_history(chat_jid: str, count: int = 20) -> dict[str, Any]:
+    """Ask WhatsApp for OLDER messages in a chat than what auto-synced. This
+    is a REAL, asynchronous request to WhatsApp's servers — not instant and
+    not free of traffic. The response only confirms the request was SENT;
+    older messages typically land within a few seconds and become visible
+    via list_messages(chat_jid, before=<the chat's current oldest message
+    id>) once they arrive — there is no separate "done" signal to poll.
+    Media in the newly-arrived messages is metadata-only until download_media
+    is called per message.
+
+    Args:
+        chat_jid: The chat or group JID to request older history for.
+        count: How many older messages to request.
+    """
+    start = time.time()
+    body = {"chat_jid": chat_jid, "count": count}
+    try:
+        result = await _bridge_post("/api/admin/request-history", body)
+        result["hint"] = (
+            "Delivered asynchronously, usually within a few seconds. Call "
+            "list_messages(chat_jid, before=<previous oldest message id>) "
+            "once landed \u2014 there is no separate completion signal. Media in "
+            "the new messages is metadata-only until download_media is "
+            "called per message."
+        )
+        _audit("request_history", body, f"requested {count} for {chat_jid}",
+               int((time.time() - start) * 1000))
+        return result
+    except Exception as e:  # noqa: BLE001
+        _audit("request_history", body, "failed", int((time.time() - start) * 1000), error=str(e))
         raise
 
 
