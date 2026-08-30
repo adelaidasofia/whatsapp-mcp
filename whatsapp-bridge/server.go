@@ -349,6 +349,13 @@ type statusResponse struct {
 	QRExpiresAt        int64  `json:"qr_expires_at,omitempty"`
 	PairingCodePending bool   `json:"pairing_code_pending,omitempty"`
 	LoggedOutReason    string `json:"logged_out_reason,omitempty"`
+	// DisconnectedSeconds is how long the WhatsApp socket has been down, absent
+	// while it is up. `connected: false` on its own cannot distinguish a
+	// two-second blip from the 24-hour outage of 2026-08-24, and an AI agent
+	// reading this endpoint reported "authenticated but disconnected" without
+	// being able to say it had been that way for a day. The duration is what
+	// makes the state actionable. See watchdog.go.
+	DisconnectedSeconds int64 `json:"disconnected_seconds,omitempty"`
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -369,6 +376,9 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	if !snap.QRExpiresAt.IsZero() && snap.QRCode != "" {
 		resp.QRExpiresAt = snap.QRExpiresAt.Unix()
+	}
+	if down := s.bridge.DisconnectedFor(); down > 0 {
+		resp.DisconnectedSeconds = int64(down.Seconds())
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

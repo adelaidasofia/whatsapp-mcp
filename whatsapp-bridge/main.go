@@ -175,6 +175,14 @@ func run() int {
 	go backfiller.Run(ctx)
 	log.Printf("transcript backfiller started: interval=%ds window=%dd", cfg.BackfillIntervalSeconds, cfg.BackfillWindowDays)
 
+	// Disconnection watchdog. Reports — and slowly retries — a WhatsApp socket
+	// that has been down long enough to not be ordinary churn. It deliberately
+	// never restarts the process: short disconnects heal themselves in seconds,
+	// and the failure this exists for (a client version WhatsApp refuses) is one
+	// no restart can fix. See watchdog.go.
+	go bridge.RunDisconnectionWatchdog(ctx)
+	log.Printf("disconnection watchdog started: reports after %s, then retries on a widening schedule", watchdogGrace)
+
 	// JID-alias backfill. Asks whatsmeow's local LID store for the alt form of
 	// every contact and records it in jid_aliases. Also repairs the legacy
 	// "LID stored as phone" rows. Runs once at startup, async so it can't

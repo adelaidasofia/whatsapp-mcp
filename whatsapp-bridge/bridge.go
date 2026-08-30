@@ -57,8 +57,15 @@ type Bridge struct {
 	mu            sync.RWMutex
 	connected     bool
 	authenticated bool
-	deviceJID     string
-	lastSyncTime  time.Time
+
+	// disconnectedSince is when the socket went down, or the zero time while it
+	// is up. Kept because connected=false alone is not actionable: the same
+	// boolean covers a two-second blip that will heal itself and a day-long
+	// outage nobody has noticed, and on 2026-08-24 it was the latter for
+	// 24 hours with nothing able to tell the difference. See watchdog.go.
+	disconnectedSince time.Time
+	deviceJID         string
+	lastSyncTime      time.Time
 
 	// Auth lifecycle surfaced over /api/status + /api/auth/* (see auth.go).
 	authState        AuthState
@@ -106,9 +113,16 @@ func NewBridge(ctx context.Context, cfg *Config, db *sql.DB, dbKey string, trans
 		client:      client,
 		transcriber: transcriber,
 		rootCtx:     ctx,
-		authState:   AuthStateUnauthenticated,
-		walker:      newBackfillWalker(),
-		fatal:       make(chan struct{}),
+		// Treat "not connected yet" as an outage that started now. Without this
+		// the clock only ever started on an events.Disconnected, so a bridge that
+		// never managed its FIRST connection reported 0 seconds down forever and
+		// the watchdog skipped it entirely — which is exactly what happened on
+		// 2026-08-28, when the logon-triggered task fired before DNS was up.
+		// Cleared on the first successful connect.
+		disconnectedSince: time.Now(),
+		authState:         AuthStateUnauthenticated,
+		walker:            newBackfillWalker(),
+		fatal:             make(chan struct{}),
 	}
 	client.AddEventHandler(b.handleEvent)
 	return b, nil
@@ -137,6 +151,27 @@ func (b *Bridge) Status() (connected, authed bool, deviceJID string, lastSync in
 		ls = b.lastSyncTime.Unix()
 	}
 	return b.connected, b.authenticated, b.deviceJID, ls
+}
+
+// HasDeviceIdentity reports whether this client is paired — whether whatsmeow's
+// store still holds a device. It is the durable fact behind "should this bridge
+// be connected right now", and unlike the `authenticated` flag it is true even
+// before the first successful connection of a run.
+func (b *Bridge) HasDeviceIdentity() bool {
+	return b.client != nil && b.client.Store != nil && b.client.Store.ID != nil
+}
+
+// DisconnectedFor returns how long the WhatsApp socket has been down, or 0
+// while it is up (or was never connected). Read by the watchdog and surfaced on
+// /api/status, so a caller asking "is this healthy" gets a duration rather than
+// a boolean that cannot distinguish a blip from a day.
+func (b *Bridge) DisconnectedFor() time.Duration {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.connected || b.disconnectedSince.IsZero() {
+		return 0
+	}
+	return time.Since(b.disconnectedSince)
 }
 
 func (b *Bridge) DeviceJID() string {
@@ -192,6 +227,24 @@ func (b *Bridge) handleEvent(raw interface{}) {
 	case *events.Connected:
 		b.mu.Lock()
 		b.connected = true
+		b.disconnectedSince = time.Time{}
+		// Derive authentication from the device identity rather than trusting a
+		// flag someone set once. events.Connected only fires after a successful
+		// handshake, so a client that still has a device identity IS
+		// authenticated at this point — that is what the state means.
+		//
+		// It used to be set in exactly two places, RunAuth's returning-user path
+		// and PairSuccess, neither of which runs on a reconnect. So when RunAuth
+		// failed at startup — 2026-08-28: the logon-triggered task fired before
+		// DNS was up, and web.whatsapp.com did not resolve — `authenticated`
+		// stayed false permanently. IsConnected() is `connected && authenticated`
+		// and gates every send, so once the socket came back the bridge answered
+		// 503 to every send against a perfectly live connection, and no amount of
+		// reconnecting could clear it short of restarting the process.
+		if id := b.client.Store.ID; id != nil {
+			b.authenticated = true
+			b.deviceJID = id.String()
+		}
 		if b.authenticated {
 			b.authState = AuthStatePaired
 		}
@@ -200,6 +253,14 @@ func (b *Bridge) handleEvent(raw interface{}) {
 	case *events.Disconnected:
 		b.mu.Lock()
 		b.connected = false
+		// Only on the FIRST disconnect of an outage. whatsmeow emits this event
+		// repeatedly while it retries, and overwriting the timestamp each time
+		// would restart the clock on every failed attempt — the duration would
+		// never grow past one retry interval, and a day-long outage would look
+		// like a fresh one forever.
+		if b.disconnectedSince.IsZero() {
+			b.disconnectedSince = time.Now()
+		}
 		b.mu.Unlock()
 		log.Println("whatsmeow: disconnected")
 	case *events.LoggedOut:
