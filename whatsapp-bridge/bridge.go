@@ -528,11 +528,14 @@ func (b *Bridge) onCallOffer(evt *events.CallOffer) {
 		return
 	}
 	chatJID := evt.CallCreator.String()
+	// callResultOffered, not a literal: this insert failing the column CHECK on
+	// a hardcoded "offered" is what kept the calls table empty on every install
+	// from 001 until migration 007.
 	_, err := b.db.Exec(`
 		INSERT INTO calls (id, chat_jid, caller_jid, timestamp, call_type, is_group, is_outbound, result)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO NOTHING
-	`, evt.CallID, chatJID, evt.CallCreator.String(), evt.Timestamp.Unix(), "voice", 0, 0, "offered")
+	`, evt.CallID, chatJID, evt.CallCreator.String(), evt.Timestamp.Unix(), "voice", 0, 0, callResultOffered)
 	if err != nil {
 		log.Printf("onCallOffer: insert failed: %v", err)
 	}
@@ -542,15 +545,23 @@ func (b *Bridge) onCallTerminate(evt *events.CallTerminate) {
 	if !b.cfg.CaptureCalls {
 		return
 	}
-	result := strings.ToLower(string(evt.Reason))
-	if result == "" {
-		result = "ended"
-	}
-	_, err := b.db.Exec(`
-		UPDATE calls SET result = ? WHERE id = ?
-	`, result, evt.CallID)
+	// evt.Reason is chosen by WhatsApp, not by us (whatsmeow reads it straight
+	// off the wire as cag.String("reason")), so it is normalized to the stored
+	// vocabulary here and kept verbatim in result_raw. Writing it unnormalized
+	// into a CHECKed column is the other half of the bug fixed in 007.
+	result, rawReason := callResultFromWireReason(evt.Reason)
+	res, err := b.db.Exec(`
+		UPDATE calls SET result = ?, result_raw = ? WHERE id = ?
+	`, result, rawReason, evt.CallID)
 	if err != nil {
 		log.Printf("onCallTerminate: update failed: %v", err)
+		return
+	}
+	// A terminate with no matching offer is not an error, but it is silent data
+	// loss if it becomes common — the outcome is known and there is nothing to
+	// attach it to (bridge started mid-call, or an offer this build never saw).
+	if n, rowsErr := res.RowsAffected(); rowsErr == nil && n == 0 {
+		log.Printf("onCallTerminate: no call row for id %s (result %q discarded)", evt.CallID, result)
 	}
 }
 
