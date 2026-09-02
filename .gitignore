@@ -53,8 +53,13 @@ Thumbs.db
 # Local-only operator files. These contain operator-specific runtime data,
 # personal contacts, or session-specific context that should not be pushed
 # to the public repo. Generated/maintained by the operator running the bridge.
-bridge-stdout.log
-bridge-stderr.log
+# launchd writes bridge.out.log and bridge.err.log (see the LaunchAgent
+# plist), so the earlier bridge-stdout/stderr names matched nothing and left
+# logs full of message previews one `git add -A` from the public repo.
+bridge*.log
+# Hand-rolled local launcher; hardcodes the operator vault path. The repo
+# ships its own installer at scripts/install-bridge-autostart.sh.
+start-bridge.sh
 prospect-api/BRIDGE-SPEC-DELTA-*.md
 prospect-api/Negotiator Playbook.md
 prospect-api/Negotiator Playbook *.md
