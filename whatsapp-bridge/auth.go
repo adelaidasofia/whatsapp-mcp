@@ -55,8 +55,144 @@ func (b *Bridge) AuthSnapshot() AuthSnapshot {
 	}
 }
 
+// connectPaired dials WhatsApp with the persisted identity and publishes the
+// resulting state under one lock. Every paired-path caller (RunAuth, Reconnect,
+// the watchdog) goes through it so they cannot leave the bridge in DIFFERENT
+// states — which is exactly what used to happen: RunAuth set authenticated,
+// Reconnect did not, so a bridge recovered via /api/auth/reconnect reported
+// connected=true and then silently refused every send and presence call,
+// because Bridge.IsConnected is `connected && authenticated`.
+//
+// Publishing state when the socket is already up is deliberate, not a no-op:
+// it is what repairs a stale authenticated=false left behind by an older
+// recovery path.
+func (b *Bridge) connectPaired() error {
+	if b.client.Store.ID == nil {
+		return errors.New("connectPaired: no persisted device identity")
+	}
+	if !b.client.IsConnected() {
+		// ErrAlreadyConnected means whatsmeow's own auto-reconnect won the race
+		// between the IsConnected check above and this dial. That is a success
+		// for our purposes — a socket exists — and treating it as a failure
+		// would skip the state publish below and leave the send gate shut for
+		// another watchdog tick. This network drops the socket every few
+		// minutes, so the race is routine, not theoretical.
+		if err := b.client.Connect(); err != nil && !errors.Is(err, whatsmeow.ErrAlreadyConnected) {
+			return err
+		}
+	}
+	b.markPairedLive(b.client.Store.ID.String())
+	return nil
+}
+
+// markPairedLive publishes "socket up, device known" as one atomic update.
+// Split out from connectPaired so the state half is reachable in tests without
+// a live whatsmeow client — this is the half that was wrong, and asserting it
+// needs no network.
+//
+// connected and authenticated MUST move together: Bridge.IsConnected (the gate
+// on sends, presence and history sync) is their AND, so setting one without the
+// other produces a bridge that looks online everywhere except where it counts.
+func (b *Bridge) markPairedLive(deviceJID string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.connected = true
+	b.authenticated = true
+	b.deviceJID = deviceJID
+	b.authState = AuthStatePaired
+}
+
+// needsRedial is the watchdog's per-tick decision, split from the loop so the
+// truth table is testable without a client or a ticker.
+//
+// `paired` is the caller's read of the persisted device identity. Unpaired means
+// the QR loop owns the client and a redial from here would drop the socket a
+// human scan is already using; loginRunning means the same for an in-flight
+// round. Otherwise anything short of fully live is worth a dial, INCLUDING
+// connected-but-not-authenticated — that is the stale state an older recovery
+// path left behind, and it silently refuses every send.
+func (b *Bridge) needsRedial(paired bool) bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return paired && !b.loginRunning && !(b.connected && b.authenticated)
+}
+
+// connectPairedWithRetry redials with capped exponential backoff until it wins
+// or ctx ends.
+//
+// A single unretried attempt here caused a 20-hour silent outage: launchd's
+// RunAtLoad started the bridge before DNS was up at boot, Connect failed with
+// `lookup web.whatsapp.com: no such host`, RunAuth returned the error, main
+// logged one line, and its goroutine exited. Nothing redialled afterwards —
+// whatsmeow's auto-reconnect only covers a socket that was ESTABLISHED and then
+// dropped, and this one never came up. Meanwhile setAuthState(paired) had
+// already run and the process stays alive on purpose to keep the HTTP API
+// serving, so /api/status read `auth_state: paired` and launchd's KeepAlive saw
+// a perfectly healthy job. Nobody was watching the one field that was false.
+func (b *Bridge) connectPairedWithRetry(ctx context.Context) error {
+	const (
+		initialBackoff = 5 * time.Second
+		maxBackoff     = 2 * time.Minute
+	)
+	backoff := initialBackoff
+	for attempt := 1; ; attempt++ {
+		err := b.connectPaired()
+		if err == nil {
+			if attempt > 1 {
+				log.Printf("reconnect: connected on attempt %d", attempt)
+			}
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		log.Printf("reconnect: attempt %d failed: %v — retrying in %s", attempt, err, backoff)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		if backoff < maxBackoff {
+			if backoff *= 2; backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+	}
+}
+
+// RunConnectionWatchdog redials whenever a paired bridge is found with no live
+// socket. It is the backstop for every way this process can stay alive while
+// being functionally offline — a dial that never succeeded, or a state where
+// whatsmeow's own auto-reconnect has stopped trying.
+//
+// Process supervision cannot cover this and never could: launchd only knows
+// whether the process is running, and the process deliberately stays running
+// while offline so the HTTP API can serve /api/auth/*. Liveness is not
+// readiness, so readiness needs its own loop.
+func (b *Bridge) RunConnectionWatchdog(ctx context.Context, interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		if !b.needsRedial(b.client.Store.ID != nil) {
+			continue
+		}
+		log.Println("watchdog: paired but not live — redialling")
+		if err := b.connectPaired(); err != nil {
+			log.Printf("watchdog: redial failed: %v — retrying in %s", err, interval)
+			continue
+		}
+		log.Printf("watchdog: reconnected; device=%s", b.DeviceJID())
+	}
+}
+
 // RunAuth drives authentication to completion. Returning user: reconnect with
-// the persisted identity. First run (or post-logout): run the QR/pairing-code
+// the persisted identity, retrying until it succeeds — a boot-time network race
+// must not cost the session. First run (or post-logout): run the QR/pairing-code
 // login loop until paired or ctx is cancelled. Blocking; main() runs it in a
 // goroutine so the HTTP API is up during pairing (a supervisor needs
 // /api/status and /api/auth/* exactly then).
@@ -64,14 +200,9 @@ func (b *Bridge) RunAuth(ctx context.Context) error {
 	if b.client.Store.ID != nil {
 		// Returning user: reconnect with persisted identity.
 		b.setAuthState(AuthStatePaired)
-		if err := b.client.Connect(); err != nil {
+		if err := b.connectPairedWithRetry(ctx); err != nil {
 			return fmt.Errorf("reconnect: %w", err)
 		}
-		b.mu.Lock()
-		b.connected = true
-		b.authenticated = true
-		b.deviceJID = b.client.Store.ID.String()
-		b.mu.Unlock()
 		log.Printf("bridge connected; device=%s", b.DeviceJID())
 		return nil
 	}
@@ -350,12 +481,9 @@ func FormatPairingCode(code string) string {
 // login loop is running so /api/auth/qr serves fresh codes. Idempotent.
 func (b *Bridge) Reconnect(ctx context.Context) (AuthSnapshot, error) {
 	if b.client.Store.ID != nil {
-		if !b.client.IsConnected() {
-			if err := b.client.Connect(); err != nil {
-				return b.AuthSnapshot(), fmt.Errorf("reconnect: %w", err)
-			}
+		if err := b.connectPaired(); err != nil {
+			return b.AuthSnapshot(), fmt.Errorf("reconnect: %w", err)
 		}
-		b.setAuthState(AuthStatePaired)
 		return b.AuthSnapshot(), nil
 	}
 	b.mu.RLock()

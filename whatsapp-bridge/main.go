@@ -268,6 +268,12 @@ func run() int {
 		}
 	}()
 
+	// Readiness supervision. RunAuth retries its own dial, but nothing else
+	// noticed a paired bridge sitting with a dead socket, and launchd cannot:
+	// it sees a live process, which this deliberately stays. See
+	// Bridge.RunConnectionWatchdog.
+	go bridge.RunConnectionWatchdog(ctx, 60*time.Second)
+
 	log.Printf("HTTP server listening on http://%s:%d", cfg.BridgeHost, cfg.BridgePort)
 	if err := server.ListenAndServe(ctx); err != nil {
 		log.Printf("server: %v", err)

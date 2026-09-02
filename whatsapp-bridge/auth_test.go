@@ -86,3 +86,68 @@ func TestFatalIfDeviceDeletedWiring(t *testing.T) {
 	b.fatalIfDeviceDeleted(fmt.Errorf("again: %w", store.ErrDeviceDeleted))
 	b.requestFatalShutdown()
 }
+
+// TestMarkPairedLiveUnblocksSends pins the second half of the 2026-09-01
+// outage. After the socket was restored via /api/auth/reconnect the bridge
+// reported connected=true and looked recovered, but Reconnect never set
+// authenticated — and Bridge.IsConnected, the gate used by sends.go,
+// presence.go and history_sync.go, is `connected && authenticated`. Reading
+// worked, every send was refused, and nothing said why.
+//
+// The two flags have to move together, so this asserts the observable the
+// callers actually use rather than the fields.
+func TestMarkPairedLiveUnblocksSends(t *testing.T) {
+	// The exact broken state: events.Connected had fired, the recovery path
+	// had not claimed authentication.
+	b := &Bridge{connected: true, authenticated: false}
+	if b.IsConnected() {
+		t.Fatal("precondition: a half-published bridge must not report connected")
+	}
+
+	b.markPairedLive("5215550001111:12@s.whatsapp.net")
+
+	if !b.IsConnected() {
+		t.Fatal("markPairedLive left the send gate shut; sends and presence stay refused")
+	}
+	if b.deviceJID != "5215550001111:12@s.whatsapp.net" {
+		t.Fatalf("deviceJID = %q, want the JID passed in", b.deviceJID)
+	}
+	if b.authState != AuthStatePaired {
+		t.Fatalf("authState = %q, want %q", b.authState, AuthStatePaired)
+	}
+}
+
+// TestNeedsRedial covers the watchdog's decision table. The two rows that
+// matter are the ones that actually happened: a paired bridge that never got a
+// socket (boot-time DNS race, 20 hours offline), and a paired bridge whose
+// socket came back with authentication still unpublished.
+func TestNeedsRedial(t *testing.T) {
+	tests := []struct {
+		name          string
+		paired        bool
+		loginRunning  bool
+		connected     bool
+		authenticated bool
+		want          bool
+	}{
+		{"unpaired: the QR loop owns the client, never dial under it", false, false, false, false, false},
+		{"unpaired even if flags are somehow set", false, false, true, true, false},
+		{"pairing round in flight: a dial would drop the socket being scanned", true, true, false, false, false},
+		{"fully live: no churn on the steady state", true, false, true, true, false},
+		{"paired, never connected — the boot DNS race", true, false, false, false, true},
+		{"paired and connected but unauthenticated — sends silently refused", true, false, true, false, true},
+		{"paired and authenticated but socket down", true, false, false, true, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			b := &Bridge{
+				loginRunning:  tc.loginRunning,
+				connected:     tc.connected,
+				authenticated: tc.authenticated,
+			}
+			if got := b.needsRedial(tc.paired); got != tc.want {
+				t.Fatalf("needsRedial(paired=%v) = %v, want %v", tc.paired, got, tc.want)
+			}
+		})
+	}
+}
