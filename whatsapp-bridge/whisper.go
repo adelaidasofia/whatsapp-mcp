@@ -298,6 +298,11 @@ func (t *Transcriber) transcribeLocalCpp(ctx context.Context, wavPath string) (s
 	args := []string{
 		"--model", t.cfg.WhisperModelPath,
 		"--language", t.cfg.WhisperLanguage,
+		// Voice notes are independent utterances, so carrying decoded text
+		// across decode windows buys nothing and invites whisper.cpp's
+		// repetition collapse: one phrase looping until the segment fills.
+		// 0 disables the carry.
+		"--max-context", "0",
 		"--output-json",
 		"--output-file", stem,
 		"--no-prints",
