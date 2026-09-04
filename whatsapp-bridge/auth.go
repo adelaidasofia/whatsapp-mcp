@@ -67,12 +67,17 @@ func (b *Bridge) RunAuth(ctx context.Context) error {
 		if err := b.client.Connect(); err != nil {
 			return fmt.Errorf("reconnect: %w", err)
 		}
+		// Do NOT set connected here. Connect() only starts the handshake; the
+		// socket may still be rejected by the server (e.g. "Client outdated
+		// (405)"), which arrives as a whatsmeow log line and never as an error
+		// from Connect(). Marking connected optimistically made the bridge
+		// report connected=true for four days with a dead socket. Only
+		// events.Connected — see handleEvent — may set that flag.
 		b.mu.Lock()
-		b.connected = true
 		b.authenticated = true
 		b.deviceJID = b.client.Store.ID.String()
 		b.mu.Unlock()
-		log.Printf("bridge connected; device=%s", b.DeviceJID())
+		log.Printf("bridge handshake started; device=%s (awaiting whatsmeow: connected)", b.DeviceJID())
 		return nil
 	}
 	return b.loginLoop(ctx)

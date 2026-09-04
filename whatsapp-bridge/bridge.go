@@ -31,6 +31,7 @@ type Bridge struct {
 	cfg         *Config
 	db          *sql.DB
 	client      *whatsmeow.Client
+	clientLog   *clientErrLog
 	transcriber *Transcriber
 
 	// rootCtx is the process-lifetime context, kept so event handlers can
@@ -104,13 +105,14 @@ func NewBridge(ctx context.Context, cfg *Config, db *sql.DB, dbKey string, trans
 		return nil, fmt.Errorf("get first device: %w", err)
 	}
 
-	clientLog := waLog.Stdout("whatsmeow-client", "WARN", true)
+	clientLog := newClientErrLog(waLog.Stdout("whatsmeow-client", "WARN", true))
 	client := whatsmeow.NewClient(device, clientLog)
 
 	b := &Bridge{
 		cfg:         cfg,
 		db:          db,
 		client:      client,
+		clientLog:   clientLog,
 		transcriber: transcriber,
 		rootCtx:     ctx,
 		// Treat "not connected yet" as an outage that started now. Without this
@@ -140,6 +142,17 @@ func (b *Bridge) Disconnect() {
 	b.connected = false
 	b.authenticated = false
 	b.mu.Unlock()
+}
+
+// LastClientError returns the most recent error whatsmeow logged, and its unix
+// timestamp (0 if none). Surfaced on /api/status so a socket that never came up
+// says why — see clientlog.go for the failure this was written for.
+func (b *Bridge) LastClientError() (string, int64) {
+	msg, at := b.clientLog.Last()
+	if at.IsZero() {
+		return msg, 0
+	}
+	return msg, at.Unix()
 }
 
 // Status returns current connection/auth state for the /api/status handler.
