@@ -460,14 +460,17 @@ async def search_groups(query: str, limit: int = 10) -> dict[str, Any]:
         groups = result.get("groups", [])
         needle = _fold(query)
         matches = [g for g in groups if needle in _fold(g.get("name") or "")]
-        trimmed = [
-            {
+        trimmed = []
+        for g in matches[: max(limit, 0)]:
+            scrubbed_name, flags = scrub(g.get("name"))
+            entry = {
                 "jid": g.get("jid"),
-                "name": g.get("name"),
+                "name": scrubbed_name,
                 "participant_count": g.get("participant_count"),
             }
-            for g in matches[: max(limit, 0)]
-        ]
+            if flags:
+                entry["_scrub_flags"] = flags
+            trimmed.append(entry)
         _audit("search_groups", params, f"{len(trimmed)} matches", int((time.time() - start) * 1000))
         return {"groups": trimmed, "count": len(trimmed), "total_joined": len(groups)}
     except Exception as e:  # noqa: BLE001
@@ -568,17 +571,21 @@ async def request_history(chat_jid: str, count: int = 20) -> dict[str, Any]:
         count: How many older messages to request.
     """
     start = time.time()
-    body = {"chat_jid": chat_jid, "count": count}
+    body = {"chat_jid": chat_jid, "count": min(count, 200)}
     try:
         result = await _bridge_post("/api/admin/request-history", body)
-        result["hint"] = (
+        bridge_hint = result.get("hint")
+        mcp_hint = (
             "Delivered asynchronously, usually within a few seconds. Call "
             "list_messages(chat_jid, before=<previous oldest message id>) "
             "once landed \u2014 there is no separate completion signal. Media in "
             "the new messages is metadata-only until download_media is "
             "called per message."
         )
-        _audit("request_history", body, f"requested {count} for {chat_jid}",
+        # Append rather than overwrite: the bridge's own hint (e.g. which
+        # log line to watch) must not be silently discarded if it changes.
+        result["hint"] = f"{bridge_hint} {mcp_hint}" if bridge_hint else mcp_hint
+        _audit("request_history", body, f"requested {body['count']} for {chat_jid}",
                int((time.time() - start) * 1000))
         return result
     except Exception as e:  # noqa: BLE001
