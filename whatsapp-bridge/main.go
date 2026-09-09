@@ -183,6 +183,18 @@ func run() int {
 	go bridge.RunDisconnectionWatchdog(ctx)
 	log.Printf("disconnection watchdog started: reports after %s, then retries on a widening schedule", watchdogGrace)
 
+	// Store backups. WHATSAPP_BACKUP_PATH used to be a setting that did
+	// nothing, so this states plainly which of the two states the install is
+	// in: the whole failure mode was an operator believing backups happened.
+	if backups := NewBackupRunner(db, cfg.BackupPath, cfg.BackupIntervalHours, cfg.BackupKeep); backups != nil {
+		go backups.Run(ctx)
+		log.Printf("backups enabled: dir=%s interval=%dh keep=%d",
+			cfg.BackupPath, cfg.BackupIntervalHours, cfg.BackupKeep)
+	} else {
+		log.Printf("backups DISABLED (WHATSAPP_BACKUP_INTERVAL_HOURS=%d, WHATSAPP_BACKUP_PATH=%q)",
+			cfg.BackupIntervalHours, cfg.BackupPath)
+	}
+
 	// JID-alias backfill. Asks whatsmeow's local LID store for the alt form of
 	// every contact and records it in jid_aliases. Also repairs the legacy
 	// "LID stored as phone" rows. Runs once at startup, async so it can't
