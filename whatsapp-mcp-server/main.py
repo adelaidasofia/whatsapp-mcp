@@ -27,6 +27,7 @@ import logging
 import os
 import sys
 import time
+import unicodedata
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -284,9 +285,73 @@ def _bridge_error(e: httpx.HTTPStatusError) -> RuntimeError:
     return RuntimeError(msg)
 
 
+def _bridge_unreachable(e: Exception) -> RuntimeError:
+    """Turn a raw socket failure into something a person can act on.
+
+    This is the most common state a fresh install lands in: the MCP server is
+    registered and its tools show up in Claude, but the Go bridge -- a
+    SEPARATE program -- was never started, or ran in a terminal that has since
+    been closed. httpx raises ConnectError for that, which is not an
+    HTTPStatusError, so it used to sail straight past _bridge_error and reach
+    the user as:
+
+        Error calling tool 'list_chats': All connection attempts failed
+
+    That names nothing: not the bridge, not the port, not the fix. The person
+    and the model then both guess, usually at the MCP config, which is the one
+    part that was already correct. Everything needed to recover is known right
+    here, so say it.
+    """
+    if sys.platform == "win32":
+        start = r'"%USERPROFILE%\.claude\whatsapp-mcp\whatsapp-bridge\bin\whatsapp-bridge.exe"'
+        autostart = r"powershell -ExecutionPolicy ByPass -File scripts\install-bridge-autostart.ps1"
+    else:
+        start = '"$HOME/.claude/whatsapp-mcp/whatsapp-bridge/bin/whatsapp-bridge"'
+        autostart = "./scripts/install-bridge-autostart.sh"
+    return RuntimeError(
+        f"Cannot reach the whatsapp-mcp bridge at {BRIDGE_BASE} ({type(e).__name__}). "
+        "The bridge is a separate program from this MCP server, and no WhatsApp tool "
+        "works until it is running.\n"
+        "\n"
+        f"Start it in a terminal:\n"
+        f"  {start}\n"
+        "\n"
+        "On a first run it prints a QR code: scan it with WhatsApp > Settings > Linked "
+        "Devices > Link a Device. Scan it in that terminal -- the code refreshes about "
+        "every 20 seconds, so it cannot be relayed through this chat.\n"
+        "\n"
+        "To stop starting it by hand every time:\n"
+        f"  {autostart}\n"
+        "\n"
+        f"If your bridge listens elsewhere, set WHATSAPP_BRIDGE_HOST / WHATSAPP_BRIDGE_PORT "
+        f"(this server is looking at {BRIDGE_HOST}:{BRIDGE_PORT})."
+    )
+
+
+def _bridge_timeout(e: Exception) -> RuntimeError:
+    """The bridge accepted the connection and then went quiet."""
+    return RuntimeError(
+        f"The whatsapp-mcp bridge at {BRIDGE_BASE} accepted the connection but did not "
+        f"answer in time ({type(e).__name__}). It is running but wedged or very busy. "
+        "Check its log (bridge.log next to the store), then restart it."
+    )
+
+
+def _transport_error(e: httpx.TransportError) -> RuntimeError:
+    """Classify a transport failure. Connect failures mean 'not running'."""
+    if isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout)):
+        return _bridge_unreachable(e)
+    if isinstance(e, httpx.TimeoutException):
+        return _bridge_timeout(e)
+    return _bridge_unreachable(e)
+
+
 async def _bridge_get(path: str, params: dict[str, Any] | None = None) -> Any:
     assert _http is not None, "http client not initialized"
-    r = await _http.get(path, params=params)
+    try:
+        r = await _http.get(path, params=params)
+    except httpx.TransportError as e:
+        raise _transport_error(e) from e
     try:
         r.raise_for_status()
     except httpx.HTTPStatusError as e:
@@ -296,7 +361,10 @@ async def _bridge_get(path: str, params: dict[str, Any] | None = None) -> Any:
 
 async def _bridge_post(path: str, body: dict[str, Any]) -> Any:
     assert _http is not None, "http client not initialized"
-    r = await _http.post(path, json=body)
+    try:
+        r = await _http.post(path, json=body)
+    except httpx.TransportError as e:
+        raise _transport_error(e) from e
     try:
         r.raise_for_status()
     except httpx.HTTPStatusError as e:
@@ -363,6 +431,53 @@ async def search_contacts(query: str, limit: int = 10) -> dict[str, Any]:
         raise
 
 
+def _fold(s: str) -> str:
+    """Lowercase, strip accents. /api/groups does no name normalization at
+    all (unlike GET /api/contacts/search, which normalizes server-side), so
+    this reimplements the same fold class locally."""
+    return "".join(
+        c for c in unicodedata.normalize("NFD", s.lower()) if not unicodedata.combining(c)
+    )
+
+
+@mcp.tool()
+async def search_groups(query: str, limit: int = 10) -> dict[str, Any]:
+    """Find WhatsApp groups by name. Accent-insensitive, case-insensitive
+    substring match. Unlike list_chats, this sees every JOINED group, not
+    only ones with recent message history — list_chats only surfaces chats
+    with traffic (often a few dozen), while a real account can belong to
+    hundreds of groups with no recent activity.
+
+    Participant phone numbers are NEVER returned by this tool. GET /api/groups
+    includes every member's phone number for every group in the response;
+    this tool strips that so a name lookup can't leak it. Use list_messages
+    on the matched jid if you need to look inside the chat.
+    """
+    start = time.time()
+    params: dict[str, Any] = {"q": query, "limit": limit}
+    try:
+        result = await _bridge_get("/api/groups")
+        groups = result.get("groups", [])
+        needle = _fold(query)
+        matches = [g for g in groups if needle in _fold(g.get("name") or "")]
+        trimmed = []
+        for g in matches[: max(limit, 0)]:
+            scrubbed_name, flags = scrub(g.get("name"))
+            entry = {
+                "jid": g.get("jid"),
+                "name": scrubbed_name,
+                "participant_count": g.get("participant_count"),
+            }
+            if flags:
+                entry["_scrub_flags"] = flags
+            trimmed.append(entry)
+        _audit("search_groups", params, f"{len(trimmed)} matches", int((time.time() - start) * 1000))
+        return {"groups": trimmed, "count": len(trimmed), "total_joined": len(groups)}
+    except Exception as e:  # noqa: BLE001
+        _audit("search_groups", params, "failed", int((time.time() - start) * 1000), error=str(e))
+        raise
+
+
 @mcp.tool()
 async def list_messages(
     chat_jid: str,
@@ -413,6 +528,68 @@ async def list_messages(
         return result
     except Exception as e:  # noqa: BLE001
         _audit("list_messages", params, "failed", int((time.time() - start) * 1000), error=str(e))
+        raise
+
+
+@mcp.tool()
+async def download_media(message_id: str) -> dict[str, Any]:
+    """Download and decrypt the media (image, document, video) attached to a
+    message, saving it to disk under the bridge's media folder. Returns the
+    LOCAL FILE PATH and mime type, NOT the bytes — read the path with a file
+    tool. cached_hit is true if this message's media was already downloaded
+    by an earlier call.
+
+    Args:
+        message_id: A message ID from list_messages — one with a media type
+            (image/document/video) and no content_text.
+    """
+    start = time.time()
+    body = {"message_id": message_id}
+    try:
+        result = await _bridge_post("/api/media/download", body)
+        _audit("download_media", body, f"{result.get('size', 0)} bytes -> {result.get('path')}",
+               int((time.time() - start) * 1000))
+        return result
+    except Exception as e:  # noqa: BLE001
+        _audit("download_media", body, "failed", int((time.time() - start) * 1000), error=str(e))
+        raise
+
+
+@mcp.tool()
+async def request_history(chat_jid: str, count: int = 20) -> dict[str, Any]:
+    """Ask WhatsApp for OLDER messages in a chat than what auto-synced. This
+    is a REAL, asynchronous request to WhatsApp's servers — not instant and
+    not free of traffic. The response only confirms the request was SENT;
+    older messages typically land within a few seconds and become visible
+    via list_messages(chat_jid, before=<the chat's current oldest message
+    id>) once they arrive — there is no separate "done" signal to poll.
+    Media in the newly-arrived messages is metadata-only until download_media
+    is called per message.
+
+    Args:
+        chat_jid: The chat or group JID to request older history for.
+        count: How many older messages to request.
+    """
+    start = time.time()
+    body = {"chat_jid": chat_jid, "count": min(count, 200)}
+    try:
+        result = await _bridge_post("/api/admin/request-history", body)
+        bridge_hint = result.get("hint")
+        mcp_hint = (
+            "Delivered asynchronously, usually within a few seconds. Call "
+            "list_messages(chat_jid, before=<previous oldest message id>) "
+            "once landed \u2014 there is no separate completion signal. Media in "
+            "the new messages is metadata-only until download_media is "
+            "called per message."
+        )
+        # Append rather than overwrite: the bridge's own hint (e.g. which
+        # log line to watch) must not be silently discarded if it changes.
+        result["hint"] = f"{bridge_hint} {mcp_hint}" if bridge_hint else mcp_hint
+        _audit("request_history", body, f"requested {body['count']} for {chat_jid}",
+               int((time.time() - start) * 1000))
+        return result
+    except Exception as e:  # noqa: BLE001
+        _audit("request_history", body, "failed", int((time.time() - start) * 1000), error=str(e))
         raise
 
 

@@ -31,12 +31,25 @@ type Bridge struct {
 	cfg         *Config
 	db          *sql.DB
 	client      *whatsmeow.Client
+	clientLog   *clientErrLog
 	transcriber *Transcriber
 
 	// rootCtx is the process-lifetime context, kept so event handlers can
 	// restart the login loop (e.g. after a WhatsApp-side logout) without
 	// holding a request-scoped ctx.
 	rootCtx context.Context
+
+	// fatal is closed once when the bridge decides it cannot continue in this
+	// process and needs a restart to recover — currently only when WhatsApp has
+	// deleted this device server-side, which permanently poisons the whatsmeow
+	// client (see fatalIfDeviceDeleted in auth.go).
+	//
+	// A channel rather than os.Exit so main() can unwind properly: os.Exit skips
+	// every deferred db.Close/transcriber.Close/bridge.Disconnect and kills
+	// in-flight HTTP handlers mid-write, including a confirm that has already
+	// delivered a message to WhatsApp but not yet recorded it.
+	fatal     chan struct{}
+	fatalOnce sync.Once
 
 	// walker drives the MYC-3284 backfill's backwards walk through chat
 	// history. See backfill_walk.go.
@@ -45,8 +58,15 @@ type Bridge struct {
 	mu            sync.RWMutex
 	connected     bool
 	authenticated bool
-	deviceJID     string
-	lastSyncTime  time.Time
+
+	// disconnectedSince is when the socket went down, or the zero time while it
+	// is up. Kept because connected=false alone is not actionable: the same
+	// boolean covers a two-second blip that will heal itself and a day-long
+	// outage nobody has noticed, and on 2026-08-24 it was the latter for
+	// 24 hours with nothing able to tell the difference. See watchdog.go.
+	disconnectedSince time.Time
+	deviceJID         string
+	lastSyncTime      time.Time
 
 	// Auth lifecycle surfaced over /api/status + /api/auth/* (see auth.go).
 	authState        AuthState
@@ -85,17 +105,26 @@ func NewBridge(ctx context.Context, cfg *Config, db *sql.DB, dbKey string, trans
 		return nil, fmt.Errorf("get first device: %w", err)
 	}
 
-	clientLog := waLog.Stdout("whatsmeow-client", "WARN", true)
+	clientLog := newClientErrLog(waLog.Stdout("whatsmeow-client", "WARN", true))
 	client := whatsmeow.NewClient(device, clientLog)
 
 	b := &Bridge{
 		cfg:         cfg,
 		db:          db,
 		client:      client,
+		clientLog:   clientLog,
 		transcriber: transcriber,
 		rootCtx:     ctx,
-		authState:   AuthStateUnauthenticated,
-		walker:      newBackfillWalker(),
+		// Treat "not connected yet" as an outage that started now. Without this
+		// the clock only ever started on an events.Disconnected, so a bridge that
+		// never managed its FIRST connection reported 0 seconds down forever and
+		// the watchdog skipped it entirely — which is exactly what happened on
+		// 2026-08-28, when the logon-triggered task fired before DNS was up.
+		// Cleared on the first successful connect.
+		disconnectedSince: time.Now(),
+		authState:         AuthStateUnauthenticated,
+		walker:            newBackfillWalker(),
+		fatal:             make(chan struct{}),
 	}
 	client.AddEventHandler(b.handleEvent)
 	return b, nil
@@ -115,6 +144,17 @@ func (b *Bridge) Disconnect() {
 	b.mu.Unlock()
 }
 
+// LastClientError returns the most recent error whatsmeow logged, and its unix
+// timestamp (0 if none). Surfaced on /api/status so a socket that never came up
+// says why — see clientlog.go for the failure this was written for.
+func (b *Bridge) LastClientError() (string, int64) {
+	msg, at := b.clientLog.Last()
+	if at.IsZero() {
+		return msg, 0
+	}
+	return msg, at.Unix()
+}
+
 // Status returns current connection/auth state for the /api/status handler.
 func (b *Bridge) Status() (connected, authed bool, deviceJID string, lastSync int64) {
 	b.mu.RLock()
@@ -124,6 +164,27 @@ func (b *Bridge) Status() (connected, authed bool, deviceJID string, lastSync in
 		ls = b.lastSyncTime.Unix()
 	}
 	return b.connected, b.authenticated, b.deviceJID, ls
+}
+
+// HasDeviceIdentity reports whether this client is paired — whether whatsmeow's
+// store still holds a device. It is the durable fact behind "should this bridge
+// be connected right now", and unlike the `authenticated` flag it is true even
+// before the first successful connection of a run.
+func (b *Bridge) HasDeviceIdentity() bool {
+	return b.client != nil && b.client.Store != nil && b.client.Store.ID != nil
+}
+
+// DisconnectedFor returns how long the WhatsApp socket has been down, or 0
+// while it is up (or was never connected). Read by the watchdog and surfaced on
+// /api/status, so a caller asking "is this healthy" gets a duration rather than
+// a boolean that cannot distinguish a blip from a day.
+func (b *Bridge) DisconnectedFor() time.Duration {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.connected || b.disconnectedSince.IsZero() {
+		return 0
+	}
+	return time.Since(b.disconnectedSince)
 }
 
 func (b *Bridge) DeviceJID() string {
@@ -137,6 +198,20 @@ func (b *Bridge) DeviceJID() string {
 // in spirit, but the whatsmeow client itself is not.
 func (b *Bridge) Client() *whatsmeow.Client {
 	return b.client
+}
+
+// Fatal is closed when the bridge needs the process to restart to recover.
+// main() selects on it alongside SIGINT/SIGTERM and runs the same graceful
+// shutdown, so the exit is orderly and the exit code is non-zero.
+func (b *Bridge) Fatal() <-chan struct{} {
+	return b.fatal
+}
+
+// requestFatalShutdown closes Fatal exactly once. Safe from any goroutine and
+// safe to call repeatedly — several handlers can reach the same conclusion
+// concurrently, and a second close would panic.
+func (b *Bridge) requestFatalShutdown() {
+	b.fatalOnce.Do(func() { close(b.fatal) })
 }
 
 // IsConnected returns true when the bridge has an active whatsmeow connection
@@ -165,6 +240,24 @@ func (b *Bridge) handleEvent(raw interface{}) {
 	case *events.Connected:
 		b.mu.Lock()
 		b.connected = true
+		b.disconnectedSince = time.Time{}
+		// Derive authentication from the device identity rather than trusting a
+		// flag someone set once. events.Connected only fires after a successful
+		// handshake, so a client that still has a device identity IS
+		// authenticated at this point — that is what the state means.
+		//
+		// It used to be set in exactly two places, RunAuth's returning-user path
+		// and PairSuccess, neither of which runs on a reconnect. So when RunAuth
+		// failed at startup — 2026-08-28: the logon-triggered task fired before
+		// DNS was up, and web.whatsapp.com did not resolve — `authenticated`
+		// stayed false permanently. IsConnected() is `connected && authenticated`
+		// and gates every send, so once the socket came back the bridge answered
+		// 503 to every send against a perfectly live connection, and no amount of
+		// reconnecting could clear it short of restarting the process.
+		if id := b.client.Store.ID; id != nil {
+			b.authenticated = true
+			b.deviceJID = id.String()
+		}
 		if b.authenticated {
 			b.authState = AuthStatePaired
 		}
@@ -173,6 +266,14 @@ func (b *Bridge) handleEvent(raw interface{}) {
 	case *events.Disconnected:
 		b.mu.Lock()
 		b.connected = false
+		// Only on the FIRST disconnect of an outage. whatsmeow emits this event
+		// repeatedly while it retries, and overwriting the timestamp each time
+		// would restart the clock on every failed attempt — the duration would
+		// never grow past one retry interval, and a day-long outage would look
+		// like a fresh one forever.
+		if b.disconnectedSince.IsZero() {
+			b.disconnectedSince = time.Now()
+		}
 		b.mu.Unlock()
 		log.Println("whatsmeow: disconnected")
 	case *events.LoggedOut:
@@ -185,8 +286,15 @@ func (b *Bridge) handleEvent(raw interface{}) {
 		b.pairingCode = ""
 		b.mu.Unlock()
 		log.Printf("whatsmeow: logged out; reason=%v — starting a fresh pairing flow (scan the new QR, or POST /api/auth/pair-phone)", evt.Reason)
-		// Re-enter pairing without a process restart. whatsmeow clears the
-		// device store on logout; the small delay lets that settle.
+		// whatsmeow deletes the local device row for EVERY logged-out reason
+		// (connectionevents.go calls Store.Delete right after dispatching this
+		// event), and that delete is a single local SQLite write while we wait
+		// 2s — so by the time loginLoop runs, this client is almost always
+		// already permanently unusable. Re-pairing on it is the cheap attempt,
+		// not the expected path. loginLoop's own exitIfDeviceDeleted is what
+		// guarantees recovery; it is checked there rather than here because
+		// loginLoop returns nil to this caller whenever another goroutine
+		// already owns the loop.
 		go func() {
 			select {
 			case <-b.rootCtx.Done():
@@ -433,11 +541,14 @@ func (b *Bridge) onCallOffer(evt *events.CallOffer) {
 		return
 	}
 	chatJID := evt.CallCreator.String()
+	// callResultOffered, not a literal: this insert failing the column CHECK on
+	// a hardcoded "offered" is what kept the calls table empty on every install
+	// from 001 until migration 007.
 	_, err := b.db.Exec(`
 		INSERT INTO calls (id, chat_jid, caller_jid, timestamp, call_type, is_group, is_outbound, result)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO NOTHING
-	`, evt.CallID, chatJID, evt.CallCreator.String(), evt.Timestamp.Unix(), "voice", 0, 0, "offered")
+	`, evt.CallID, chatJID, evt.CallCreator.String(), evt.Timestamp.Unix(), "voice", 0, 0, callResultOffered)
 	if err != nil {
 		log.Printf("onCallOffer: insert failed: %v", err)
 	}
@@ -447,15 +558,23 @@ func (b *Bridge) onCallTerminate(evt *events.CallTerminate) {
 	if !b.cfg.CaptureCalls {
 		return
 	}
-	result := strings.ToLower(string(evt.Reason))
-	if result == "" {
-		result = "ended"
-	}
-	_, err := b.db.Exec(`
-		UPDATE calls SET result = ? WHERE id = ?
-	`, result, evt.CallID)
+	// evt.Reason is chosen by WhatsApp, not by us (whatsmeow reads it straight
+	// off the wire as cag.String("reason")), so it is normalized to the stored
+	// vocabulary here and kept verbatim in result_raw. Writing it unnormalized
+	// into a CHECKed column is the other half of the bug fixed in 007.
+	result, rawReason := callResultFromWireReason(evt.Reason)
+	res, err := b.db.Exec(`
+		UPDATE calls SET result = ?, result_raw = ? WHERE id = ?
+	`, result, rawReason, evt.CallID)
 	if err != nil {
 		log.Printf("onCallTerminate: update failed: %v", err)
+		return
+	}
+	// A terminate with no matching offer is not an error, but it is silent data
+	// loss if it becomes common — the outcome is known and there is nothing to
+	// attach it to (bridge started mid-call, or an offer this build never saw).
+	if n, rowsErr := res.RowsAffected(); rowsErr == nil && n == 0 {
+		log.Printf("onCallTerminate: no call row for id %s (result %q discarded)", evt.CallID, result)
 	}
 }
 

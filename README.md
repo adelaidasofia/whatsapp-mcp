@@ -71,7 +71,7 @@ This installs the Python MCP server side. The Go bridge still needs the one-time
 
 See [SETUP.md](SETUP.md) for step-by-step install per OS. In short:
 
-1. Grab a prebuilt bridge binary from [Releases](../../releases/latest) (Windows/macOS/Linux — no compiler needed), or build from source (Go 1.24+ and a C toolchain)
+1. Grab a prebuilt bridge binary from [Releases](../../releases/latest) (Windows/macOS/Linux — no compiler needed), or build from source (Go 1.26+ and a C toolchain)
 2. Python 3.11+ and `uv` for the MCP server layer
 3. Clone this repo; verify with `scripts/check_prerequisites.sh` (Windows: `scripts\check_prerequisites.ps1`)
 4. Start the bridge: `./bin/whatsapp-bridge` (Windows: `.\bin\whatsapp-bridge.exe`)
