@@ -197,7 +197,7 @@ func (b *BackupRunner) Prune() (int, error) {
 			continue
 		}
 		name := e.Name()
-		if strings.HasPrefix(name, backupTempPrefix) {
+		if strings.HasPrefix(name, backupTempPrefix) && strings.HasSuffix(name, backupSuffix) {
 			if os.Remove(filepath.Join(b.dir, name)) == nil {
 				removed++
 			}

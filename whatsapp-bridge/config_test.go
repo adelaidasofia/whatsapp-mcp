@@ -60,6 +60,42 @@ func TestConfigReadsExplicitDBKey(t *testing.T) {
 	}
 }
 
+// Backups duplicate a private message store. An upgrade must not silently
+// start writing extra copies of it on installs that never asked for backups,
+// so a fresh boot with no backup env set must come up with backups OFF.
+func TestConfigDefaultsBackupsDisabled(t *testing.T) {
+	t.Setenv("WHATSAPP_WHISPER_BACKEND", "off")
+	t.Setenv("WHATSAPP_BACKUP_INTERVAL_HOURS", "")
+	t.Setenv("WHATSAPP_BACKUP_PATH", "")
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig with defaults must succeed, got: %v", err)
+	}
+	if cfg.BackupIntervalHours != 0 {
+		t.Fatalf("default BackupIntervalHours = %d, want 0 (disabled)", cfg.BackupIntervalHours)
+	}
+	if NewBackupRunner(nil, cfg.BackupPath, cfg.BackupIntervalHours, cfg.BackupKeep) != nil {
+		t.Fatal("a zero-config boot must not produce a running BackupRunner")
+	}
+}
+
+func TestConfigBackupsOptInViaIntervalEnv(t *testing.T) {
+	t.Setenv("WHATSAPP_WHISPER_BACKEND", "off")
+	t.Setenv("WHATSAPP_BACKUP_INTERVAL_HOURS", "24")
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.BackupIntervalHours != 24 {
+		t.Fatalf("BackupIntervalHours = %d, want 24", cfg.BackupIntervalHours)
+	}
+	if cfg.BackupPath == "" {
+		t.Fatal("BackupPath must still resolve to a sensible default when only the interval is set")
+	}
+}
+
 func TestSplitNormalizedCSV(t *testing.T) {
 	got := splitNormalizedCSV(" Mamá, Pablo Tucu ,, FAVORITOS ")
 	want := []string{"mama", "pablo tucu", "favoritos"}

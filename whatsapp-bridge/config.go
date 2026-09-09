@@ -81,12 +81,15 @@ func LoadConfig() (*Config, error) {
 	defaultRoot := filepath.Join(home, ".claude", "whatsapp-mcp")
 
 	c := &Config{
-		BridgeHost:          getenv("WHATSAPP_BRIDGE_HOST", "127.0.0.1"),
-		BridgePort:          getenvInt("WHATSAPP_BRIDGE_PORT", 8080),
-		DBPath:              expandPath(getenv("WHATSAPP_DB_PATH", filepath.Join(defaultRoot, "store", "messages.db")), home),
-		MediaPath:           expandPath(getenv("WHATSAPP_MEDIA_PATH", filepath.Join(defaultRoot, "media")), home),
-		BackupPath:          expandPath(getenv("WHATSAPP_BACKUP_PATH", filepath.Join(defaultRoot, "store", "backups")), home),
-		BackupIntervalHours: getenvInt("WHATSAPP_BACKUP_INTERVAL_HOURS", 24),
+		BridgeHost: getenv("WHATSAPP_BRIDGE_HOST", "127.0.0.1"),
+		BridgePort: getenvInt("WHATSAPP_BRIDGE_PORT", 8080),
+		DBPath:     expandPath(getenv("WHATSAPP_DB_PATH", filepath.Join(defaultRoot, "store", "messages.db")), home),
+		MediaPath:  expandPath(getenv("WHATSAPP_MEDIA_PATH", filepath.Join(defaultRoot, "media")), home),
+		BackupPath: expandPath(getenv("WHATSAPP_BACKUP_PATH", filepath.Join(defaultRoot, "store", "backups")), home),
+		// 0 (disabled) by default: this duplicates a private message store,
+		// so an upgrade must not silently start writing extra copies of it
+		// on existing installs. Opt in with WHATSAPP_BACKUP_INTERVAL_HOURS.
+		BackupIntervalHours: getenvInt("WHATSAPP_BACKUP_INTERVAL_HOURS", 0),
 		BackupKeep:          getenvInt("WHATSAPP_BACKUP_KEEP", 7),
 		EncryptDB:           getenvBool("WHATSAPP_ENCRYPT_DB", true),
 		DBKey:               getenv("WHATSAPP_DB_KEY", ""),

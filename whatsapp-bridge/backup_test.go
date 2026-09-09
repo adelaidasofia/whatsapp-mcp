@@ -220,6 +220,31 @@ func TestPruneRemovesInterruptedTempFilesAndNeverCountsThem(t *testing.T) {
 	}
 }
 
+// Prune's temp-file cleanup matched on the ".tmp-" prefix alone, with no
+// suffix check, inside a directory named by an operator-supplied env var
+// (WHATSAPP_BACKUP_PATH). That is a deletion primitive: any unrelated file a
+// user happened to keep there with a ".tmp-" name would be removed too.
+func TestPruneNeverDeletesAnUnrelatedTmpFile(t *testing.T) {
+	db, dir := backupTestDB(t)
+	r := NewBackupRunner(db, dir, 24, 3)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	unrelated := filepath.Join(dir, backupTempPrefix+"my-notes.txt")
+	if err := os.WriteFile(unrelated, []byte("not a backup"), 0o600); err != nil {
+		t.Fatalf("write unrelated: %v", err)
+	}
+
+	if _, err := r.Prune(); err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if _, err := os.Stat(unrelated); err != nil {
+		t.Error("Prune deleted a file that only happened to start with the temp prefix, " +
+			"not one it actually wrote (missing the backup suffix)")
+	}
+}
+
 // A crashed run can leave a temp file with the same stamp. The next snapshot in
 // that second must not fail because VACUUM INTO refuses an existing target.
 func TestSnapshotOverwritesAStaleTempFile(t *testing.T) {
