@@ -45,6 +45,12 @@ type Config struct {
 	// matched against chat JID and chat name; matching chats are never
 	// transcribed (privacy filter for personal chats).
 	WhisperExcludeChats []string
+	// WhisperOnlyChats: same matching as WhisperExcludeChats, inverted. When set,
+	// ONLY chats matching one of these patterns are transcribed; every other chat
+	// is treated as excluded. For members who want transcription on a single
+	// chat (e.g. their own "message yourself" chat) without listing every other
+	// contact. Exclude still wins over only when a chat matches both.
+	WhisperOnlyChats []string
 
 	ScrubPromptInjection bool
 	AuditLog             bool
@@ -107,6 +113,7 @@ func LoadConfig() (*Config, error) {
 		WhisperModelPath:        expandPath(getenv("WHATSAPP_WHISPER_MODEL_PATH", ""), home),
 		WhisperAPIKey:           getenv("WHATSAPP_WHISPER_API_KEY", ""),
 		WhisperExcludeChats:     splitNormalizedCSV(getenv("WHATSAPP_WHISPER_EXCLUDE_CHATS", "")),
+		WhisperOnlyChats:        splitNormalizedCSV(getenv("WHATSAPP_WHISPER_ONLY_CHATS", "")),
 		FFmpegBinPath:           getenv("WHATSAPP_FFMPEG_BIN_PATH", ""),
 		ScrubPromptInjection:    getenvBool("WHATSAPP_SCRUB_PROMPT_INJECTION", true),
 		AuditLog:                getenvBool("WHATSAPP_AUDIT_LOG", true),

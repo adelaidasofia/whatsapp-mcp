@@ -92,18 +92,25 @@ func (t *Transcriber) Enqueue(j transcriptionJob) {
 }
 
 // chatExcluded reports whether the chat matches any WHATSAPP_WHISPER_EXCLUDE_CHATS
-// pattern. Patterns are normalized substrings compared against the chat JID and
-// the chat's stored name/normalized_name (accent-insensitive, so "Mamá" and
-// "mama" both match).
+// pattern, or — when WHATSAPP_WHISPER_ONLY_CHATS is set — fails to match every
+// only-chats pattern. Patterns are normalized substrings compared against the
+// chat JID and the chat's stored name/normalized_name (accent-insensitive, so
+// "Mamá" and "mama" both match). Exclude wins over only.
 // Fails CLOSED: if the chat lookup errors we cannot know whether this chat is
 // on the exclude list, and the member asked for those chats to never be
 // transcribed. Treating "unknown" as excluded costs a transcript; treating it
 // as allowed sends a private voice note through transcription, which is not
 // recoverable once done. sql.ErrNoRows is NOT an error here — a chat row may
 // legitimately not exist yet, and the JID still gets matched below.
+// With an only-chats list, an empty chat JID is excluded too: an allow-list
+// that cannot identify the chat must not let it through.
 func (t *Transcriber) chatExcluded(chatJID string) bool {
-	if len(t.cfg.WhisperExcludeChats) == 0 || chatJID == "" {
+	only := t.cfg.WhisperOnlyChats
+	if len(t.cfg.WhisperExcludeChats) == 0 && len(only) == 0 {
 		return false
+	}
+	if chatJID == "" {
+		return len(only) > 0
 	}
 	var name, normName string
 	err := t.db.QueryRow(`SELECT COALESCE(name,''), COALESCE(normalized_name,'') FROM chats WHERE jid = ?`, chatJID).Scan(&name, &normName)
@@ -116,6 +123,14 @@ func (t *Transcriber) chatExcluded(chatJID string) bool {
 		if strings.Contains(hay, pat) {
 			return true
 		}
+	}
+	if len(only) > 0 {
+		for _, pat := range only {
+			if strings.Contains(hay, pat) {
+				return false
+			}
+		}
+		return true
 	}
 	return false
 }
