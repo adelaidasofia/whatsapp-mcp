@@ -286,6 +286,43 @@ func TestRealContentBeatsCarrier(t *testing.T) {
 	}
 }
 
+// TestEveryFutureProofEnvelopeIsUnwrapped: album items (associatedChildMessage)
+// and other FutureProofMessage wrappers absent from the old hard-coded list
+// must decode as their payload AND yield its media key, on both live and
+// history-sync paths (history sync delivers envelopes still in place).
+func TestEveryFutureProofEnvelopeIsUnwrapped(t *testing.T) {
+	pdf := func() *waE2E.Message {
+		return &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{
+			MediaKey: []byte{1, 2, 3}, Mimetype: proto.String("application/pdf"),
+			Caption: proto.String("factura"),
+		}}
+	}
+	fp := func(m *waE2E.Message) *waE2E.FutureProofMessage { return &waE2E.FutureProofMessage{Message: m} }
+	cases := map[string]*waE2E.Message{
+		"associatedChild": {AssociatedChildMessage: fp(pdf()), MessageContextInfo: &waE2E.MessageContextInfo{}},
+		"groupMentioned":  {GroupMentionedMessage: fp(pdf())},
+		"botInvoke":       {BotInvokeMessage: fp(pdf())},
+		"ephemeral>documentWithCaption": {EphemeralMessage: fp(&waE2E.Message{
+			DocumentWithCaptionMessage: fp(pdf())})},
+		"deviceSent>associatedChild": {DeviceSentMessage: &waE2E.DeviceSentMessage{
+			Message: &waE2E.Message{AssociatedChildMessage: fp(pdf())}}},
+	}
+	for name, m := range cases {
+		t.Run(name, func(t *testing.T) {
+			if text, typ := extractContentFromProto(m); text != "factura" || typ != "document" {
+				t.Errorf("decode = (%q, %q), want (factura, document)", text, typ)
+			}
+			f, ok := extractDownloadableFieldsFromProto(m)
+			if !ok || len(f.MediaKey) != 3 || f.MediaMime.String != "application/pdf" {
+				t.Errorf("media fields = %+v, %v; want key + pdf mime", f, ok)
+			}
+			if f2, _ := extractFromMessage(m); len(f2.MediaKey) != 3 {
+				t.Error("history-sync extractor disagrees with the live one")
+			}
+		})
+	}
+}
+
 func TestUnwrapEnvelopeHandlesNil(t *testing.T) {
 	if got := unwrapEnvelope(nil); got != nil {
 		t.Errorf("unwrapEnvelope(nil) = %v, want nil", got)

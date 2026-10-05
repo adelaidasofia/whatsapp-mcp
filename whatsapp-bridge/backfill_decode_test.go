@@ -86,7 +86,6 @@ func TestBackfillNeverOverwritesExistingContent(t *testing.T) {
 	cases := []struct{ id, typ, content string }{
 		{"keep-text", "text", "a real message that must survive"},
 		{"keep-image", "image", "a caption"},
-		{"keep-marker", "system", "[unsupported: encReactionMessage]"},
 		{"keep-voice", "voice", ""}, // media legitimately has empty content
 		{"keep-sticker", "sticker", ""},
 	}
@@ -110,6 +109,57 @@ func TestBackfillNeverOverwritesExistingContent(t *testing.T) {
 				t.Errorf("row mutated: (%q,%q) -> (%q,%q)", c.typ, c.content, typ, content)
 			}
 		})
+	}
+}
+
+// albumPDF is one item of a multi-file send as WhatsApp delivers it: wrapped in
+// associatedChildMessage, which the old hard-coded envelope list did not know.
+func albumPDF() *waE2E.Message {
+	return &waE2E.Message{AssociatedChildMessage: &waE2E.FutureProofMessage{
+		Message: &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{
+			MediaKey: []byte{1, 2, 3},
+			Mimetype: proto.String("application/pdf"),
+		}},
+	}}
+}
+
+// TestBackfillRepairsMarkerRowOnceDecodable: a marker records that the decoder
+// could not read the message, not that it never will. Once it can, the row is
+// repaired — but a re-delivery that still decodes to a marker leaves it alone.
+func TestBackfillRepairsMarkerRowOnceDecodable(t *testing.T) {
+	b, db := backfillDB(t)
+	seedRow(t, db, "album", "system", "[unsupported: associatedChildMessage]")
+	seedRow(t, db, "still-unknown", "system", "[unsupported: encReactionMessage]")
+
+	if n, err := b.backfillDecodedContent("album", albumPDF()); err != nil || n != 1 {
+		t.Fatalf("album: got (%d, %v), want (1, nil)", n, err)
+	}
+	if typ, content := rowOf(t, db, "album"); typ != "document" || content != "" {
+		t.Errorf("album row = (%q, %q), want (document, \"\")", typ, content)
+	}
+
+	n, err := b.backfillDecodedContent("still-unknown", &waE2E.Message{EncReactionMessage: &waE2E.EncReactionMessage{}})
+	if err != nil || n != 0 {
+		t.Fatalf("still-unknown: got (%d, %v), want (0, nil)", n, err)
+	}
+	if typ, content := rowOf(t, db, "still-unknown"); typ != "system" || content != "[unsupported: encReactionMessage]" {
+		t.Errorf("still-unknown row changed to (%q, %q)", typ, content)
+	}
+}
+
+// TestBackfillRepairsCaptionlessMedia: a PDF with no caption decodes to empty
+// text, and must still get its type back — "system" is not downloadable.
+func TestBackfillRepairsCaptionlessMedia(t *testing.T) {
+	b, db := backfillDB(t)
+	seedRow(t, db, "pdf", "system", "")
+
+	first, _ := b.backfillDecodedContent("pdf", albumPDF())
+	second, _ := b.backfillDecodedContent("pdf", albumPDF())
+	if first != 1 || second != 0 {
+		t.Fatalf("passes affected (%d, %d), want (1, 0)", first, second)
+	}
+	if typ, _ := rowOf(t, db, "pdf"); typ != "document" {
+		t.Errorf("type = %q, want document", typ)
 	}
 }
 
