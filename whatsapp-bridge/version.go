@@ -12,4 +12,4 @@ package main
 // Overridable at build time so a release binary can carry its exact tag:
 //
 //	go build -ldflags="-X main.bridgeVersion=$(git describe --tags)" .
-var bridgeVersion = "0.4.0"
+var bridgeVersion = "0.5.0"

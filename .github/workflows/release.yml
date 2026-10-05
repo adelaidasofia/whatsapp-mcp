@@ -58,6 +58,28 @@ jobs:
       CGO_ENABLED: '1'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Refuse a tag the checked-out code does not carry
+        shell: bash
+        # v0.4.1 was tagged with every stamp still at 0.4.0, so its binaries
+        # reported 0.4.0 at /healthcheck. A workflow_dispatch run also checks
+        # out the ref it was dispatched FROM, not the tag it uploads TO, so it
+        # can attach one version's binaries to another version's release. Both
+        # fail here, before anything is built or uploaded.
+        # TestVersionStampsAgree keeps the other stamps in line with version.go.
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          ver=$(tr -d '\r' < whatsapp-bridge/version.go | sed -n 's/^var bridgeVersion = "\([^"]*\)"$/\1/p')
+          if [ -z "${ver}" ]; then
+            echo "::error::could not read bridgeVersion from whatsapp-bridge/version.go; refusing to build a release whose version is unknown"
+            exit 1
+          fi
+          if [ "${TAG}" != "v${ver}" ]; then
+            echo "::error::release tag ${TAG} does not match bridgeVersion ${ver} in the checked-out code. Bump the version stamps and re-tag, or dispatch this workflow from the tag's own ref."
+            exit 1
+          fi
+          echo "tag ${TAG} matches bridgeVersion ${ver}."
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           go-version: 'stable'
