@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"regexp"
-	"runtime"
 	"strings"
 	"time"
 
@@ -303,25 +302,19 @@ func (b *Bridge) SetPairPhoneOnStart(phone string) {
 
 var nonDigits = regexp.MustCompile(`\D`)
 
-// pairPhoneDisplayName is the companion name a typed-code pairing registers,
-// shown on the phone under Linked devices. whatsmeow's PairPhone doc
-// (pair-code.go) says it "must be formatted as `Browser (OS)`, and only common
-// browsers/OSes are allowed (the server will validate it and return 400 if
-// it's wrong)". Each value here is one a widely deployed client already sends:
-// "Chrome (Linux)" is mautrix-whatsapp's, "Chrome (Mac OS)" is Baileys'
-// default and "Chrome (Windows)" is Baileys' Windows preset. Linux is also the
-// fallback for any other GOOS, since an unrecognized OS name is exactly what
-// the server rejects.
-func pairPhoneDisplayName(goos string) string {
-	switch goos {
-	case "windows":
-		return "Chrome (Windows)"
-	case "darwin":
-		return "Chrome (Mac OS)"
-	default:
-		return "Chrome (Linux)"
-	}
-}
+// pairPhoneDisplayName is the companion name sent with a typed-code pairing
+// request. whatsmeow's PairPhone doc (pair-code.go) says it "must be formatted
+// as `Browser (OS)`, and only common browsers/OSes are allowed (the server will
+// validate it and return 400 if it's wrong)"; v0.4.1 sent
+// "Chrome (whatsapp-mcp)" and got exactly that 400. Baileys hit the same 400
+// with "Chrome (Baileys)" and fixed it by changing the OS part:
+// https://github.com/WhiskeySockets/Baileys/commit/c17198e1d0ac780bf154c6697c9005e7beb92c9f
+//
+// The OS part is only a label here, so every OS sends the value
+// mautrix-whatsapp, a production bridge built on whatsmeow, sends, rather than
+// a per-OS label WhatsApp might not accept:
+// https://github.com/mautrix/whatsapp/blob/2ffea1248ab9ddcdb83712d2a7e85d277d51925e/pkg/connector/login.go#L215
+const pairPhoneDisplayName = "Chrome (Linux)"
 
 // RequestPairingCode wraps whatsmeow's PairPhone: the user types an 8-char
 // code on the phone instead of scanning a QR. Works identically on Android
@@ -345,7 +338,7 @@ func (b *Bridge) RequestPairingCode(ctx context.Context, phone string) (string, 
 	if pairPhone == nil {
 		pairPhone = b.client.PairPhone
 	}
-	code, err := pairPhone(ctx, digits, true, whatsmeow.PairClientChrome, pairPhoneDisplayName(runtime.GOOS))
+	code, err := pairPhone(ctx, digits, true, whatsmeow.PairClientChrome, pairPhoneDisplayName)
 	if err != nil {
 		return "", err
 	}

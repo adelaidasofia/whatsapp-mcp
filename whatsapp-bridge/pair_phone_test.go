@@ -3,42 +3,34 @@ package main
 import (
 	"context"
 	"regexp"
-	"runtime"
 	"testing"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/store"
 )
 
-// browserOS is the companion display-name shape WhatsApp accepts for a typed
-// pairing code, limited to names a deployed client already sends (see
-// pairPhoneDisplayName). v0.4.1 sent "Chrome (whatsapp-mcp)", so every
-// --pair-phone and POST /api/auth/pair-phone failed with
-// "info query returned status 400: bad-request", on every OS.
+// browserOS is the `Browser (OS)` shape whatsmeow's PairPhone documents for the
+// companion display name. v0.4.1 sent "Chrome (whatsapp-mcp)", and
+// --pair-phone / POST /api/auth/pair-phone failed with
+// "info query returned status 400: bad-request".
 var browserOS = regexp.MustCompile(`^Chrome \((Windows|Mac OS|Linux)\)$`)
 
-func TestPairPhoneDisplayNameIsBrowserOS(t *testing.T) {
+func TestPairPhoneDisplayNameIsTheProvenBrowserOSName(t *testing.T) {
 	if browserOS.MatchString("Chrome (whatsapp-mcp)") {
-		t.Fatal("control: the format check accepts the name the server rejected")
+		t.Fatal("control: the shape check accepts the name the server rejected")
 	}
-	for goos, want := range map[string]string{
-		"windows": "Chrome (Windows)",
-		"darwin":  "Chrome (Mac OS)",
-		"linux":   "Chrome (Linux)",
-		"freebsd": "Chrome (Linux)",
-	} {
-		got := pairPhoneDisplayName(goos)
-		if got != want {
-			t.Errorf("pairPhoneDisplayName(%q) = %q, want %q", goos, got, want)
-		}
-		if !browserOS.MatchString(got) {
-			t.Errorf("pairPhoneDisplayName(%q) = %q is not Browser (OS) with a known OS", goos, got)
-		}
+	if !browserOS.MatchString(pairPhoneDisplayName) {
+		t.Fatalf("pairPhoneDisplayName = %q is not Browser (OS)", pairPhoneDisplayName)
+	}
+	// Pinned to the value with production evidence behind it (see the
+	// constant's comment). Changing it needs that evidence for the new value.
+	if pairPhoneDisplayName != "Chrome (Linux)" {
+		t.Fatalf("pairPhoneDisplayName = %q; only %q has production evidence behind it", pairPhoneDisplayName, "Chrome (Linux)")
 	}
 }
 
-// Asserted where the value leaves the bridge, not on the helper: a helper test
-// stays green when the call site stops using the helper.
+// Asserted where the value leaves the bridge, not on the constant: a constant
+// test stays green when the call site stops using the constant.
 func TestRequestPairingCodeSendsABrowserOSDisplayName(t *testing.T) {
 	type call struct {
 		phone      string
@@ -67,8 +59,8 @@ func TestRequestPairingCodeSendsABrowserOSDisplayName(t *testing.T) {
 		t.Fatalf("PairPhone called %d times, want 1", len(calls))
 	}
 	c := calls[0]
-	if want := pairPhoneDisplayName(runtime.GOOS); c.name != want {
-		t.Errorf("display name sent to WhatsApp = %q, want %q", c.name, want)
+	if c.name != pairPhoneDisplayName {
+		t.Errorf("display name sent to WhatsApp = %q, want %q", c.name, pairPhoneDisplayName)
 	}
 	if !browserOS.MatchString(c.name) {
 		t.Errorf("display name sent to WhatsApp = %q, which the server answers with 400 bad-request", c.name)

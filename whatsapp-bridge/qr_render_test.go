@@ -18,11 +18,12 @@ import (
 // qrterminal.Generate runs IsSixelSupported first. On a Windows console with
 // VT processing on, go-colorable hands back os.Stdout itself, so the probe
 // gets past its writer check and calls term.MakeRaw on the OUTPUT handle;
-// conhost rejects the input-only mode, MakeRaw returns nil, and the probe's
-// deferred term.Restore(fd, nil) dereferences it (x/term term_windows.go:47).
-// The QR loop runs in the auth goroutine, so that panic took the whole bridge
-// down on every draw outside Windows Terminal. Bridge code must never reach
-// either function; tests may, as controls.
+// SetConsoleMode rejects the input-only mode, MakeRaw returns nil, and the
+// probe's deferred term.Restore(fd, nil) dereferences it (x/term
+// term_windows.go:47). The QR loop runs in the auth goroutine, so outside
+// Windows Terminal that panic took the whole bridge down on every draw on such
+// a console. Bridge code must never reach either function; tests may, as
+// controls.
 var qrterminalProbes = map[string]bool{"Generate": true, "IsSixelSupported": true}
 
 // qrterminalProbeRefs lists every reference to a probing qrterminal function
@@ -171,11 +172,34 @@ func TestDrawQRSurvivesAPanicMidDraw(t *testing.T) {
 			t.Fatalf("%s: control: the header never reached the writer, so the panic was not mid-draw", tc.goos)
 		}
 		got := logs.String()
-		for _, want := range []string{"simulated failure while drawing the QR", "GET /api/auth/qr", "attempt 3"} {
+		for _, want := range []string{"simulated failure while drawing the QR", "GET /api/auth/qr", "--pair-phone", "attempt 3"} {
 			if !strings.Contains(got, want) {
 				t.Errorf("%s (Windows Terminal %v): log is missing %q:\n%s", tc.goos, tc.windowsTerminal, want, got)
 			}
 		}
+	}
+}
+
+// A draw that fails fails again on every rotation, every few seconds; one stack
+// diagnoses it, and a stack per rotation buries the line that says how to pair.
+func TestDrawQRLogsTheStackOnlyOnce(t *testing.T) {
+	qrDrawStackLogged.Store(false)
+	t.Cleanup(func() { qrDrawStackLogged.Store(false) })
+
+	var logs bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
+	for attempt := 1; attempt <= 3; attempt++ {
+		drawQR(&panicsOnQRWriter{}, "2@code", attempt, 20*time.Second, "darwin", false)
+	}
+	got := logs.String()
+	if n := strings.Count(got, "could not draw the QR"); n != 3 {
+		t.Fatalf("control: %d failed draws logged, want 3:\n%s", n, got)
+	}
+	if n := strings.Count(got, "[running]:"); n != 1 {
+		t.Errorf("logged %d goroutine stacks over 3 failed draws, want 1:\n%s", n, got)
 	}
 }
 

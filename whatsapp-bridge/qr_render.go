@@ -7,6 +7,7 @@ import (
 	"os"
 	"runtime"
 	"runtime/debug"
+	"sync/atomic"
 	"time"
 
 	"github.com/mattn/go-colorable"
@@ -41,14 +42,23 @@ func renderQRToTerminal(code string, attempt int, expiresIn time.Duration) {
 	drawQR(w, code, attempt, expiresIn, runtime.GOOS, os.Getenv("WT_SESSION") != "")
 }
 
+// qrDrawStackLogged keeps a draw that fails on every rotation from printing a
+// full stack each time; the first one is what diagnoses it.
+var qrDrawStackLogged atomic.Bool
+
 // drawQR is renderQRToTerminal after the environment reads, so tests can drive
-// every branch. A panic while drawing is logged with its stack and the run
-// carries on: the code is still served at /api/auth/qr, and the login loop
-// that called this has to keep rotating it.
+// every branch. A panic while drawing is logged (with its stack the first
+// time) and the run carries on: the code is still served at /api/auth/qr, and
+// the login loop that called this has to keep rotating it.
 func drawQR(w io.Writer, code string, attempt int, expiresIn time.Duration, goos string, windowsTerminal bool) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("auth: could not draw the QR in this console: %v\n%s", r, debug.Stack())
+			if qrDrawStackLogged.CompareAndSwap(false, true) {
+				log.Printf("auth: could not draw the QR in this console: %v\n%s", r, debug.Stack())
+			} else {
+				log.Printf("auth: could not draw the QR in this console: %v", r)
+			}
+			log.Printf("auth: pair from GET /api/auth/qr instead, or restart with --pair-phone to pair by typed code")
 			logQRRotated(attempt, expiresIn)
 		}
 	}()

@@ -22,20 +22,20 @@ Known operational pain points and how to recover. Each entry: symptom → cause 
 
 **Symptom.** Outside Windows Terminal, the bridge exits right where the QR should draw, with `panic: runtime error: invalid memory address or nil pointer dereference` and a stack running through `qrterminal` and `golang.org/x/term` `term_windows.go:47`. It happens on every attempt.
 
-**Cause.** v0.4.1 and earlier asked the QR library to probe the console for sixel graphics before drawing. In a console with VT processing on (VS Code's terminal, PowerShell 7, most current hosts) that probe fails and then panics in its own cleanup, and the panic takes the bridge with it.
+**Cause.** v0.4.1 and earlier asked the QR library to probe the console for sixel graphics before drawing. In a console that already has VT processing on, that probe fails and then panics in its own cleanup, and the panic takes the bridge with it. Whether VT processing is on depends on the terminal and the shell that start the bridge.
 
 **Fix.**
-- Upgrade to v0.5.0 or later; the probe is gone and a failed draw no longer stops pairing.
+- Upgrade to the first release after v0.4.1; the probe is gone, and a crash while drawing no longer stops the bridge.
 - On an older binary, set `WT_SESSION` before starting the bridge so it takes the Windows Terminal path: `$env:WT_SESSION = "1"` in PowerShell, `set WT_SESSION=1` in cmd. Or run it inside Windows Terminal.
 
 ## `--pair-phone` fails with `400: bad-request`
 
 **Symptom.** No pairing code ever prints. The log shows `--pair-phone failed (info query returned status 400: bad-request); falling back to QR scanning`, or `POST /api/auth/pair-phone` answers `pairing_code_unavailable` with that detail.
 
-**Cause.** v0.4.1 and earlier registered the device under the name `Chrome (whatsapp-mcp)`. WhatsApp only accepts a `Browser (OS)` name with a common browser and OS and rejects anything else with 400. Every OS was affected, not only Windows.
+**Cause.** v0.4.1 and earlier requested the typed code under the name `Chrome (whatsapp-mcp)`. WhatsApp only accepts a `Browser (OS)` name with a common browser and OS and rejects anything else with 400. The name was the same on every OS, so this is not Windows-specific.
 
 **Fix.**
-- Upgrade to v0.5.0 or later.
+- Upgrade to the first release after v0.4.1.
 - On an older binary, pair with the QR. If your console cannot draw it, `GET /api/auth/qr` returns the raw code as `qr_code`; render it with a QR tool on the same machine and scan that. Never paste it into a website: until it expires it is a live pairing credential for your bridge.
 
 ## "StreamReplaced" disconnect / bridge logs out
