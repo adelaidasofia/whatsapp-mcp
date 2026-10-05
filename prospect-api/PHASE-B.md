@@ -135,7 +135,7 @@ The dependency chain runs **10 → 8 → 7 → 9**:
 
 **Implementation notes (post-ship):**
 
-- Renamed from `/api/notify-adelaida` to `/api/notify-owner` in PR #14
+- Renamed from its original owner-named path to `/api/notify-owner` in PR #14
   (BREAKING). Anchor links to the old name will not resolve.
 - Quiet-hours and shared-budget gating are **disabled** for
   `/api/notify-owner` as of 2026-05-03 (PR #15). The concierge real-time
