@@ -16,7 +16,27 @@ Known operational pain points and how to recover. Each entry: symptom → cause 
 - Put your phone on the same network as the bridge for the pairing step (you can switch back after).
 - If you previously paired this device, delete the `store/` directory before re-running the bridge. `store/` contains the persistent multidevice session; pairing skips when one already exists.
 - The QR refreshes in place every ~20 s and the bridge auto-requests a fresh batch when one expires — always scan the code currently on screen. (`pair: timeout` no longer kills the process.)
-- **Windows: QR renders as garbage characters.** Legacy consoles mis-render the compact half-block glyphs under OEM codepages; the bridge already falls back to ANSI block rendering outside Windows Terminal. If it still looks wrong, use [Windows Terminal](https://aka.ms/terminal) — or skip the QR entirely: `.\bin\whatsapp-bridge.exe --pair-phone +15551234567` prints a typed code (phone side: WhatsApp › Linked Devices › Link a Device › "Link with phone number instead").
+- **Windows: QR renders as garbage characters.** Legacy consoles mis-render the compact half-block glyphs under OEM codepages; the bridge already falls back to ANSI block rendering outside Windows Terminal. If it still looks wrong, use [Windows Terminal](https://aka.ms/terminal) — or skip the QR entirely: `.\bin\whatsapp-bridge.exe --pair-phone +15551234567` prints a typed code (phone side: WhatsApp › Linked Devices › Link a Device › "Link with phone number instead"). On v0.4.1 and earlier `--pair-phone` itself fails; see below.
+
+## Windows: the bridge crashes when the QR should appear
+
+**Symptom.** Outside Windows Terminal, the bridge exits right where the QR should draw, with `panic: runtime error: invalid memory address or nil pointer dereference` and a stack running through `qrterminal` and `golang.org/x/term` `term_windows.go:47`. It happens on every attempt.
+
+**Cause.** v0.4.1 and earlier asked the QR library to probe the console for sixel graphics before drawing. In a console with VT processing on (VS Code's terminal, PowerShell 7, most current hosts) that probe fails and then panics in its own cleanup, and the panic takes the bridge with it.
+
+**Fix.**
+- Upgrade to v0.5.0 or later; the probe is gone and a failed draw no longer stops pairing.
+- On an older binary, set `WT_SESSION` before starting the bridge so it takes the Windows Terminal path: `$env:WT_SESSION = "1"` in PowerShell, `set WT_SESSION=1` in cmd. Or run it inside Windows Terminal.
+
+## `--pair-phone` fails with `400: bad-request`
+
+**Symptom.** No pairing code ever prints. The log shows `--pair-phone failed (info query returned status 400: bad-request); falling back to QR scanning`, or `POST /api/auth/pair-phone` answers `pairing_code_unavailable` with that detail.
+
+**Cause.** v0.4.1 and earlier registered the device under the name `Chrome (whatsapp-mcp)`. WhatsApp only accepts a `Browser (OS)` name with a common browser and OS and rejects anything else with 400. Every OS was affected, not only Windows.
+
+**Fix.**
+- Upgrade to v0.5.0 or later.
+- On an older binary, pair with the QR. If your console cannot draw it, `GET /api/auth/qr` returns the raw code as `qr_code`; render it with a QR tool on the same machine and scan that. Never paste it into a website: until it expires it is a live pairing credential for your bridge.
 
 ## "StreamReplaced" disconnect / bridge logs out
 
