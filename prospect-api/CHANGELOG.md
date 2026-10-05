@@ -4,8 +4,9 @@
 
 ### Changed (BREAKING)
 
-- Renamed `/api/notify-adelaida` → `/api/notify-owner` (PR #14). External
-  callers and anchor links to the old name must update.
+- Renamed the owner-notification endpoint, previously named after the owner,
+  to `/api/notify-owner` (PR #14). External callers and anchor links to the
+  old name must update.
 
 ### Changed
 
@@ -127,9 +128,10 @@ Phase B will add:
 
 - `POST /api/get-negotiator-terms` (Sprint 10) reading from
   `⚙️ Meta/Negotiator Playbook.md`.
-- `POST /api/notify-adelaida` (Sprint 8) sending via the whatsapp-bridge with
-  a shared 10/hour budget across endpoints.
+- `POST /api/notify-owner` (Sprint 8; shipped under an owner-named path until
+  PR #14) sending via the whatsapp-bridge with a shared 10/hour budget across
+  endpoints.
 - `POST /api/relay-note` (Sprint 7) writing structured inbox files into
-  `📮 Inbox/` and conditionally calling notify-adelaida.
+  `📮 Inbox/` and conditionally calling notify-owner.
 - `POST /api/morning-digest` (Sprint 9) cron-triggered at the configured
   local hour by an internal goroutine.
