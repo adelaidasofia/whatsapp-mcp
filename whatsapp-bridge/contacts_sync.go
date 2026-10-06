@@ -61,6 +61,20 @@ func addressBookName(fullName, firstName string) string {
 	return strings.TrimSpace(firstName)
 }
 
+// phoneFromJID returns the phone number a JID carries, or NULL when it carries
+// none. Only the phone-number form (@s.whatsapp.net) carries one. The user
+// part of a @lid JID is an opaque identifier, and storing it as a phone is the
+// failure bridge.go's phone-column rule exists to prevent; a user part that is
+// not a bare number is not stored either.
+func phoneFromJID(jid string) sql.NullString {
+	parsed, err := types.ParseJID(jid)
+	if err != nil || parsed.Server != types.DefaultUserServer ||
+		parsed.User == "" || digitsOnly(parsed.User) != parsed.User {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: parsed.User, Valid: true}
+}
+
 // writeContactName records one address-book entry and renames the chats it
 // belongs to. Returns how many chat rows were renamed.
 //
@@ -79,14 +93,20 @@ func writeContactName(ctx context.Context, ex execer, jid, name string, now int6
 		norm = sql.NullString{String: Normalize(name), Valid: true}
 	}
 
+	// phone is written too. This used to leave it NULL, with the number only
+	// inside the JID, and search_contacts, CRM enrichment and the phone field
+	// of every response all read the column: a saved contact was findable by
+	// number only when some other path had stored the number on one of their
+	// rows. Migration 008 repairs the rows written before this.
 	if _, err := ex.ExecContext(ctx, `
-		INSERT INTO contacts (jid, full_name, normalized_full_name, is_business, created_at, updated_at)
-		VALUES (?, ?, ?, 0, ?, ?)
+		INSERT INTO contacts (jid, phone, full_name, normalized_full_name, is_business, created_at, updated_at)
+		VALUES (?, ?, ?, ?, 0, ?, ?)
 		ON CONFLICT(jid) DO UPDATE SET
+			phone                = COALESCE(excluded.phone, contacts.phone),
 			full_name            = excluded.full_name,
 			normalized_full_name = excluded.normalized_full_name,
 			updated_at           = excluded.updated_at
-	`, jid, full, norm, now, now); err != nil {
+	`, jid, phoneFromJID(jid), full, norm, now, now); err != nil {
 		return 0, fmt.Errorf("contact %s: %w", jid, err)
 	}
 

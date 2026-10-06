@@ -64,7 +64,10 @@ func RunBaileysImport(cfg *Config, db *sql.DB, storePath string) error {
 	// --- Import contacts ---
 	contactsInserted := 0
 	for jid, c := range store.Contacts {
-		phone := extractPhone(jid)
+		// Only a phone-number JID carries a phone. extractPhone keeps the
+		// digits of any JID, so a @lid contact used to be imported with its
+		// LID stored, and displayed, as its phone number.
+		phone := phoneFromJID(jid)
 		displayName := strings.TrimSpace(c.Notify)
 		if displayName == "" {
 			displayName = strings.TrimSpace(c.Name)
@@ -73,8 +76,8 @@ func RunBaileysImport(cfg *Config, db *sql.DB, storePath string) error {
 			displayName = strings.TrimSpace(c.VerifiedName)
 		}
 		if displayName == "" {
-			if phone != "" {
-				displayName = "+" + phone
+			if phone.Valid {
+				displayName = "+" + phone.String
 			} else {
 				displayName = jid
 			}
