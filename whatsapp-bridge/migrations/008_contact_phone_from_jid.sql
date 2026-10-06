@@ -16,6 +16,13 @@
 --
 -- updated_at is left alone on purpose: search orders its results by it, and a
 -- column filled in by a migration is not activity.
+--
+-- The rows it fills become visible to anything that matches on phone. CRM
+-- enrichment (crm_enrich.go) is one: when a CRM folder is configured it runs
+-- after every start, and it may now give one of these rows a push_name from
+-- the CRM, bumping updated_at as it does for every row it enriches. That is
+-- the feature reaching rows it could not see before, not this migration
+-- writing them.
 
 UPDATE contacts
    SET phone = SUBSTR(jid, 1, INSTR(jid, '@') - 1)

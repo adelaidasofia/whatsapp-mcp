@@ -673,6 +673,7 @@ func (s *Server) handleSearchContacts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	norm := Normalize(query)
+	namePattern := "%" + norm + "%"
 	num := numberQuery(query)
 
 	// Initial match by name/phone/lid/JID. We then expand each match through
@@ -692,8 +693,12 @@ func (s *Server) handleSearchContacts(w http.ResponseWriter, r *http.Request) {
 	// so a saved contact was found by name and, unless some other path had
 	// stored the number on one of their rows, never by number. Matching the
 	// JID keeps the search independent of which writer filled the column. The
-	// @s.whatsapp.net suffix keeps a @lid user part, an opaque identifier,
-	// from ever matching as a number.
+	// @s.whatsapp.net suffix keeps the JID clause off @lid rows, whose user
+	// part is an opaque identifier rather than a number.
+	//
+	// Rows that match by name rank first. A short number-shaped query can
+	// match many rows by phone ("7-" matches every phone with a 7), and those
+	// must not push a name match ("7-Eleven") past the limit.
 	rows, err := s.db.QueryContext(r.Context(), `
 		SELECT jid, COALESCE(lid, ''), COALESCE(phone, ''), COALESCE(full_name, ''),
 		       COALESCE(push_name, ''), COALESCE(verified_name, ''), is_business
@@ -701,9 +706,10 @@ func (s *Server) handleSearchContacts(w http.ResponseWriter, r *http.Request) {
 		WHERE normalized_name LIKE ? OR normalized_full_name LIKE ?
 		   OR phone LIKE ? OR lid LIKE ?
 		   OR jid LIKE ?
-		ORDER BY updated_at DESC
+		ORDER BY (normalized_name LIKE ? OR normalized_full_name LIKE ?) DESC, updated_at DESC
 		LIMIT ?
-	`, "%"+norm+"%", "%"+norm+"%", "%"+num+"%", "%"+query+"%", "%"+num+"%@s.whatsapp.net", limit)
+	`, namePattern, namePattern, "%"+num+"%", "%"+query+"%", "%"+num+"%@s.whatsapp.net",
+		namePattern, namePattern, limit)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "query failed", Details: err.Error()})
 		return
@@ -786,18 +792,19 @@ func loadContactRow(ctx context.Context, db *sql.DB, jid string) (contactRow, bo
 
 // numberQuery is what a contact search matches against phone numbers. A query
 // written as a number, digits plus the spacing and punctuation numbers are
-// formatted with ("+57 300 123 4567", "(300) 123-4567"), is reduced to its
-// digits: phone and the phone-number JID both store bare digits, and the
-// formatted string matched neither. Invisible format characters count as
-// spacing. Any other query is returned unchanged.
+// formatted with ("+57 300 123 4567", "(300) 123-4567", "300/1234567"), is
+// reduced to its digits: phone and the phone-number JID both store bare
+// digits, and the formatted string matched neither. Every Unicode dash counts
+// as punctuation, and invisible format characters count as spacing. Any other
+// query is returned unchanged.
 func numberQuery(q string) string {
 	hasDigit := false
 	for _, r := range q {
 		switch {
 		case r >= '0' && r <= '9':
 			hasDigit = true
-		case r == '+' || r == '-' || r == '(' || r == ')' || r == '.',
-			unicode.IsSpace(r), unicode.Is(unicode.Cf, r):
+		case r == '+' || r == '(' || r == ')' || r == '.' || r == '/',
+			unicode.Is(unicode.Pd, r), unicode.IsSpace(r), unicode.Is(unicode.Cf, r):
 		default:
 			return q
 		}

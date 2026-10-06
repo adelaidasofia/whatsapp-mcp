@@ -62,14 +62,20 @@ func addressBookName(fullName, firstName string) string {
 }
 
 // phoneFromJID returns the phone number a JID carries, or NULL when it carries
-// none. Only the phone-number form (@s.whatsapp.net) carries one. The user
-// part of a @lid JID is an opaque identifier, and storing it as a phone is the
-// failure bridge.go's phone-column rule exists to prevent; a user part that is
-// not a bare number is not stored either.
+// none. Only the phone-number forms carry one: @s.whatsapp.net, and the legacy
+// @c.us (types.LegacyUserServer). The user part of a @lid JID is an opaque
+// identifier, and storing it as a phone is the failure bridge.go's
+// phone-column rule exists to prevent. types.ParseJID splits off a device
+// suffix first; a user part that is still not a bare number is not stored.
 func phoneFromJID(jid string) sql.NullString {
 	parsed, err := types.ParseJID(jid)
-	if err != nil || parsed.Server != types.DefaultUserServer ||
-		parsed.User == "" || digitsOnly(parsed.User) != parsed.User {
+	if err != nil {
+		return sql.NullString{}
+	}
+	if parsed.Server != types.DefaultUserServer && parsed.Server != types.LegacyUserServer {
+		return sql.NullString{}
+	}
+	if parsed.User == "" || digitsOnly(parsed.User) != parsed.User {
 		return sql.NullString{}
 	}
 	return sql.NullString{String: parsed.User, Valid: true}

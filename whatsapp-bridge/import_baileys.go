@@ -75,12 +75,13 @@ func RunBaileysImport(cfg *Config, db *sql.DB, storePath string) error {
 		if displayName == "" {
 			displayName = strings.TrimSpace(c.VerifiedName)
 		}
-		if displayName == "" {
-			if phone.Valid {
-				displayName = "+" + phone.String
-			} else {
-				displayName = jid
-			}
+		// A nameless contact gets the "+<phone>" placeholder only when it has
+		// a phone; export_vault.go and crm_enrich.go read that shape as "no
+		// name yet". Any other JID gets no label. Its digits are not a phone,
+		// and the raw JID is not a name: the vault export shows a push_name
+		// that is not a placeholder ahead of the name the user saved.
+		if displayName == "" && phone.Valid {
+			displayName = "+" + phone.String
 		}
 
 		_, err := db.Exec(`
