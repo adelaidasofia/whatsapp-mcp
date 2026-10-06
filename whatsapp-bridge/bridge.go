@@ -76,6 +76,11 @@ type Bridge struct {
 	loggedOutReason  string
 	loginRunning     bool
 	pairPhoneOnStart string // --pair-phone flag: request a typed code on first QR event
+
+	// pairPhone is the whatsmeow PairPhone call RequestPairingCode makes, held
+	// as a field so a test can see exactly what reaches WhatsApp. nil means
+	// b.client.PairPhone.
+	pairPhone func(ctx context.Context, phone string, showPushNotification bool, clientType whatsmeow.PairClientType, clientDisplayName string) (string, error)
 }
 
 // NewBridge builds the whatsmeow client, prepares its session store, and registers event handlers.
