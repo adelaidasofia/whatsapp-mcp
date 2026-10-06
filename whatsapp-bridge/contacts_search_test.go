@@ -168,17 +168,22 @@ func TestAddressBookWriteKeepsAPhoneLearnedElsewhere(t *testing.T) {
 // A short number-shaped query can match many rows by phone. The rows that
 // match by name must still come first, or the default limit of 10 drops
 // them: "7-" finds "7-Eleven" by name, and the number clauses also match
-// every phone with a 7 in it.
+// every phone with a 7 in it. Both name columns count: the self-chosen name
+// and the one saved in the address book.
 func TestNameMatchesRankAheadOfNumberMatches(t *testing.T) {
 	db := newContactTestDB(t)
-	// The name match is the oldest row, so ordering by recency alone would
-	// put it last.
-	const store = "15555550100@s.whatsapp.net"
+	// Both name matches are the oldest rows, so ordering by recency alone
+	// would put them last. Neither JID nor phone contains a 7.
+	const pushNamed = "15555550100@s.whatsapp.net"
 	if _, err := db.Exec(`
 		INSERT INTO contacts (jid, phone, push_name, normalized_name, is_business, created_at, updated_at)
 		VALUES (?, '15555550100', '7-Eleven', ?, 0, 0, 1)
-	`, store, Normalize("7-Eleven")); err != nil {
-		t.Fatalf("seed name match: %v", err)
+	`, pushNamed, Normalize("7-Eleven")); err != nil {
+		t.Fatalf("seed push-name match: %v", err)
+	}
+	const addressBookNamed = "15555550101@s.whatsapp.net"
+	if _, err := writeContactName(t.Context(), db, addressBookNamed, "7-Eleven Centro", 1); err != nil {
+		t.Fatalf("seed address-book match: %v", err)
 	}
 	for i := 0; i < 12; i++ {
 		digits := fmt.Sprintf("1555557%04d", i)
@@ -191,9 +196,132 @@ func TestNameMatchesRankAheadOfNumberMatches(t *testing.T) {
 	}
 
 	got := searchContacts(t, db, "7-")
-	if len(got) == 0 || got[0].JID != store {
-		t.Fatalf("first result = %+v, want the name match %s ahead of the number matches", got, store)
+	if len(got) < 2 {
+		t.Fatalf("got %d results, want both name matches first: %+v", len(got), got)
 	}
+	first := map[string]bool{got[0].JID: true, got[1].JID: true}
+	if !first[pushNamed] || !first[addressBookNamed] {
+		t.Fatalf("first two results = %s, %s; want the name matches %s and %s ahead of the number matches",
+			got[0].JID, got[1].JID, pushNamed, addressBookNamed)
+	}
+}
+
+// Among rows that match only by number, the newest comes first whatever
+// their name columns hold. A rank expression that evaluates to NULL when a
+// name column is empty and to 0 when both are set (SQL's three-valued LIKE)
+// put an old, fully named contact ahead of a newer one.
+func TestNumberOnlyMatchesKeepRecencyOrder(t *testing.T) {
+	db := newContactTestDB(t)
+	const older = "15555550201@s.whatsapp.net"
+	if _, err := db.Exec(`
+		INSERT INTO contacts (jid, phone, push_name, normalized_name, full_name, normalized_full_name,
+		                      is_business, created_at, updated_at)
+		VALUES (?, '15555550201', 'Olga', 'olga', 'Olga P', 'olga p', 0, 0, 1)
+	`, older); err != nil {
+		t.Fatalf("seed older: %v", err)
+	}
+	const newer = "15555550202@s.whatsapp.net"
+	if _, err := db.Exec(`
+		INSERT INTO contacts (jid, phone, is_business, created_at, updated_at)
+		VALUES (?, '15555550202', 0, 0, 2)
+	`, newer); err != nil {
+		t.Fatalf("seed newer: %v", err)
+	}
+
+	got := searchContacts(t, db, "555555020")
+	if len(got) != 2 || got[0].JID != newer || got[1].JID != older {
+		t.Fatalf("got %+v, want [%s, %s] (newest first)", got, newer, older)
+	}
+}
+
+// phoneFromJID decides what every writer that uses it stores as a phone.
+// Each guard is pinned here, including the ones only a malformed import can
+// reach (an empty user part, a user part that is not a number).
+func TestPhoneFromJID(t *testing.T) {
+	none := sql.NullString{}
+	phone := func(s string) sql.NullString { return sql.NullString{String: s, Valid: true} }
+	for _, tc := range []struct {
+		jid  string
+		want sql.NullString
+	}{
+		{"573001234567@s.whatsapp.net", phone("573001234567")},
+		{"573001234567:12@s.whatsapp.net", phone("573001234567")}, // device suffix split off first
+		{"15555550100@c.us", phone("15555550100")},                // legacy phone-number form
+		{"123456789012345@lid", none},                             // opaque identifier, not a number
+		{"120363000000000000@g.us", none},                         // a group
+		{"@s.whatsapp.net", none},                                 // empty user part
+		{"57300abc@s.whatsapp.net", none},                         // user part is not a bare number
+		{"not-a-jid", none},                                       // no server at all
+	} {
+		if got := phoneFromJID(tc.jid); got != tc.want {
+			t.Errorf("phoneFromJID(%q) = %+v, want %+v", tc.jid, got, tc.want)
+		}
+	}
+}
+
+// CRM enrichment fills push_name for contacts it can match by phone, and the
+// rows migration 008 fills are address-book contacts it could not match
+// before. It must leave a name saved in the address book alone: the vault
+// export shows push_name ahead of the chat name, so enriching "Mi Amor" would
+// rename that person's export file after the CRM entry. A contact with no
+// name at all is still enriched.
+func TestCRMEnrichmentLeavesAnAddressBookNameAlone(t *testing.T) {
+	db := xvDB(t)
+	const ts = int64(1786000000)
+	const saved = "573001234567@s.whatsapp.net"
+	xvChat(t, db, saved, "direct", "", ts)
+	xvMsg(t, db, "M1", saved, saved, "", "text", "hola", "", ts, false)
+	if _, err := writeContactName(t.Context(), db, saved, "Mi Amor", ts); err != nil {
+		t.Fatalf("writeContactName: %v", err)
+	}
+	const unnamed = "15555550100@s.whatsapp.net"
+	xvContact(t, db, unnamed, "", "15555550100")
+
+	crm := t.TempDir()
+	for file, body := range map[string]string{
+		"Ivette De La Vega.md": "---\nphone: \"+57 300 123 4567\"\n---\n",
+		"Ana Gomez.md":         "---\nphone: 15555550100\n---\n",
+	} {
+		if err := os.WriteFile(filepath.Join(crm, file), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	updated, err := EnrichContactsFromVault(db, crm)
+	if err != nil {
+		t.Fatalf("EnrichContactsFromVault: %v", err)
+	}
+
+	pushName := func(jid string) string {
+		t.Helper()
+		var name string
+		if err := db.QueryRow(`SELECT COALESCE(push_name, '') FROM contacts WHERE jid = ?`, jid).Scan(&name); err != nil {
+			t.Fatalf("read %s: %v", jid, err)
+		}
+		return name
+	}
+	if got := pushName(saved); got != "" {
+		t.Errorf("address-book contact got push_name %q from the CRM, want none", got)
+	}
+	if got := pushName(unnamed); got != "Ana Gomez" {
+		t.Errorf("unnamed contact push_name = %q, want the CRM name (enrichment still works)", got)
+	}
+	if updated != 1 {
+		t.Errorf("enrichment updated %d rows, want 1", updated)
+	}
+
+	units, _, err := buildExportUnits(db, false, 0, nil)
+	if err != nil {
+		t.Fatalf("buildExportUnits: %v", err)
+	}
+	for _, u := range units {
+		if u.primary == saved {
+			if u.display != "Mi Amor" {
+				t.Fatalf("export display = %q, want the address-book name %q", u.display, "Mi Amor")
+			}
+			return
+		}
+	}
+	t.Fatalf("no export unit for %s among %d units", saved, len(units))
 }
 
 // Migration 008 repairs the rows the address-book writer already wrote with
