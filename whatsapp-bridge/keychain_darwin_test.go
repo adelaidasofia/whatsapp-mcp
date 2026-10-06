@@ -27,6 +27,20 @@ import (
 // fail-loud contract, and is now enforced by keychainTimeout. What is never
 // acceptable, on any host, is hanging. That is what this pins.
 func TestMacOSKeychainNeverHangs(t *testing.T) {
+	// This touches the REAL login keychain, so it runs only where that is
+	// harmless: on GitHub Actions (a throwaway runner, nobody's keychain), or
+	// on a desktop Mac whose owner opted in with WHATSAPP_KEYCHAIN_INTERACTIVE=1
+	// and is there to answer the dialog. Anywhere else, meaning an agent or a
+	// local gate running `go test ./...` on someone's Mac, it adds an item to
+	// that person's login keychain and reads it back through /usr/bin/security,
+	// which the `-T ""` ACL does not trust. macOS then asks for the login
+	// password to release whatsapp-mcp-test-<pid>, once per run, in front of
+	// whoever is at the machine, who never started a test.
+	if os.Getenv("GITHUB_ACTIONS") != "true" && os.Getenv("WHATSAPP_KEYCHAIN_INTERACTIVE") != "1" {
+		t.Skip("touches the real login keychain and makes macOS ask for the password; " +
+			"runs on GitHub Actions, or locally with WHATSAPP_KEYCHAIN_INTERACTIVE=1")
+	}
+
 	service := fmt.Sprintf("whatsapp-mcp-test-%d", os.Getpid())
 	account := "test"
 	t.Cleanup(func() {

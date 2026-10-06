@@ -158,7 +158,7 @@ func getOrCreateDBKeyMacOS(service, account, dbPath string) (string, error) {
 				"-s", service,
 				"-a", account,
 				"-w", key,
-				"-T", "", // restrict access to this binary path; empty = default ACL
+				"-T", "", // empty trusted-app list: even /usr/bin/security must ask the user to read it back (keychain_darwin_test.go)
 			))
 		},
 	}.getOrCreate(dbPath)
