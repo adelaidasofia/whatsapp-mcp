@@ -12,8 +12,9 @@ name: release-binaries
 #
 # Security note: no untrusted user-supplied fields are interpolated into run
 # blocks. The release tag name reaches run steps via an env var, never inline,
-# and selects the checkout ref through an action input. Builds run only on
-# releases published by repo collaborators.
+# and for workflow_dispatch it also selects the checkout ref through an action
+# input, after the first step has validated it. Builds run only on releases
+# published by repo collaborators.
 
 on:
   release:
@@ -75,7 +76,7 @@ jobs:
           TAG: ${{ inputs.tag }}
         run: |
           if [[ ! "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]*)?$ ]]; then
-            echo "::error::the tag input must be an existing release tag like v1.2.3 (got ${#TAG} characters that are not one)"
+            echo "::error::the tag input must be an existing release tag like v1.2.3; the ${#TAG}-character value given is not one"
             exit 1
           fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -106,8 +107,9 @@ jobs:
             exit 1
           fi
           if [ "${TAG}" != "v${ver}" ]; then
-            # Shown through a filter: a dispatch input can carry a newline, and
-            # a raw one would start a workflow command of its own.
+            # Shown through a filter as a second layer: the first step already
+            # rejects a dispatch input carrying a newline, which printed raw
+            # would start a workflow command of its own.
             shown=$(printf '%s' "${TAG}" | tr -cd 'A-Za-z0-9._+-')
             echo "::error::release tag ${shown} points at code whose bridgeVersion is ${ver}, so the tag should be v${ver}. Bump the version stamps on the commit you release, then tag that commit."
             exit 1
