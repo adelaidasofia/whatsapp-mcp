@@ -2,7 +2,7 @@
   "manifest_version": "0.4",
   "name": "whatsapp-mcp",
   "display_name": "Personal WhatsApp MCP for Claude, built directly on whatsmeow",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Personal WhatsApp MCP for Claude, built directly on whatsmeow. Encrypted-at-rest storage, Whisper voice-note transcription, accent-insensitive Spanish search, vault-native CRM integration, send-confirmation safety.",
   "author": {
     "name": "adelaidasofia",
