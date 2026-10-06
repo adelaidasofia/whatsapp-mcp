@@ -698,7 +698,10 @@ func (s *Server) handleSearchContacts(w http.ResponseWriter, r *http.Request) {
 	//
 	// Rows that match by name rank first. A short number-shaped query can
 	// match many rows by phone ("7-" matches every phone with a 7), and those
-	// must not push a name match ("7-Eleven") past the limit.
+	// must not push a name match ("7-Eleven") past the limit. The rank is a
+	// CASE so it is always 1 or 0: LIKE on a NULL column is NULL, and a bare
+	// OR of two LIKEs would sort rows with both name columns set ahead of
+	// newer rows with an empty one.
 	rows, err := s.db.QueryContext(r.Context(), `
 		SELECT jid, COALESCE(lid, ''), COALESCE(phone, ''), COALESCE(full_name, ''),
 		       COALESCE(push_name, ''), COALESCE(verified_name, ''), is_business
@@ -706,7 +709,8 @@ func (s *Server) handleSearchContacts(w http.ResponseWriter, r *http.Request) {
 		WHERE normalized_name LIKE ? OR normalized_full_name LIKE ?
 		   OR phone LIKE ? OR lid LIKE ?
 		   OR jid LIKE ?
-		ORDER BY (normalized_name LIKE ? OR normalized_full_name LIKE ?) DESC, updated_at DESC
+		ORDER BY CASE WHEN normalized_name LIKE ? OR normalized_full_name LIKE ? THEN 1 ELSE 0 END DESC,
+		         updated_at DESC
 		LIMIT ?
 	`, namePattern, namePattern, "%"+num+"%", "%"+query+"%", "%"+num+"%@s.whatsapp.net",
 		namePattern, namePattern, limit)
@@ -794,9 +798,9 @@ func loadContactRow(ctx context.Context, db *sql.DB, jid string) (contactRow, bo
 // written as a number, digits plus the spacing and punctuation numbers are
 // formatted with ("+57 300 123 4567", "(300) 123-4567", "300/1234567"), is
 // reduced to its digits: phone and the phone-number JID both store bare
-// digits, and the formatted string matched neither. Every Unicode dash counts
-// as punctuation, and invisible format characters count as spacing. Any other
-// query is returned unchanged.
+// digits, and the formatted string matched neither. Characters in Unicode's
+// dash-punctuation category (Pd) count as punctuation, and invisible format
+// characters (Cf) count as spacing. Any other query is returned unchanged.
 func numberQuery(q string) string {
 	hasDigit := false
 	for _, r := range q {

@@ -19,10 +19,10 @@
 --
 -- The rows it fills become visible to anything that matches on phone. CRM
 -- enrichment (crm_enrich.go) is one: when a CRM folder is configured it runs
--- after every start, and it may now give one of these rows a push_name from
--- the CRM, bumping updated_at as it does for every row it enriches. That is
--- the feature reaching rows it could not see before, not this migration
--- writing them.
+-- after every start and fills push_name for contacts it matches by phone. It
+-- skips any contact the address book already names, so these rows keep the
+-- name the user saved instead of taking the CRM's, and the vault export does
+-- not rename them.
 
 UPDATE contacts
    SET phone = SUBSTR(jid, 1, INSTR(jid, '@') - 1)

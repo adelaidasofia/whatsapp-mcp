@@ -22,8 +22,9 @@ import (
 // Returns count of rows updated.
 //
 // Called on bridge startup when WHATSAPP_VAULT_CRM_PATH is set.
-// Safe to re-run; updates are idempotent and additive (CRM-known names only overwrite
-// when the existing push_name is a raw "+phone" placeholder).
+// Safe to re-run; updates are idempotent and additive (a CRM-known name only fills a
+// blank push_name or replaces a raw "+phone" placeholder, and never touches a contact
+// the user's address book already names; see updateContactByPhone).
 func EnrichContactsFromVault(db *sql.DB, crmPath string) (int, error) {
 	if crmPath == "" {
 		return 0, nil
@@ -134,7 +135,12 @@ func digitsOnly(s string) string {
 
 // updateContactByPhone sets push_name=<crmName> for any contact whose digits-only phone
 // ends with the last 10 digits of the CRM phone (loose match for country-code variations).
-// Only overwrites when the existing push_name is blank OR is a bare "+phone" placeholder.
+// Only overwrites when the existing push_name is blank OR is a bare "+phone" placeholder,
+// and never for a contact the user's address book already names (full_name): enrichment
+// names contacts that have no name. Filling push_name there would make the vault export,
+// which shows push_name ahead of the chat name, rename that person's file after the CRM
+// entry. Address-book rows carry a phone now that contacts_sync.go writes it (migration
+// 008 filled the older ones), so this guard is what keeps them out.
 // Returns count of rows affected.
 func updateContactByPhone(db *sql.DB, crmPhone, crmName string, now int64) (int, error) {
 	if len(crmPhone) < 7 {
@@ -151,6 +157,7 @@ func updateContactByPhone(db *sql.DB, crmPhone, crmName string, now int64) (int,
 		    updated_at = ?
 		WHERE phone LIKE '%' || ? || '%'
 		  AND (push_name IS NULL OR push_name = '' OR push_name GLOB '+[0-9]*')
+		  AND (full_name IS NULL OR full_name = '')
 	`, crmName, Normalize(crmName), now, tail)
 	if err != nil {
 		return 0, err
