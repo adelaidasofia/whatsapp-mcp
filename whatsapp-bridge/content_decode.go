@@ -43,6 +43,7 @@ import (
 	"strings"
 
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 // maxUnwrapDepth bounds envelope descent. Real nesting is one or two deep (an
@@ -50,34 +51,36 @@ import (
 // payload cannot spin the decoder.
 const maxUnwrapDepth = 8
 
+var futureProofName = (&waE2E.FutureProofMessage{}).ProtoReflect().Descriptor().FullName()
+
 // unwrapEnvelope descends wrapper types that nest the real message and returns
 // the innermost payload. Returns the original message unchanged when it is not
 // an envelope, so callers can apply it unconditionally.
+//
+// Every FutureProofMessage field is treated as an envelope, generically. A
+// hard-coded list (ephemeral, viewOnce*, documentWithCaption, lottieSticker,
+// edited) missed associatedChildMessage — how WhatsApp wraps EACH item of an
+// album — so every photo/PDF sent as part of a multi-file send was stored as
+// "[unsupported: associatedChildMessage]" with no media key and could never be
+// downloaded. groupMentionedMessage, botInvokeMessage, spoilerMessage and
+// botForwardedMessage had the same gap, and WhatsApp keeps adding more.
 func unwrapEnvelope(m *waE2E.Message) *waE2E.Message {
 	for depth := 0; m != nil && depth < maxUnwrapDepth; depth++ {
-		var inner *waE2E.Message
-		switch {
-		case m.GetEphemeralMessage().GetMessage() != nil:
-			inner = m.GetEphemeralMessage().GetMessage()
-		case m.GetViewOnceMessage().GetMessage() != nil:
-			inner = m.GetViewOnceMessage().GetMessage()
-		case m.GetViewOnceMessageV2().GetMessage() != nil:
-			inner = m.GetViewOnceMessageV2().GetMessage()
-		case m.GetViewOnceMessageV2Extension().GetMessage() != nil:
-			inner = m.GetViewOnceMessageV2Extension().GetMessage()
-		case m.GetDocumentWithCaptionMessage().GetMessage() != nil:
-			inner = m.GetDocumentWithCaptionMessage().GetMessage()
-		case m.GetLottieStickerMessage().GetMessage() != nil:
-			inner = m.GetLottieStickerMessage().GetMessage()
-		case m.GetDeviceSentMessage().GetMessage() != nil:
-			inner = m.GetDeviceSentMessage().GetMessage()
-		case m.GetEditedMessage().GetMessage() != nil:
-			inner = m.GetEditedMessage().GetMessage()
+		inner := m.GetDeviceSentMessage().GetMessage()
 		// An edit delivered as a protocol message carries the replacement body,
 		// so the store ends up holding the edited text rather than a bare
 		// protocol row.
-		case m.GetProtocolMessage().GetEditedMessage() != nil:
+		if inner == nil {
 			inner = m.GetProtocolMessage().GetEditedMessage()
+		}
+		if inner == nil {
+			m.ProtoReflect().Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
+				if fd.IsList() || fd.Message() == nil || fd.Message().FullName() != futureProofName {
+					return true
+				}
+				inner = v.Message().Interface().(*waE2E.FutureProofMessage).GetMessage()
+				return inner == nil
+			})
 		}
 		if inner == nil {
 			return m

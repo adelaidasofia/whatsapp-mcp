@@ -114,6 +114,10 @@ func extractDownloadableFields(evt *events.Message) (mediaFields, bool) {
 // Mirrors the extractContent / extractContentFromProto split for the same
 // reason: one classifier, so a sent row and a received row cannot disagree.
 func extractDownloadableFieldsFromProto(m *waE2E.Message) (mediaFields, bool) {
+	// Same envelope descent as extractContentFromProto, so a row the decoder
+	// types as image/document also gets the key that makes it downloadable.
+	// History-sync protos arrive with every envelope still in place.
+	m = unwrapEnvelope(m)
 	if m == nil {
 		return mediaFields{}, false
 	}

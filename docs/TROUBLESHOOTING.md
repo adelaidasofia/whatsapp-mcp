@@ -25,7 +25,7 @@ Known operational pain points and how to recover. Each entry: symptom → cause 
 **Cause.** v0.4.1 and earlier asked the QR library to probe the console for sixel graphics before drawing. In a console that already has VT processing on, that probe fails and then panics in its own cleanup, and the panic takes the bridge with it. Whether VT processing is on depends on the terminal and the shell that start the bridge.
 
 **Fix.**
-- Upgrade to the first release after v0.4.1; the probe is gone, and a crash while drawing no longer stops the bridge.
+- Upgrade to v0.5.0 or later; the probe is gone, and a crash while drawing no longer stops the bridge.
 - On an older binary, set `WT_SESSION` before starting the bridge so it takes the Windows Terminal path: `$env:WT_SESSION = "1"` in PowerShell, `set WT_SESSION=1` in cmd. Or run it inside Windows Terminal.
 
 ## `--pair-phone` fails with `400: bad-request`
@@ -35,7 +35,7 @@ Known operational pain points and how to recover. Each entry: symptom → cause 
 **Cause.** v0.4.1 and earlier requested the typed code under the name `Chrome (whatsapp-mcp)`. WhatsApp only accepts a `Browser (OS)` name with a common browser and OS and rejects anything else with 400. The name was the same on every OS, so this is not Windows-specific.
 
 **Fix.**
-- Upgrade to the first release after v0.4.1.
+- Upgrade to v0.5.0 or later.
 - On an older binary, pair with the QR. If your console cannot draw it, `GET /api/auth/qr` returns the raw code as `qr_code`; render it with a QR tool on the same machine and scan that. Never paste it into a website: until it expires it is a live pairing credential for your bridge.
 
 ## "StreamReplaced" disconnect / bridge logs out

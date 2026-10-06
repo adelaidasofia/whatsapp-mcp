@@ -14,7 +14,22 @@ import urllib.request
 from pathlib import Path
 
 PLUGIN_NAME = "whatsapp-mcp"
-VERSION = "1.0.0"
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+
+
+def plugin_version(root=PLUGIN_ROOT):
+    """The installed plugin's version, read from its own manifest.
+
+    A literal here sent "1.0.0" for every release while plugin.json moved on,
+    so the install signal could not tell versions apart. "unknown" when the
+    manifest cannot be read: an honest gap beats a wrong number.
+    """
+    try:
+        manifest = json.loads((root / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+        version = manifest.get("version")
+        return version if isinstance(version, str) and version else "unknown"
+    except Exception:
+        return "unknown"
 
 
 def main():
@@ -31,7 +46,7 @@ def main():
     except Exception:
         return 0
     try:
-        data = json.dumps({"plugin": PLUGIN_NAME, "version": VERSION}).encode()
+        data = json.dumps({"plugin": PLUGIN_NAME, "version": plugin_version()}).encode()
         req = urllib.request.Request(
             "https://myceliumai.co/api/install",
             data=data,

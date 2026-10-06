@@ -50,27 +50,10 @@ import (
 // extractFromMessage is the inner-type variant of extractDownloadableFields.
 // Live receive (events.Message) wraps the proto in evt.Message; HistorySync
 // delivery wraps it in HistorySyncMsg.GetMessage().GetMessage(). Both reach
-// the same *waE2E.Message, so both paths share this helper.
+// the same *waE2E.Message, so both paths share ONE extractor — a private copy
+// here is how history sync came to skip envelopes the live path unwraps.
 func extractFromMessage(m *waE2E.Message) (mediaFields, bool) {
-	if m == nil {
-		return mediaFields{}, false
-	}
-	if mm := m.GetImageMessage(); mm != nil {
-		return fieldsFrom(mm), true
-	}
-	if mm := m.GetVideoMessage(); mm != nil {
-		return fieldsFrom(mm), true
-	}
-	if mm := m.GetDocumentMessage(); mm != nil {
-		return fieldsFrom(mm), true
-	}
-	if mm := m.GetAudioMessage(); mm != nil {
-		return fieldsFrom(mm), true
-	}
-	if mm := m.GetStickerMessage(); mm != nil {
-		return fieldsFrom(mm), true
-	}
-	return mediaFields{}, false
+	return extractDownloadableFieldsFromProto(m)
 }
 
 // processHistorySyncEvent updates messages.media_key for any rows currently
@@ -421,17 +404,25 @@ func (b *Bridge) RequestHistoryBefore(ctx context.Context, chatJID, anchorID str
 // plainly. A row is eligible only when BOTH hold:
 //
 //	type = 'system'                          the old catch-all bucket
-//	content_text IS NULL OR content_text=''  it actually has no payload
+//	content_text is empty, OR is an          it has no payload, or only a
+//	"[unsupported: …]" marker                note that it was never decoded
 //
-// So this can only ever turn a blank into something. It cannot overwrite text,
-// cannot touch a media row, and cannot disturb a row the current decoder wrote
-// (those carry either real text or an "[unsupported: …]" marker, and a marker
-// is non-empty). Overlapping history chunks are therefore idempotent, and a
-// stale re-delivery cannot clobber a fresher live row.
+// So this can only ever turn a blank or a marker into something. It cannot
+// overwrite text and cannot touch a media row. Overlapping history chunks are
+// therefore idempotent (a repaired row is no longer 'system'), and a stale
+// re-delivery cannot clobber a fresher live row.
 //
-// A genuinely textless protocol carrier re-decodes to ("", "system") and the
-// UPDATE is a no-op write of identical values, which is the correct outcome:
-// key-distribution rows stay silent rather than gaining vault noise.
+// Marker rows are eligible because a marker means "the decoder could not read
+// this", and the decoder improves: album items were stored as
+// "[unsupported: associatedChildMessage]" until unwrapEnvelope learned that
+// envelope. A marker row is only rewritten when the re-decode is no longer
+// 'system' — a type that is still undecodable leaves its marker untouched.
+//
+// A genuinely textless protocol carrier re-decodes to ("", "system") and is
+// left alone: key-distribution rows stay silent rather than gaining vault
+// noise. An empty row whose re-decode is a marker gains the marker, as before.
+// Media with no caption re-decodes to ("", "image"/"document"/…) and IS
+// repaired — the type is what makes /api/media/download accept the row.
 func (b *Bridge) backfillDecodedContent(msgID string, m *waE2E.Message) (int, error) {
 	if msgID == "" || m == nil {
 		return 0, nil
@@ -441,7 +432,7 @@ func (b *Bridge) backfillDecodedContent(msgID string, m *waE2E.Message) (int, er
 	// backfilled row is byte-identical to what it would have been had the
 	// message arrived today.
 	text, msgType := extractContentFromProto(m)
-	if text == "" {
+	if text == "" && msgType == "system" {
 		// Nothing recovered — leave the row exactly as it is rather than
 		// rewriting it with the same emptiness.
 		return 0, nil
@@ -463,8 +454,9 @@ func (b *Bridge) backfillDecodedContent(msgID string, m *waE2E.Message) (int, er
 		       raw_type           = ?
 		 WHERE id = ?
 		   AND type = 'system'
-		   AND (content_text IS NULL OR content_text = '')
-	`, msgType, text, Normalize(text), scrubbed, ScrubFlagsJSON(flags), rawTypeNullable(msgType, text), msgID)
+		   AND (content_text IS NULL OR content_text = ''
+		        OR (content_text LIKE '[unsupported: %' AND ? <> 'system'))
+	`, msgType, text, Normalize(text), scrubbed, ScrubFlagsJSON(flags), rawTypeNullable(msgType, text), msgID, msgType)
 	if err != nil {
 		return 0, err
 	}
