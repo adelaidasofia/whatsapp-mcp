@@ -3,12 +3,16 @@ name: release-binaries
 # GitHub release, so Windows users never need the MSYS2/CGO toolchain and
 # macOS/Linux users can skip the Go install entirely (MYC-3033).
 #
-# Trigger is `release: published` — same semantics as publish-mcp.yml (a tag
-# push alone does NOT fire it; create the release via `gh release create`).
+# Trigger is `release: published` (a tag push alone does NOT fire it; create
+# the release via `gh release create`). Every leg builds the tag's own commit,
+# and the first step refuses a tag whose whatsapp-bridge/version.go does not
+# say the same version. That refusal lands AFTER the release is public, so
+# before publishing vX.Y.Z, check version.go on the target commit says X.Y.Z.
 #
 # Security note: no untrusted user-supplied fields are interpolated into run
-# blocks. The release tag name reaches the upload step via an env var, never
-# inline. Builds run only on releases published by repo collaborators.
+# blocks. The release tag name reaches run steps via an env var, never inline,
+# and selects the checkout ref through an action input. Builds run only on
+# releases published by repo collaborators.
 
 on:
   release:
@@ -16,7 +20,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing release tag to build and attach binaries to (e.g. v0.4.0)'
+        description: 'Existing release tag to rebuild from its own commit and attach binaries to (e.g. v0.5.0)'
         required: true
         type: string
 
@@ -58,28 +62,38 @@ jobs:
       CGO_ENABLED: '1'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # The tag's own commit, on every trigger. Left to its default, a
+          # workflow_dispatch run builds the branch it was started from, and
+          # after a release main keeps the same bridgeVersion until the next
+          # bump, so a re-run would replace a release's binaries with code that
+          # is not in its tag, checksums and all.
+          ref: refs/tags/${{ github.event.release.tag_name || inputs.tag }}
       - name: Refuse a tag the checked-out code does not carry
         shell: bash
         # v0.4.1 was tagged with every stamp still at 0.4.0, so its binaries
-        # reported 0.4.0 at /healthcheck. A workflow_dispatch run also checks
-        # out the ref it was dispatched FROM, not the tag it uploads TO, so it
-        # can attach one version's binaries to another version's release. Both
-        # fail here, before anything is built or uploaded.
-        # TestVersionStampsAgree keeps the other stamps in line with version.go.
+        # reported 0.4.0 at /healthcheck. A tag like that fails here, before
+        # anything is built or uploaded. This parses the single
+        # `var bridgeVersion = "..."` line; TestReleaseCanReadBridgeVersion
+        # keeps version.go in that shape and TestVersionStampsAgree keeps the
+        # other stamps in line with it.
         env:
           TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
           set -euo pipefail
           ver=$(tr -d '\r' < whatsapp-bridge/version.go | sed -n 's/^var bridgeVersion = "\([^"]*\)"$/\1/p')
-          if [ -z "${ver}" ]; then
-            echo "::error::could not read bridgeVersion from whatsapp-bridge/version.go; refusing to build a release whose version is unknown"
+          if [ -z "${ver}" ] || [ "$(printf '%s\n' "${ver}" | wc -l)" -ne 1 ]; then
+            echo "::error::could not read exactly one bridgeVersion from whatsapp-bridge/version.go; refusing to build a release whose version is unknown"
             exit 1
           fi
           if [ "${TAG}" != "v${ver}" ]; then
-            echo "::error::release tag ${TAG} does not match bridgeVersion ${ver} in the checked-out code. Bump the version stamps and re-tag, or dispatch this workflow from the tag's own ref."
+            # Shown through a filter: a dispatch input can carry a newline, and
+            # a raw one would start a workflow command of its own.
+            shown=$(printf '%s' "${TAG}" | tr -cd 'A-Za-z0-9._+-')
+            echo "::error::release tag ${shown} points at code whose bridgeVersion is ${ver}, so the tag should be v${ver}. Bump the version stamps on the commit you release, then tag that commit."
             exit 1
           fi
-          echo "tag ${TAG} matches bridgeVersion ${ver}."
+          echo "tag v${ver} matches bridgeVersion ${ver}."
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           go-version: 'stable'
