@@ -5,9 +5,10 @@ name: release-binaries
 #
 # Trigger is `release: published` (a tag push alone does NOT fire it; create
 # the release via `gh release create`). Every leg builds the tag's own commit,
-# and the first step refuses a tag whose whatsapp-bridge/version.go does not
-# say the same version. That refusal lands AFTER the release is public, so
-# before publishing vX.Y.Z, check version.go on the target commit says X.Y.Z.
+# and the first step after checkout refuses a tag whose
+# whatsapp-bridge/version.go does not say the same version. That refusal lands
+# AFTER the release is public, so before publishing vX.Y.Z, check version.go
+# on the target commit says X.Y.Z.
 #
 # Security note: no untrusted user-supplied fields are interpolated into run
 # blocks. The release tag name reaches run steps via an env var, never inline,
@@ -61,18 +62,36 @@ jobs:
     env:
       CGO_ENABLED: '1'
     steps:
+      - name: Refuse a dispatch input that is not a release tag
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        # Before checkout on purpose: the checkout step echoes the git command
+        # it runs, ref included, so a newline in this input would otherwise
+        # start a workflow command of its own in that step's log. A whole-string
+        # [[ =~ ]] test, not grep: grep matches line by line and would pass a
+        # two-line value. Release events never get here, and git refuses
+        # control characters in tag names anyway.
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          if [[ ! "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]*)?$ ]]; then
+            echo "::error::the tag input must be an existing release tag like v1.2.3 (got ${#TAG} characters that are not one)"
+            exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          # The tag's own commit, on every trigger. Left to its default, a
-          # workflow_dispatch run builds the branch it was started from, and
-          # after a release main keeps the same bridgeVersion until the next
-          # bump, so a re-run would replace a release's binaries with code that
-          # is not in its tag, checksums and all.
-          ref: refs/tags/${{ github.event.release.tag_name || inputs.tag }}
+          # A workflow_dispatch run builds refs/tags/<input>. Left to its
+          # default it builds the branch it was started from, and after a
+          # release main keeps the same bridgeVersion until the next bump, so a
+          # re-run would replace a release's binaries with code that is not in
+          # its tag, checksums and all. A release event keeps the default (an
+          # empty ref): that already is the tag's commit, and the default also
+          # fails the leg if the tag was moved after the release was published.
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || '' }}
       - name: Refuse a tag the checked-out code does not carry
         shell: bash
-        # v0.4.1 was tagged with every stamp still at 0.4.0, so its binaries
-        # reported 0.4.0 at /healthcheck. A tag like that fails here, before
+        # v0.4.1 was tagged with its four version stamps still at 0.4.0, so its
+        # binaries reported 0.4.0 at /healthcheck. A tag like that fails here, before
         # anything is built or uploaded. This parses the single
         # `var bridgeVersion = "..."` line; TestReleaseCanReadBridgeVersion
         # keeps version.go in that shape and TestVersionStampsAgree keeps the
