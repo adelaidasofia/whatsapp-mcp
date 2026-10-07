@@ -77,24 +77,35 @@ func chatNames(t *testing.T, db *sql.DB, jid string) (name, normalized string) {
 // A chat whose store entry carries no name gets the "+<phone>" placeholder
 // only when its JID is a phone number. The digits of a @lid JID are an opaque
 // identifier and a group's are its id, so "+<digits>" would present either as
-// a phone number, and the raw JID is not a name.
+// a phone number, and the raw JID (the old fallback for a JID with no digits)
+// is not a name. Any other chat is stored with no name, as NULL the way
+// bridge.go stores it: history_sync.go fills a NULL name but keeps an empty
+// string.
 func TestBaileysNamelessChatGetsNoMadeUpName(t *testing.T) {
 	db := xvDB(t)
-	const pn, lid, group = "573001234567@s.whatsapp.net", "123456789012345@lid", "120363000000000001@g.us"
-	importBaileysStore(t, db, `{"contacts": {}, "messages": `+baileysChats(pn, lid, group)+`}`)
+	const pn, lid, group, digitless = "573001234567@s.whatsapp.net", "123456789012345@lid", "120363000000000001@g.us", "nodigits@lid"
+	importBaileysStore(t, db, `{"contacts": {}, "messages": `+baileysChats(pn, lid, group, digitless)+`}`)
 
-	want := map[string]string{pn: "+573001234567", lid: "", group: ""}
-	for jid, w := range want {
-		if got, _ := chatNames(t, db, jid); got != w {
-			t.Errorf("%s: chat name = %q, want %q", jid, got, w)
+	if got, _ := chatNames(t, db, pn); got != "+573001234567" {
+		t.Errorf("%s: chat name = %q, want the placeholder %q", pn, got, "+573001234567")
+	}
+	for _, jid := range []string{lid, group, digitless} {
+		var name, normalized sql.NullString
+		err := db.QueryRow(`SELECT name, normalized_name FROM chats WHERE jid = ?`, jid).Scan(&name, &normalized)
+		if err != nil {
+			t.Fatalf("read chat %s: %v", jid, err)
+		}
+		if name.Valid || normalized.Valid {
+			t.Errorf("%s: name = %+v, normalized_name = %+v; want both NULL", jid, name, normalized)
 		}
 	}
 }
 
 // A store with no name for a chat must leave the stored name alone, and
 // normalized_name has to make the same keep-or-replace choice as name. Every
-// other chat writer moves the two together; the importer kept the name and
-// blanked its normalized form.
+// other chat writer moves the two together. The importer's upsert kept the
+// name but always overwrote normalized_name, so a chat arriving with no name
+// would keep its name and lose the normalized form.
 func TestBaileysReimportKeepsAChatNameAndItsNormalizedForm(t *testing.T) {
 	db := xvDB(t)
 	const lid, group = "123456789012345@lid", "120363000000000001@g.us"

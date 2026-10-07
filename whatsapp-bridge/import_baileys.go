@@ -134,7 +134,9 @@ func RunBaileysImport(cfg *Config, db *sql.DB, storePath string) error {
 		// gets the "+<phone>" placeholder only when its JID is a phone number,
 		// the same rule as the contact loop above: the digits of a @lid or
 		// group JID are not a phone, and the raw JID is not a name. Any other
-		// chat gets "", which the upsert below reads as "keep the stored name".
+		// chat gets no name. It goes in as NULL, as bridge.go writes it, so a
+		// later history sync can still fill it (history_sync.go keeps a stored
+		// empty string), and the upsert below reads it as "keep the stored name".
 		var chatName string
 		if c, ok := store.Contacts[jid]; ok {
 			chatName = strings.TrimSpace(c.Notify)
@@ -213,11 +215,11 @@ func RunBaileysImport(cfg *Config, db *sql.DB, storePath string) error {
 			continue
 		}
 
-		// Same rule as the contact upsert: an empty name keeps the stored one,
-		// and the placeholder only fills a chat that has no name, so a chat the
-		// address book or the live bridge named keeps that name.
-		// normalized_name takes the same branch as name. Keep the two CASEs
-		// identical.
+		// Same rule as the contact upsert: no name keeps the stored one, and
+		// the placeholder only fills a chat that has no name, so neither can
+		// replace a name the address book or the live bridge gave the chat. A
+		// real name from the store still does. normalized_name takes the same
+		// branch as name. Keep the two CASEs identical.
 		_, err := db.Exec(`
 			INSERT INTO chats (jid, chat_type, name, normalized_name, created_at, updated_at, last_message_time, last_message_preview)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -225,17 +227,17 @@ func RunBaileysImport(cfg *Config, db *sql.DB, storePath string) error {
 				last_message_time = MAX(excluded.last_message_time, last_message_time),
 				last_message_preview = CASE WHEN excluded.last_message_time > last_message_time THEN excluded.last_message_preview ELSE last_message_preview END,
 				name = CASE
-					WHEN excluded.name = '' THEN chats.name
+					WHEN COALESCE(excluded.name, '') = '' THEN chats.name
 					WHEN excluded.name GLOB '+[0-9]*' AND COALESCE(chats.name, '') <> '' THEN chats.name
 					ELSE excluded.name
 				END,
 				normalized_name = CASE
-					WHEN excluded.name = '' THEN chats.normalized_name
+					WHEN COALESCE(excluded.name, '') = '' THEN chats.normalized_name
 					WHEN excluded.name GLOB '+[0-9]*' AND COALESCE(chats.name, '') <> '' THEN chats.normalized_name
 					ELSE excluded.normalized_name
 				END,
 				updated_at = excluded.updated_at
-		`, jid, chatType, chatName, Normalize(chatName), now, now, lastTs, lastPreview)
+		`, jid, chatType, nullIfEmpty(chatName), nullIfEmpty(Normalize(chatName)), now, now, lastTs, lastPreview)
 		if err != nil {
 			log.Printf("chat upsert failed for %s: %v", jid, err)
 			continue
