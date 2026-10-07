@@ -217,14 +217,30 @@ func RunBaileysImport(cfg *Config, db *sql.DB, storePath string) error {
 			continue
 		}
 
+		// Same rule as the contact upsert: the stored name wins over an empty
+		// one and over a placeholder, so a chat the address book or the live
+		// bridge named keeps that name. normalized_name takes the same branch
+		// as name. Keep the two CASEs identical.
 		_, err := db.Exec(`
 			INSERT INTO chats (jid, chat_type, name, normalized_name, created_at, updated_at, last_message_time, last_message_preview)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(jid) DO UPDATE SET
 				last_message_time = MAX(excluded.last_message_time, last_message_time),
 				last_message_preview = CASE WHEN excluded.last_message_time > last_message_time THEN excluded.last_message_preview ELSE last_message_preview END,
-				name = CASE WHEN excluded.name <> '' THEN excluded.name ELSE chats.name END,
-				normalized_name = CASE WHEN excluded.name <> '' THEN excluded.normalized_name ELSE chats.normalized_name END,
+				name = CASE
+					WHEN excluded.name = '' THEN chats.name
+					WHEN excluded.name GLOB '+[0-9]*'
+					 AND COALESCE(chats.name, '') <> ''
+					 AND chats.name NOT GLOB '+[0-9]*' THEN chats.name
+					ELSE excluded.name
+				END,
+				normalized_name = CASE
+					WHEN excluded.name = '' THEN chats.normalized_name
+					WHEN excluded.name GLOB '+[0-9]*'
+					 AND COALESCE(chats.name, '') <> ''
+					 AND chats.name NOT GLOB '+[0-9]*' THEN chats.normalized_name
+					ELSE excluded.normalized_name
+				END,
 				updated_at = excluded.updated_at
 		`, jid, chatType, chatName, Normalize(chatName), now, now, lastTs, lastPreview)
 		if err != nil {

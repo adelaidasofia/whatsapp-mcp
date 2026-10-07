@@ -2,7 +2,10 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,6 +33,27 @@ func baileysChats(jids ...string) string {
 		chats[i] = fmt.Sprintf(`%q: [{"key": {"remoteJid": %q, "fromMe": false, "id": "M%d"}, "messageTimestamp": 1786000000, "message": {"conversation": "hola"}}]`, jid, jid, i)
 	}
 	return "{" + strings.Join(chats, ", ") + "}"
+}
+
+// listChatNames drives the real GET /api/chats handler and returns the name
+// list_chats shows for each chat.
+func listChatNames(t *testing.T, db *sql.DB) map[string]string {
+	t.Helper()
+	s := &Server{db: db, bridge: &Bridge{}}
+	rec := httptest.NewRecorder()
+	s.handleListChats(rec, httptest.NewRequest(http.MethodGet, "/api/chats", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list chats: HTTP %d: %s", rec.Code, rec.Body.String())
+	}
+	var out chatListResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("list chats: decode response: %v", err)
+	}
+	names := make(map[string]string, len(out.Chats))
+	for _, c := range out.Chats {
+		names[c.JID] = c.Name
+	}
+	return names
 }
 
 func contactNames(t *testing.T, db *sql.DB, jid string) (pushName, normalized string) {
@@ -122,6 +146,33 @@ func TestBaileysReimportKeepsAContactsRealName(t *testing.T) {
 			if !found {
 				t.Errorf("import %d: search_contacts %q does not return %s", run, q, jid)
 			}
+		}
+	}
+}
+
+// The placeholder must not replace a real chat name either. A direct chat the
+// address book named keeps that name when a store with no name for the
+// contact is imported over it, while the contact, which has no push_name of
+// its own, still gets the placeholder.
+func TestBaileysReimportKeepsARealDirectChatName(t *testing.T) {
+	db := xvDB(t)
+	const pn = "573001234567@s.whatsapp.net"
+	xvChat(t, db, pn, "direct", "", 1785000000)
+	if _, err := writeContactName(t.Context(), db, pn, "Mi Amor", 1785000000); err != nil {
+		t.Fatalf("writeContactName: %v", err)
+	}
+	store := `{"contacts": {"573001234567@s.whatsapp.net": {"id": "573001234567@s.whatsapp.net"}}, "messages": ` + baileysChats(pn) + `}`
+
+	for run := 1; run <= 2; run++ {
+		importBaileysStore(t, db, store)
+		if got := listChatNames(t, db)[pn]; got != "Mi Amor" {
+			t.Errorf("import %d: list_chats shows %q, want the address-book name %q", run, got, "Mi Amor")
+		}
+		if name, normalized := chatNames(t, db, pn); normalized != Normalize(name) {
+			t.Errorf("import %d: chat normalized_name = %q for name %q", run, normalized, name)
+		}
+		if name, _ := contactNames(t, db, pn); name != "+573001234567" {
+			t.Errorf("import %d: contact push_name = %q, want the placeholder %q", run, name, "+573001234567")
 		}
 	}
 }
