@@ -32,6 +32,15 @@ func baileysChats(jids ...string) string {
 	return "{" + strings.Join(chats, ", ") + "}"
 }
 
+func contactNames(t *testing.T, db *sql.DB, jid string) (pushName, normalized string) {
+	t.Helper()
+	err := db.QueryRow(`SELECT COALESCE(push_name, ''), COALESCE(normalized_name, '') FROM contacts WHERE jid = ?`, jid).Scan(&pushName, &normalized)
+	if err != nil {
+		t.Fatalf("read contact %s: %v", jid, err)
+	}
+	return pushName, normalized
+}
+
 func chatNames(t *testing.T, db *sql.DB, jid string) (name, normalized string) {
 	t.Helper()
 	err := db.QueryRow(`SELECT COALESCE(name, ''), COALESCE(normalized_name, '') FROM chats WHERE jid = ?`, jid).Scan(&name, &normalized)
@@ -76,6 +85,42 @@ func TestBaileysReimportKeepsAChatNameAndItsNormalizedForm(t *testing.T) {
 			if name != want || normalized != Normalize(want) {
 				t.Errorf("import %d, %s: name = %q, normalized_name = %q; want %q, %q",
 					run, jid, name, normalized, want, Normalize(want))
+			}
+		}
+	}
+}
+
+// A store with no name for a contact must not replace a real name, neither
+// with the "+<phone>" placeholder (the shape export_vault.go and
+// crm_enrich.go read as "no name yet") nor with nothing. normalized_name has
+// to follow the push_name that is kept: search_contacts matches names through
+// it, never through push_name.
+func TestBaileysReimportKeepsAContactsRealName(t *testing.T) {
+	db := xvDB(t)
+	const pn, lid = "573001234567@s.whatsapp.net", "123456789012345@lid"
+	xvContact(t, db, pn, "Juan Pérez", "573001234567")
+	xvContact(t, db, lid, "Bea", "")
+	nameless := `{
+		"573001234567@s.whatsapp.net": {"id": "573001234567@s.whatsapp.net"},
+		"123456789012345@lid": {"id": "123456789012345@lid"}
+	}`
+
+	for run := 1; run <= 2; run++ {
+		runBaileysImport(t, db, nameless)
+		for jid, want := range map[string]string{pn: "Juan Pérez", lid: "Bea"} {
+			name, normalized := contactNames(t, db, jid)
+			if name != want || normalized != Normalize(want) {
+				t.Errorf("import %d, %s: push_name = %q, normalized_name = %q; want %q, %q",
+					run, jid, name, normalized, want, Normalize(want))
+			}
+		}
+		for q, jid := range map[string]string{"juan perez": pn, "bea": lid} {
+			found := false
+			for _, c := range searchContacts(t, db, q) {
+				found = found || c.JID == jid
+			}
+			if !found {
+				t.Errorf("import %d: search_contacts %q does not return %s", run, q, jid)
 			}
 		}
 	}

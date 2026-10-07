@@ -84,13 +84,30 @@ func RunBaileysImport(cfg *Config, db *sql.DB, storePath string) error {
 			displayName = "+" + phone.String
 		}
 
+		// On a re-import, or an import over rows the bridge already wrote, the
+		// stored name wins over an empty one and over a placeholder: the
+		// placeholder only fills a contact with no real name. normalized_name
+		// takes the same branch as push_name, because search_contacts matches
+		// names through it. Keep the two CASEs identical.
 		_, err := db.Exec(`
 			INSERT INTO contacts (jid, phone, push_name, verified_name, normalized_name, is_business, created_at, updated_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(jid) DO UPDATE SET
-				push_name = COALESCE(NULLIF(excluded.push_name, ''), push_name),
+				push_name = CASE
+					WHEN excluded.push_name = '' THEN contacts.push_name
+					WHEN excluded.push_name GLOB '+[0-9]*'
+					 AND COALESCE(contacts.push_name, '') <> ''
+					 AND contacts.push_name NOT GLOB '+[0-9]*' THEN contacts.push_name
+					ELSE excluded.push_name
+				END,
 				verified_name = COALESCE(NULLIF(excluded.verified_name, ''), verified_name),
-				normalized_name = excluded.normalized_name,
+				normalized_name = CASE
+					WHEN excluded.push_name = '' THEN contacts.normalized_name
+					WHEN excluded.push_name GLOB '+[0-9]*'
+					 AND COALESCE(contacts.push_name, '') <> ''
+					 AND contacts.push_name NOT GLOB '+[0-9]*' THEN contacts.normalized_name
+					ELSE excluded.normalized_name
+				END,
 				updated_at = excluded.updated_at
 		`, jid, phone, displayName, c.VerifiedName, Normalize(displayName), 0, now, now)
 		if err != nil {
