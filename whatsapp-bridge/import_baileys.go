@@ -206,8 +206,8 @@ func RunBaileysImport(cfg *Config, db *sql.DB, storePath string) error {
 			ON CONFLICT(jid) DO UPDATE SET
 				last_message_time = MAX(excluded.last_message_time, last_message_time),
 				last_message_preview = CASE WHEN excluded.last_message_time > last_message_time THEN excluded.last_message_preview ELSE last_message_preview END,
-				name = COALESCE(NULLIF(excluded.name, ''), name),
-				normalized_name = excluded.normalized_name,
+				name = CASE WHEN excluded.name <> '' THEN excluded.name ELSE chats.name END,
+				normalized_name = CASE WHEN excluded.name <> '' THEN excluded.normalized_name ELSE chats.normalized_name END,
 				updated_at = excluded.updated_at
 		`, jid, chatType, chatName, Normalize(chatName), now, now, lastTs, lastPreview)
 		if err != nil {

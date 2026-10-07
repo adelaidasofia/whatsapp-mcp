@@ -57,3 +57,26 @@ func TestBaileysNamelessChatGetsNoMadeUpName(t *testing.T) {
 		}
 	}
 }
+
+// A store with no name for a chat must leave the stored name alone, and
+// normalized_name has to make the same keep-or-replace choice as name. Every
+// other chat writer moves the two together; the importer kept the name and
+// blanked its normalized form.
+func TestBaileysReimportKeepsAChatNameAndItsNormalizedForm(t *testing.T) {
+	db := xvDB(t)
+	const lid, group = "123456789012345@lid", "120363000000000001@g.us"
+	xvChat(t, db, group, "group", "Familia Pérez", 1785000000)
+	xvChat(t, db, lid, "direct", "Mi Amor", 1785000000)
+	store := `{"contacts": {}, "messages": ` + baileysChats(lid, group) + `}`
+
+	for run := 1; run <= 2; run++ {
+		importBaileysStore(t, db, store)
+		for jid, want := range map[string]string{group: "Familia Pérez", lid: "Mi Amor"} {
+			name, normalized := chatNames(t, db, jid)
+			if name != want || normalized != Normalize(want) {
+				t.Errorf("import %d, %s: name = %q, normalized_name = %q; want %q, %q",
+					run, jid, name, normalized, want, Normalize(want))
+			}
+		}
+	}
+}
