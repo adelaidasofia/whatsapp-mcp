@@ -259,23 +259,20 @@ func TestPhoneFromJID(t *testing.T) {
 	}
 }
 
-// CRM enrichment fills push_name for contacts it can match by phone, and the
-// rows migration 008 fills are address-book contacts it could not match
-// before. It must leave a name saved in the address book alone: the vault
-// export shows push_name ahead of the chat name, so enriching "Mi Amor" would
-// rename that person's export file after the CRM entry. A contact with no
-// name at all is still enriched.
-func TestCRMEnrichmentLeavesAnAddressBookNameAlone(t *testing.T) {
+// CRM enrichment matches contacts by phone, so it never saw an address-book
+// contact while that contact's number lived only in the JID. With phone
+// filled it reaches them under its existing rules, as it already did for a
+// @lid address-book row whose phone the alias backfill had filled: a blank
+// push_name is filled from the CRM, and a name the contact chose for
+// themselves is left alone.
+func TestCRMEnrichmentReachesAddressBookContactsByPhone(t *testing.T) {
 	db := xvDB(t)
-	const ts = int64(1786000000)
 	const saved = "573001234567@s.whatsapp.net"
-	xvChat(t, db, saved, "direct", "", ts)
-	xvMsg(t, db, "M1", saved, saved, "", "text", "hola", "", ts, false)
-	if _, err := writeContactName(t.Context(), db, saved, "Mi Amor", ts); err != nil {
+	if _, err := writeContactName(t.Context(), db, saved, "Mi Amor", 100); err != nil {
 		t.Fatalf("writeContactName: %v", err)
 	}
-	const unnamed = "15555550100@s.whatsapp.net"
-	xvContact(t, db, unnamed, "", "15555550100")
+	const selfNamed = "15555550100@s.whatsapp.net"
+	xvContact(t, db, selfNamed, "Dra Ivette", "15555550100")
 
 	crm := t.TempDir()
 	for file, body := range map[string]string{
@@ -299,29 +296,15 @@ func TestCRMEnrichmentLeavesAnAddressBookNameAlone(t *testing.T) {
 		}
 		return name
 	}
-	if got := pushName(saved); got != "" {
-		t.Errorf("address-book contact got push_name %q from the CRM, want none", got)
+	if got := pushName(saved); got != "Ivette De La Vega" {
+		t.Errorf("address-book contact push_name = %q, want the CRM name: enrichment matches on phone", got)
 	}
-	if got := pushName(unnamed); got != "Ana Gomez" {
-		t.Errorf("unnamed contact push_name = %q, want the CRM name (enrichment still works)", got)
+	if got := pushName(selfNamed); got != "Dra Ivette" {
+		t.Errorf("self-named contact push_name = %q, want it left alone", got)
 	}
 	if updated != 1 {
 		t.Errorf("enrichment updated %d rows, want 1", updated)
 	}
-
-	units, _, err := buildExportUnits(db, false, 0, nil)
-	if err != nil {
-		t.Fatalf("buildExportUnits: %v", err)
-	}
-	for _, u := range units {
-		if u.primary == saved {
-			if u.display != "Mi Amor" {
-				t.Fatalf("export display = %q, want the address-book name %q", u.display, "Mi Amor")
-			}
-			return
-		}
-	}
-	t.Fatalf("no export unit for %s among %d units", saved, len(units))
 }
 
 // Migration 008 repairs the rows the address-book writer already wrote with

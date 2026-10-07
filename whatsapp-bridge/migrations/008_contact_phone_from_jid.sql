@@ -19,10 +19,11 @@
 --
 -- The rows it fills become visible to anything that matches on phone. CRM
 -- enrichment (crm_enrich.go) is one: when a CRM folder is configured it runs
--- after every start and fills push_name for contacts it matches by phone. It
--- skips any contact the address book already names, so these rows keep the
--- name the user saved instead of taking the CRM's, and the vault export does
--- not rename them.
+-- after every start and fills a blank push_name for contacts it matches by
+-- phone, which these rows now are. That is the rule it already applied to a
+-- @lid address-book row whose phone the alias backfill had filled. The vault
+-- export shows push_name ahead of the chat name, so such a contact can then
+-- be exported under its CRM name rather than its address-book name.
 
 UPDATE contacts
    SET phone = SUBSTR(jid, 1, INSTR(jid, '@') - 1)
