@@ -176,3 +176,28 @@ func TestBaileysReimportKeepsARealDirectChatName(t *testing.T) {
 		}
 	}
 }
+
+// Only a real stored name is protected. The placeholder still fills a
+// contact or chat with no name, and a name from the store still replaces a
+// placeholder an earlier import wrote.
+func TestBaileysPlaceholderStillFillsAMissingName(t *testing.T) {
+	db := xvDB(t)
+	const named, blank = "573001234567@s.whatsapp.net", "573009876543@s.whatsapp.net"
+	xvContact(t, db, named, "+573001234567", "573001234567")
+	xvContact(t, db, blank, "", "573009876543")
+	xvChat(t, db, named, "direct", "+573001234567", 1785000000)
+	xvChat(t, db, blank, "direct", "", 1785000000)
+	importBaileysStore(t, db, `{"contacts": {
+		"573001234567@s.whatsapp.net": {"id": "573001234567@s.whatsapp.net", "notify": "Ana"},
+		"573009876543@s.whatsapp.net": {"id": "573009876543@s.whatsapp.net"}
+	}, "messages": `+baileysChats(named, blank)+`}`)
+
+	for jid, want := range map[string]string{named: "Ana", blank: "+573009876543"} {
+		if name, normalized := contactNames(t, db, jid); name != want || normalized != Normalize(want) {
+			t.Errorf("contact %s: push_name = %q, normalized_name = %q; want %q, %q", jid, name, normalized, want, Normalize(want))
+		}
+		if name, normalized := chatNames(t, db, jid); name != want || normalized != Normalize(want) {
+			t.Errorf("chat %s: name = %q, normalized_name = %q; want %q, %q", jid, name, normalized, want, Normalize(want))
+		}
+	}
+}

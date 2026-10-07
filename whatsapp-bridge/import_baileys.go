@@ -84,9 +84,9 @@ func RunBaileysImport(cfg *Config, db *sql.DB, storePath string) error {
 			displayName = "+" + phone.String
 		}
 
-		// On a re-import, or an import over rows the bridge already wrote, the
-		// stored name wins over an empty one and over a placeholder: the
-		// placeholder only fills a contact with no real name. normalized_name
+		// On a re-import, or an import over rows the bridge already wrote, an
+		// empty name keeps the stored one, and the placeholder only fills a
+		// contact that has no name: it never replaces one. normalized_name
 		// takes the same branch as push_name, because search_contacts matches
 		// names through it. Keep the two CASEs identical.
 		_, err := db.Exec(`
@@ -95,17 +95,13 @@ func RunBaileysImport(cfg *Config, db *sql.DB, storePath string) error {
 			ON CONFLICT(jid) DO UPDATE SET
 				push_name = CASE
 					WHEN excluded.push_name = '' THEN contacts.push_name
-					WHEN excluded.push_name GLOB '+[0-9]*'
-					 AND COALESCE(contacts.push_name, '') <> ''
-					 AND contacts.push_name NOT GLOB '+[0-9]*' THEN contacts.push_name
+					WHEN excluded.push_name GLOB '+[0-9]*' AND COALESCE(contacts.push_name, '') <> '' THEN contacts.push_name
 					ELSE excluded.push_name
 				END,
 				verified_name = COALESCE(NULLIF(excluded.verified_name, ''), verified_name),
 				normalized_name = CASE
 					WHEN excluded.push_name = '' THEN contacts.normalized_name
-					WHEN excluded.push_name GLOB '+[0-9]*'
-					 AND COALESCE(contacts.push_name, '') <> ''
-					 AND contacts.push_name NOT GLOB '+[0-9]*' THEN contacts.normalized_name
+					WHEN excluded.push_name GLOB '+[0-9]*' AND COALESCE(contacts.push_name, '') <> '' THEN contacts.normalized_name
 					ELSE excluded.normalized_name
 				END,
 				updated_at = excluded.updated_at
@@ -217,10 +213,11 @@ func RunBaileysImport(cfg *Config, db *sql.DB, storePath string) error {
 			continue
 		}
 
-		// Same rule as the contact upsert: the stored name wins over an empty
-		// one and over a placeholder, so a chat the address book or the live
-		// bridge named keeps that name. normalized_name takes the same branch
-		// as name. Keep the two CASEs identical.
+		// Same rule as the contact upsert: an empty name keeps the stored one,
+		// and the placeholder only fills a chat that has no name, so a chat the
+		// address book or the live bridge named keeps that name.
+		// normalized_name takes the same branch as name. Keep the two CASEs
+		// identical.
 		_, err := db.Exec(`
 			INSERT INTO chats (jid, chat_type, name, normalized_name, created_at, updated_at, last_message_time, last_message_preview)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -229,16 +226,12 @@ func RunBaileysImport(cfg *Config, db *sql.DB, storePath string) error {
 				last_message_preview = CASE WHEN excluded.last_message_time > last_message_time THEN excluded.last_message_preview ELSE last_message_preview END,
 				name = CASE
 					WHEN excluded.name = '' THEN chats.name
-					WHEN excluded.name GLOB '+[0-9]*'
-					 AND COALESCE(chats.name, '') <> ''
-					 AND chats.name NOT GLOB '+[0-9]*' THEN chats.name
+					WHEN excluded.name GLOB '+[0-9]*' AND COALESCE(chats.name, '') <> '' THEN chats.name
 					ELSE excluded.name
 				END,
 				normalized_name = CASE
 					WHEN excluded.name = '' THEN chats.normalized_name
-					WHEN excluded.name GLOB '+[0-9]*'
-					 AND COALESCE(chats.name, '') <> ''
-					 AND chats.name NOT GLOB '+[0-9]*' THEN chats.normalized_name
+					WHEN excluded.name GLOB '+[0-9]*' AND COALESCE(chats.name, '') <> '' THEN chats.normalized_name
 					ELSE excluded.normalized_name
 				END,
 				updated_at = excluded.updated_at
