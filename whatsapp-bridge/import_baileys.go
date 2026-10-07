@@ -117,7 +117,11 @@ func RunBaileysImport(cfg *Config, db *sql.DB, storePath string) error {
 			continue
 		}
 
-		// Derive a chat name: prefer contact displayName for directs, else group id suffix.
+		// Derive a chat name from the store's contact entry. A nameless chat
+		// gets the "+<phone>" placeholder only when its JID is a phone number,
+		// the same rule as the contact loop above: the digits of a @lid or
+		// group JID are not a phone, and the raw JID is not a name. Any other
+		// chat gets "", which the upsert below reads as "keep the stored name".
 		var chatName string
 		if c, ok := store.Contacts[jid]; ok {
 			chatName = strings.TrimSpace(c.Notify)
@@ -126,10 +130,8 @@ func RunBaileysImport(cfg *Config, db *sql.DB, storePath string) error {
 			}
 		}
 		if chatName == "" {
-			if phone := extractPhone(jid); phone != "" {
-				chatName = "+" + phone
-			} else {
-				chatName = jid
+			if phone := phoneFromJID(jid); phone.Valid {
+				chatName = "+" + phone.String
 			}
 		}
 
