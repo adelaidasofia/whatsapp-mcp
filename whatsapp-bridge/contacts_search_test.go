@@ -263,8 +263,8 @@ func TestPhoneFromJID(t *testing.T) {
 // contact while that contact's number lived only in the JID. With phone
 // filled it reaches them under its existing rules, as it already did for a
 // @lid address-book row whose phone the alias backfill had filled: a blank
-// push_name is filled from the CRM, and a name the contact chose for
-// themselves is left alone.
+// push_name is filled from the CRM, and a push_name that is not a "+digits"
+// placeholder is left alone.
 func TestCRMEnrichmentReachesAddressBookContactsByPhone(t *testing.T) {
 	db := xvDB(t)
 	const saved = "573001234567@s.whatsapp.net"
