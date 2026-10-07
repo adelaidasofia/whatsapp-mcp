@@ -41,9 +41,11 @@ type baileysKey struct {
 	Participant string `json:"participant,omitempty"`
 }
 
-// RunBaileysImport reads a baileys_store.json file and inserts its contacts,
-// chats, and messages into our SQLite database. Idempotent via ON CONFLICT DO NOTHING.
-// Returns counts for a final summary.
+// RunBaileysImport reads a baileys_store.json file and writes its contacts,
+// chats and messages into our SQLite database, logging counts for a final
+// summary. It is safe to run again over the same database: messages are
+// inserted with ON CONFLICT DO NOTHING, and the contact and chat upserts never
+// let an empty name or a placeholder replace a stored name.
 func RunBaileysImport(cfg *Config, db *sql.DB, storePath string) error {
 	log.Printf("reading baileys store: %s", storePath)
 	raw, err := os.ReadFile(storePath)
@@ -134,9 +136,10 @@ func RunBaileysImport(cfg *Config, db *sql.DB, storePath string) error {
 		// gets the "+<phone>" placeholder only when its JID is a phone number,
 		// the same rule as the contact loop above: the digits of a @lid or
 		// group JID are not a phone, and the raw JID is not a name. Any other
-		// chat gets no name. It goes in as NULL, as bridge.go writes it, so a
-		// later history sync can still fill it (history_sync.go keeps a stored
-		// empty string), and the upsert below reads it as "keep the stored name".
+		// chat gets no name, passed as NULL the way bridge.go writes it: a chat
+		// row created here can then still be named by a later history sync
+		// (history_sync.go keeps a stored empty string), and for a row that
+		// already exists the upsert below reads it as "keep the stored name".
 		var chatName string
 		if c, ok := store.Contacts[jid]; ok {
 			chatName = strings.TrimSpace(c.Notify)

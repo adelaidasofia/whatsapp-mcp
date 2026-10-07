@@ -75,19 +75,22 @@ func chatNames(t *testing.T, db *sql.DB, jid string) (name, normalized string) {
 }
 
 // A chat whose store entry carries no name gets the "+<phone>" placeholder
-// only when its JID is a phone number. The digits of a @lid JID are an opaque
-// identifier and a group's are its id, so "+<digits>" would present either as
-// a phone number, and the raw JID (the old fallback for a JID with no digits)
-// is not a name. Any other chat is stored with no name, as NULL the way
-// bridge.go stores it: history_sync.go fills a NULL name but keeps an empty
-// string.
+// only when its JID is a phone number, the legacy @c.us form included. The
+// digits of a @lid JID are an opaque identifier and a group's are its id, so
+// "+<digits>" would present either as a phone number, and the raw JID (the
+// old fallback for a JID with no digits) is not a name. Any other chat is
+// stored with no name, as NULL the way bridge.go stores it: history_sync.go
+// fills a NULL name but keeps an empty string.
 func TestBaileysNamelessChatGetsNoMadeUpName(t *testing.T) {
 	db := xvDB(t)
-	const pn, lid, group, digitless = "573001234567@s.whatsapp.net", "123456789012345@lid", "120363000000000001@g.us", "nodigits@lid"
-	importBaileysStore(t, db, `{"contacts": {}, "messages": `+baileysChats(pn, lid, group, digitless)+`}`)
+	const pn, legacy = "573001234567@s.whatsapp.net", "15555550100@c.us"
+	const lid, group, digitless = "123456789012345@lid", "120363000000000001@g.us", "nodigits@lid"
+	importBaileysStore(t, db, `{"contacts": {}, "messages": `+baileysChats(pn, legacy, lid, group, digitless)+`}`)
 
-	if got, _ := chatNames(t, db, pn); got != "+573001234567" {
-		t.Errorf("%s: chat name = %q, want the placeholder %q", pn, got, "+573001234567")
+	for jid, want := range map[string]string{pn: "+573001234567", legacy: "+15555550100"} {
+		if got, _ := chatNames(t, db, jid); got != want {
+			t.Errorf("%s: chat name = %q, want the placeholder %q", jid, got, want)
+		}
 	}
 	for _, jid := range []string{lid, group, digitless} {
 		var name, normalized sql.NullString
