@@ -41,9 +41,11 @@ type baileysKey struct {
 	Participant string `json:"participant,omitempty"`
 }
 
-// RunBaileysImport reads a baileys_store.json file and inserts its contacts,
-// chats, and messages into our SQLite database. Idempotent via ON CONFLICT DO NOTHING.
-// Returns counts for a final summary.
+// RunBaileysImport reads a baileys_store.json file and writes its contacts,
+// chats and messages into our SQLite database, logging counts for a final
+// summary. It is safe to run again over the same database: messages are
+// inserted with ON CONFLICT DO NOTHING, and the contact and chat upserts never
+// let an empty name or a placeholder replace a stored name.
 func RunBaileysImport(cfg *Config, db *sql.DB, storePath string) error {
 	log.Printf("reading baileys store: %s", storePath)
 	raw, err := os.ReadFile(storePath)
@@ -84,13 +86,26 @@ func RunBaileysImport(cfg *Config, db *sql.DB, storePath string) error {
 			displayName = "+" + phone.String
 		}
 
+		// On a re-import, or an import over rows the bridge already wrote, an
+		// empty name keeps the stored one, and the placeholder only fills a
+		// contact that has no name: it never replaces one. normalized_name
+		// takes the same branch as push_name, because search_contacts matches
+		// names through it. Keep the two CASEs identical.
 		_, err := db.Exec(`
 			INSERT INTO contacts (jid, phone, push_name, verified_name, normalized_name, is_business, created_at, updated_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(jid) DO UPDATE SET
-				push_name = COALESCE(NULLIF(excluded.push_name, ''), push_name),
+				push_name = CASE
+					WHEN excluded.push_name = '' THEN contacts.push_name
+					WHEN excluded.push_name GLOB '+[0-9]*' AND COALESCE(contacts.push_name, '') <> '' THEN contacts.push_name
+					ELSE excluded.push_name
+				END,
 				verified_name = COALESCE(NULLIF(excluded.verified_name, ''), verified_name),
-				normalized_name = excluded.normalized_name,
+				normalized_name = CASE
+					WHEN excluded.push_name = '' THEN contacts.normalized_name
+					WHEN excluded.push_name GLOB '+[0-9]*' AND COALESCE(contacts.push_name, '') <> '' THEN contacts.normalized_name
+					ELSE excluded.normalized_name
+				END,
 				updated_at = excluded.updated_at
 		`, jid, phone, displayName, c.VerifiedName, Normalize(displayName), 0, now, now)
 		if err != nil {
@@ -117,7 +132,14 @@ func RunBaileysImport(cfg *Config, db *sql.DB, storePath string) error {
 			continue
 		}
 
-		// Derive a chat name: prefer contact displayName for directs, else group id suffix.
+		// Derive a chat name from the store's contact entry. A nameless chat
+		// gets the "+<phone>" placeholder only when its JID is a phone number,
+		// the same rule as the contact loop above: the digits of a @lid or
+		// group JID are not a phone, and the raw JID is not a name. Any other
+		// chat gets no name, passed as NULL the way bridge.go writes it: a chat
+		// row created here can then still be named by a later history sync
+		// (history_sync.go keeps a stored empty string), and for a row that
+		// already exists the upsert below reads it as "keep the stored name".
 		var chatName string
 		if c, ok := store.Contacts[jid]; ok {
 			chatName = strings.TrimSpace(c.Notify)
@@ -126,10 +148,8 @@ func RunBaileysImport(cfg *Config, db *sql.DB, storePath string) error {
 			}
 		}
 		if chatName == "" {
-			if phone := extractPhone(jid); phone != "" {
-				chatName = "+" + phone
-			} else {
-				chatName = jid
+			if phone := phoneFromJID(jid); phone.Valid {
+				chatName = "+" + phone.String
 			}
 		}
 
@@ -198,16 +218,29 @@ func RunBaileysImport(cfg *Config, db *sql.DB, storePath string) error {
 			continue
 		}
 
+		// Same rule as the contact upsert: no name keeps the stored one, and
+		// the placeholder only fills a chat that has no name, so neither can
+		// replace a name the address book or the live bridge gave the chat. A
+		// real name from the store still does. normalized_name takes the same
+		// branch as name. Keep the two CASEs identical.
 		_, err := db.Exec(`
 			INSERT INTO chats (jid, chat_type, name, normalized_name, created_at, updated_at, last_message_time, last_message_preview)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(jid) DO UPDATE SET
 				last_message_time = MAX(excluded.last_message_time, last_message_time),
 				last_message_preview = CASE WHEN excluded.last_message_time > last_message_time THEN excluded.last_message_preview ELSE last_message_preview END,
-				name = COALESCE(NULLIF(excluded.name, ''), name),
-				normalized_name = excluded.normalized_name,
+				name = CASE
+					WHEN COALESCE(excluded.name, '') = '' THEN chats.name
+					WHEN excluded.name GLOB '+[0-9]*' AND COALESCE(chats.name, '') <> '' THEN chats.name
+					ELSE excluded.name
+				END,
+				normalized_name = CASE
+					WHEN COALESCE(excluded.name, '') = '' THEN chats.normalized_name
+					WHEN excluded.name GLOB '+[0-9]*' AND COALESCE(chats.name, '') <> '' THEN chats.normalized_name
+					ELSE excluded.normalized_name
+				END,
 				updated_at = excluded.updated_at
-		`, jid, chatType, chatName, Normalize(chatName), now, now, lastTs, lastPreview)
+		`, jid, chatType, nullIfEmpty(chatName), nullIfEmpty(Normalize(chatName)), now, now, lastTs, lastPreview)
 		if err != nil {
 			log.Printf("chat upsert failed for %s: %v", jid, err)
 			continue
