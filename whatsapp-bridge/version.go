@@ -17,4 +17,4 @@ package main
 // the release workflow refuses to build a tag that is not "v" + this value. It
 // reads this exact one-line declaration, so keep it in the form
 // `var bridgeVersion = "X.Y.Z"` (TestReleaseCanReadBridgeVersion checks it).
-var bridgeVersion = "0.5.0"
+var bridgeVersion = "0.5.1"
