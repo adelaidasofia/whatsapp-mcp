@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **`search_contacts` could not find a saved contact by phone number.** Contacts that come from the phone's address book (`contacts_sync.go`) were stored with the number only inside the JID (`573001234567@s.whatsapp.net`) and an empty `phone` column, and the search matched `phone`, never the JID. Such a contact was found by name and returned nothing by number, unless some other path had also stored the number on one of their rows. A number typed the way a phone displays it (`+57 300 123 4567`) matched nothing even for contacts whose `phone` was set, because the column holds bare digits and the query was compared as typed. Reported from a Windows install on v0.4.1, with the cause traced to `handleSearchContacts`. The address-book writer now stores `phone` for phone-number JIDs; migration 008 fills it in on the rows already written; and the search matches a number on its digits against both `phone` and the number inside a phone-number JID, so it no longer depends on which writer filled the column. Name matches rank ahead of number matches, so a short number-shaped query such as `7-` cannot push a name match like "7-Eleven" past the limit. The user part of a `@lid` JID is an opaque identifier: the address-book writer and the Baileys importer no longer store it as a phone, and the JID match only considers phone-number JIDs. The importer also no longer invents a name for a nameless contact: a phone-number JID keeps the `+<phone>` placeholder, and any other JID gets no label rather than `+<LID digits>` or the raw JID. With a CRM folder configured, CRM enrichment, which also matches on phone, now reaches address-book contacts under its existing rules, as it already did for `@lid` address-book contacts whose phone the alias backfill had filled: a contact with no push name of its own gets the CRM name, so its vault export can switch from the address-book name to the CRM name. The test for this endpoint used to copy part of its `WHERE` clause; it now calls the handler.
+
 ## [0.5.0] - 2026-10-06
 
 ### Added

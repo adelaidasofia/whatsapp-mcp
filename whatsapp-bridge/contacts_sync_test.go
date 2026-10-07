@@ -212,19 +212,13 @@ func TestSearchMatchesTheAddressBookName(t *testing.T) {
 		t.Fatalf("writeContactName: %v", err)
 	}
 
-	// Mirrors the WHERE clause in handleSearchContacts. Searching for the only
-	// name the user knows used to return zero rows.
+	// Through the real handler. Searching for the only name the user knows
+	// used to return zero rows. This test once copied the handler's WHERE
+	// clause, and only its two name columns, so nothing exercised the number
+	// half of the search (see contacts_search_test.go).
 	search := func(q string) int {
 		t.Helper()
-		norm := Normalize(q)
-		var n int
-		if err := db.QueryRow(`
-			SELECT COUNT(*) FROM contacts
-			WHERE normalized_name LIKE ? OR normalized_full_name LIKE ?
-		`, "%"+norm+"%", "%"+norm+"%").Scan(&n); err != nil {
-			t.Fatalf("search %q: %v", q, err)
-		}
-		return n
+		return len(searchContacts(t, db, q))
 	}
 
 	if got := search("Mi Amor"); got != 1 {

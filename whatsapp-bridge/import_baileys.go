@@ -64,7 +64,10 @@ func RunBaileysImport(cfg *Config, db *sql.DB, storePath string) error {
 	// --- Import contacts ---
 	contactsInserted := 0
 	for jid, c := range store.Contacts {
-		phone := extractPhone(jid)
+		// Only a phone-number JID carries a phone. extractPhone keeps the
+		// digits of any JID, so a @lid contact used to be imported with its
+		// LID stored, and displayed, as its phone number.
+		phone := phoneFromJID(jid)
 		displayName := strings.TrimSpace(c.Notify)
 		if displayName == "" {
 			displayName = strings.TrimSpace(c.Name)
@@ -72,12 +75,13 @@ func RunBaileysImport(cfg *Config, db *sql.DB, storePath string) error {
 		if displayName == "" {
 			displayName = strings.TrimSpace(c.VerifiedName)
 		}
-		if displayName == "" {
-			if phone != "" {
-				displayName = "+" + phone
-			} else {
-				displayName = jid
-			}
+		// A nameless contact gets the "+<phone>" placeholder only when it has
+		// a phone; export_vault.go and crm_enrich.go read that shape as "no
+		// name yet". Any other JID gets no label. Its digits are not a phone,
+		// and the raw JID is not a name: the vault export shows a push_name
+		// that is not a placeholder ahead of the name the user saved.
+		if displayName == "" && phone.Valid {
+			displayName = "+" + phone.String
 		}
 
 		_, err := db.Exec(`

@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"time"
+	"unicode"
 )
 
 // Server is the HTTP REST API the Python MCP server consumes.
@@ -672,8 +673,10 @@ func (s *Server) handleSearchContacts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	norm := Normalize(query)
+	namePattern := "%" + norm + "%"
+	num := numberQuery(query)
 
-	// Initial match by name/phone/lid. We then expand each match through
+	// Initial match by name/phone/lid/JID. We then expand each match through
 	// jid_aliases so callers see every JID known to refer to the same human
 	// (LID + phone-JID forms). Without this, a name search returns only the
 	// row whose stored push_name happens to match exactly, hiding the alias.
@@ -683,14 +686,34 @@ func (s *Server) handleSearchContacts(w http.ResponseWriter, r *http.Request) {
 	// column went unread, searching "Mi Amor" returned zero and the caller was
 	// pushed into supplying a phone number from memory — which is exactly the
 	// job an address book exists to do. See contacts_sync.go.
+	//
+	// A number is matched on its digits (numberQuery), against phone and
+	// against the number inside a phone-number JID. Address-book rows carried
+	// the number only in the JID until contacts_sync.go began writing phone,
+	// so a saved contact was found by name and, unless some other path had
+	// stored the number on one of their rows, never by number. Matching the
+	// JID keeps the search independent of which writer filled the column. The
+	// @s.whatsapp.net suffix keeps the JID clause off @lid rows, whose user
+	// part is an opaque identifier rather than a number.
+	//
+	// Rows that match by name rank first. A short number-shaped query can
+	// match many rows by phone ("7-" matches every phone with a 7), and those
+	// must not push a name match ("7-Eleven") past the limit. The rank is a
+	// CASE so it is always 1 or 0: LIKE on a NULL column is NULL, and a bare
+	// OR of two LIKEs would sort rows with both name columns set ahead of
+	// newer rows with an empty one.
 	rows, err := s.db.QueryContext(r.Context(), `
 		SELECT jid, COALESCE(lid, ''), COALESCE(phone, ''), COALESCE(full_name, ''),
 		       COALESCE(push_name, ''), COALESCE(verified_name, ''), is_business
 		FROM contacts
-		WHERE normalized_name LIKE ? OR normalized_full_name LIKE ? OR phone LIKE ? OR lid LIKE ?
-		ORDER BY updated_at DESC
+		WHERE normalized_name LIKE ? OR normalized_full_name LIKE ?
+		   OR phone LIKE ? OR lid LIKE ?
+		   OR jid LIKE ?
+		ORDER BY CASE WHEN normalized_name LIKE ? OR normalized_full_name LIKE ? THEN 1 ELSE 0 END DESC,
+		         updated_at DESC
 		LIMIT ?
-	`, "%"+norm+"%", "%"+norm+"%", "%"+query+"%", "%"+query+"%", limit)
+	`, namePattern, namePattern, "%"+num+"%", "%"+query+"%", "%"+num+"%@s.whatsapp.net",
+		namePattern, namePattern, limit)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "query failed", Details: err.Error()})
 		return
@@ -769,6 +792,31 @@ func loadContactRow(ctx context.Context, db *sql.DB, jid string) (contactRow, bo
 	}
 	c.IsBusiness = isBiz == 1
 	return c, true
+}
+
+// numberQuery is what a contact search matches against phone numbers. A query
+// written as a number, digits plus the spacing and punctuation numbers are
+// formatted with ("+57 300 123 4567", "(300) 123-4567", "300/1234567"), is
+// reduced to its digits: phone and the phone-number JID both store bare
+// digits, and the formatted string matched neither. Characters in Unicode's
+// dash-punctuation category (Pd) count as punctuation, and invisible format
+// characters (Cf) count as spacing. Any other query is returned unchanged.
+func numberQuery(q string) string {
+	hasDigit := false
+	for _, r := range q {
+		switch {
+		case r >= '0' && r <= '9':
+			hasDigit = true
+		case r == '+' || r == '(' || r == ')' || r == '.' || r == '/',
+			unicode.Is(unicode.Pd, r), unicode.IsSpace(r), unicode.Is(unicode.Cf, r):
+		default:
+			return q
+		}
+	}
+	if !hasDigit {
+		return q
+	}
+	return digitsOnly(q)
 }
 
 // --- helpers ----------------------------------------------------------------
