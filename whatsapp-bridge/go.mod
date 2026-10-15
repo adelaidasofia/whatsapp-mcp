@@ -2,7 +2,7 @@ module github.com/adelaidasofia/whatsapp-mcp/whatsapp-bridge
 
 go 1.26.0
 
-toolchain go1.26.5
+toolchain go1.26.9
 
 // Dependencies are populated by `go mod tidy` on first build.
 // Upgrading any dependency requires a manual diff review per SECURITY.md.
@@ -14,8 +14,8 @@ require (
 	github.com/mdp/qrterminal/v3 v3.2.1
 	github.com/mutecomm/go-sqlcipher/v4 v4.4.2
 	go.mau.fi/whatsmeow v0.0.0-20260821141805-33cfac511629
-	golang.org/x/sys v0.47.0
-	golang.org/x/text v0.41.0
+	golang.org/x/sys v0.48.0
+	golang.org/x/text v0.42.0
 	google.golang.org/protobuf v1.36.12
 )
 
@@ -29,10 +29,10 @@ require (
 	github.com/vektah/gqlparser/v2 v2.5.27 // indirect
 	go.mau.fi/libsignal v0.2.2 // indirect
 	go.mau.fi/util v0.10.1-0.20260820140024-eb612d936fde // indirect
-	golang.org/x/crypto v0.55.0 // indirect
+	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/exp v0.0.0-20260813180055-c1d0aacb2297 // indirect
-	golang.org/x/net v0.58.0 // indirect
-	golang.org/x/sync v0.22.0 // indirect
-	golang.org/x/term v0.45.0 // indirect
+	golang.org/x/net v0.60.0 // indirect
+	golang.org/x/sync v0.23.0 // indirect
+	golang.org/x/term v0.46.0 // indirect
 	rsc.io/qr v0.2.0 // indirect
 )
