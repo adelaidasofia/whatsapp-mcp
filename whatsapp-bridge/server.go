@@ -31,7 +31,6 @@ func NewServer(cfg *Config, db *sql.DB, bridge *Bridge, backfiller *TranscriptBa
 	s := &Server{cfg: cfg, db: db, bridge: bridge, backfiller: backfiller, mux: http.NewServeMux()}
 	s.registerRoutes()
 	s.server = &http.Server{
-		Addr:              fmt.Sprintf("%s:%d", cfg.BridgeHost, cfg.BridgePort),
 		Handler:           newOriginGuard(s.mux, cfg.AllowedOrigins),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
@@ -120,18 +119,22 @@ func (s *Server) handleRequestHistory(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) ListenAndServe(ctx context.Context) error {
-	ln, err := net.Listen("tcp", s.server.Addr)
-	if err != nil {
-		return err
-	}
+// ListenAPI binds the API address. run calls it before opening the store or
+// connecting to WhatsApp, so a second bridge copy fails here and not after it has
+// kicked the first copy's WhatsApp session off. See run.
+func ListenAPI(cfg *Config) (net.Listener, error) {
+	return net.Listen("tcp", fmt.Sprintf("%s:%d", cfg.BridgeHost, cfg.BridgePort))
+}
+
+// Serve runs the API on a listener the caller already bound with ListenAPI.
+func (s *Server) Serve(ln net.Listener) error {
 	// Announce the bound port for supervisors. With WHATSAPP_BRIDGE_PORT=0
 	// the OS picks a free port (multi-instance installs); the one greppable
 	// stdout line + the sidecar file are how they learn it.
 	port := ln.Addr().(*net.TCPAddr).Port
 	log.Printf("BRIDGE_LISTENING port=%d", port)
 	s.writePortFile(port)
-	err = s.server.Serve(ln)
+	err := s.server.Serve(ln)
 	if err == http.ErrServerClosed {
 		return nil
 	}

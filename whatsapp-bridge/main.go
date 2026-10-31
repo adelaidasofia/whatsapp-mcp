@@ -19,6 +19,7 @@ import (
 	"encoding/hex"
 	"flag"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -26,7 +27,7 @@ import (
 )
 
 func main() {
-	os.Exit(run())
+	os.Exit(run(os.Args[1:]))
 }
 
 // run is main's body, split out so the exit path is a `return` rather than
@@ -34,20 +35,24 @@ func main() {
 // db.Close / transcriber.Close / bridge.Disconnect below, and the fatal-shutdown
 // path (see Bridge.Fatal) needs them to actually run. main() is now the only
 // place that calls os.Exit, with a code the supervisor records.
-func run() int {
-	importBaileys := flag.String("import-baileys", "",
+//
+// It parses args on its own FlagSet, not the global one, so a test can start the
+// bridge more than once in a process (the global flags would panic on a redefine).
+func run(args []string) int {
+	fs := flag.NewFlagSet("whatsapp-bridge", flag.ExitOnError)
+	importBaileys := fs.String("import-baileys", "",
 		"Path to a baileys_store.json from the prior Baileys sync. If set, the bridge imports that store into SQLite and exits without connecting to WhatsApp.")
-	exportVault := flag.String("export-to-vault", "",
+	exportVault := fs.String("export-to-vault", "",
 		"Path to an output folder. If set, the bridge regenerates one markdown file per chat from SQLite into that folder and exits without connecting to WhatsApp.")
-	exportIncludeGroups := flag.Bool("export-include-groups", false,
+	exportIncludeGroups := fs.Bool("export-include-groups", false,
 		"When set with --export-to-vault, also exports group chats (default exports direct chats only, matching Baileys behavior).")
-	exportMinMessages := flag.Int("export-min-messages", 0,
+	exportMinMessages := fs.Int("export-min-messages", 0,
 		"With --export-to-vault: only export chats with at least this many messages (default 0 = export everything; recommended 5 to skip drive-by contacts). Counted across a person's merged JID forms.")
-	reconcileVault := flag.String("reconcile-vault", "",
+	reconcileVault := fs.String("reconcile-vault", "",
 		"Path to an exported vault folder. If set, the bridge compares the SQLite DB against the chat files (honoring --export-include-groups / --export-min-messages), prints MISSING/MISFILED/DRIFT/DUPLICATE/ORPHAN findings, and exits non-zero when any exist. Exits without connecting to WhatsApp.")
-	pairPhone := flag.String("pair-phone", "",
+	pairPhone := fs.String("pair-phone", "",
 		"Pair by typed code instead of QR scanning: your own phone number in international format (e.g. +15551234567). The 8-char code prints here; on the phone: WhatsApp > Settings > Linked Devices > Link a Device > 'Link with phone number instead'. Works on Android and iOS.")
-	flag.Parse()
+	fs.Parse(args)
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
 	log.Println("whatsapp-mcp bridge starting")
@@ -62,6 +67,27 @@ func run() int {
 	}
 	log.Printf("config loaded: bind=%s:%d db=%s crm=%s whisper=%s",
 		cfg.BridgeHost, cfg.BridgePort, cfg.DBPath, truncateForLog(cfg.VaultCRMPath), cfg.WhisperBackend)
+
+	// Take the API port before anything else is touched. A second copy started
+	// next to a running one has to find out here: further on it would open the
+	// store (ReconcileInFlightSends marks the live copy's in-flight sends failed)
+	// and connect to WhatsApp (which kicks the live copy's session off), and only
+	// then fail to bind. Exit non-zero: the launchd and systemd units restart
+	// only an unsuccessful exit, so the service retries until the other copy is
+	// gone and then takes over.
+	//
+	// The offline modes never serve or connect, and are meant to run next to the
+	// live bridge (the vault export does, every few hours), so they skip the port.
+	var ln net.Listener
+	if *importBaileys == "" && *exportVault == "" && *reconcileVault == "" {
+		ln, err = ListenAPI(cfg)
+		if err != nil {
+			log.Printf("another bridge probably already serves %s:%d; not connecting to WhatsApp or opening the store: %v",
+				cfg.BridgeHost, cfg.BridgePort, err)
+			return 1
+		}
+		defer ln.Close()
+	}
 
 	// One-time visibility for the v0.2.0 default flip: users who relied on
 	// the old local-cpp default would otherwise lose transcription silently.
@@ -289,14 +315,14 @@ func run() int {
 	}()
 
 	log.Printf("HTTP server listening on http://%s:%d", cfg.BridgeHost, cfg.BridgePort)
-	if err := server.ListenAndServe(ctx); err != nil {
+	if err := server.Serve(ln); err != nil {
 		log.Printf("server: %v", err)
 		return 1
 	}
 
 	// Reading the closed channel is how the exit code gets out of the shutdown
 	// goroutine without a shared variable and a data race: a channel close is a
-	// synchronisation point, and ListenAndServe has already returned by now.
+	// synchronisation point, and Serve has already returned by now.
 	select {
 	case <-bridge.Fatal():
 		log.Println("bridge stopped for a supervisor restart (fatal condition)")

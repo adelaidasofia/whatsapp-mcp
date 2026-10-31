@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **A second bridge copy connected to WhatsApp before it found out the API port was taken.** The bridge opened the store and started the WhatsApp connection first and bound the API port last, so a copy started next to a running one (a hand-started bridge beside the login service, say) kicked the running copy's session off and marked its in-flight sends failed, and only then died on `bind: address already in use`. Under launchd that repeated every 30 seconds: 154 restarts in about 77 minutes. The port is now bound right after the config loads, and the copy exits non-zero before it opens the store or connects, so the service manager keeps retrying until the other copy is gone and then takes over. `--export-to-vault`, `--reconcile-vault` and `--import-baileys` never serve, so they skip the port and still run next to a live bridge.
+
 ## [0.5.1] - 2026-10-07
 
 ### Fixed
