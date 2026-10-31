@@ -84,47 +84,75 @@ def _bridge_url(path: str) -> str:
 # A workspace sees only its own chats. An app that sorts a person's chats into
 # workspaces runs one server per workspace with WHATSAPP_CHAT_SCOPE_FILE, a
 # JSON file it keeps current: {"allow": [jid, ...]} for only those chats, or
-# {"deny": [jid, ...]} for every chat but those. It is read on every call, so
-# moving a chat takes effect at once.
+# {"deny": [jid, ...]} for every chat but those. One person is one chat under
+# every JID the bridge knows for them (phone JID, LID, any device part), so
+# every check uses the chat's whole family. The file is read once per call, so
+# moving a chat takes effect on the next one.
 CHAT_SCOPE_FILE = os.environ.get("WHATSAPP_CHAT_SCOPE_FILE", "").strip()
 OUT_OF_SCOPE = "That chat belongs to another workspace, so it is not available in this one."
 
-# What this server itself handed out, so a scoped server confirms only its own
-# drafts and downloads media only from messages it showed.
-_scoped_drafts: set[str] = set()
-_scoped_messages: set[str] = set()
+# What this server handed out, with the chat each belongs to: a scoped server
+# confirms only its own drafts and downloads only media it showed, and checks
+# them again when used, in case the chat has moved since. Bounded; a restart
+# empties them, which refuses rather than allows.
+_SCOPED_IDS_LIMIT = 2000
+_scoped_drafts: dict[str, list[str]] = {}
+_scoped_messages: dict[str, list[str]] = {}
 
 
 def _chat_scope() -> tuple[str, frozenset[str]] | None:
-    """("allow" | "deny", jids), or None when this server is not scoped. A
-    scoped server whose file is missing or unreadable allows nothing: failing
-    open would show one workspace another's chats."""
+    """("allow" | "deny", jids), or None when this server is not scoped.
+    Anything but exactly one of the two keys holding a list of strings allows
+    nothing: failing open would show one workspace another's chats."""
     if not CHAT_SCOPE_FILE:
         return None
     try:
         data = json.loads(Path(CHAT_SCOPE_FILE).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return ("allow", frozenset())
-    for mode in ("allow", "deny"):
-        listed = data.get(mode) if isinstance(data, dict) else None
-        if isinstance(listed, list):
-            return (mode, frozenset(str(jid) for jid in listed))
+    if isinstance(data, dict) and len(data) == 1:
+        ((mode, listed),) = data.items()
+        if mode in ("allow", "deny") and isinstance(listed, list) and all(isinstance(j, str) for j in listed):
+            return (mode, frozenset(_strip_device(j) for j in listed))
     return ("allow", frozenset())
 
 
-def _in_scope(*jids: str | None) -> bool:
+def _strip_device(jid: str) -> str:
+    """'573001234567:12@s.whatsapp.net' is the same chat as '573001234567@s.whatsapp.net'."""
+    user, sep, server = jid.partition("@")
+    return user.split(":", 1)[0] + sep + server
+
+
+def _family_allowed(scope: tuple[str, frozenset[str]] | None, family: list[str | None]) -> bool:
     """Whether a chat known by any of these JIDs belongs to this workspace."""
-    scope = _chat_scope()
     if scope is None:
         return True
     mode, listed = scope
-    hit = any(jid in listed for jid in jids if jid)
+    hit = any(_strip_device(jid) in listed for jid in family if jid)
     return hit if mode == "allow" else not hit
 
 
-def _require_in_scope(*jids: str | None) -> None:
-    if not _in_scope(*jids):
+async def _family(jid: str) -> list[str]:
+    """Every JID the bridge knows for this chat (GET /api/aliases)."""
+    result = await _bridge_get("/api/aliases", {"jid": jid})
+    family = [str(j) for j in (result.get("family") or []) if j]
+    return family or [_strip_device(jid)]
+
+
+async def _require_in_scope(scope: tuple[str, frozenset[str]] | None, jid: str) -> list[str]:
+    """The chat's family, once it is known to belong to this workspace."""
+    if scope is None:
+        return [jid]
+    family = await _family(jid)
+    if not _family_allowed(scope, [jid, *family]):
         raise RuntimeError(OUT_OF_SCOPE)
+    return family
+
+
+def _remember(store: dict[str, list[str]], key: str, family: list[str]) -> None:
+    store[key] = family
+    while len(store) > _SCOPED_IDS_LIMIT:
+        store.pop(next(iter(store)))
 
 
 def _contact_jids(contact: dict[str, Any]) -> list[str | None]:
@@ -503,12 +531,38 @@ async def healthcheck() -> dict[str, Any]:
     try:
         result = await _bridge_get("/healthcheck")
         status = await _bridge_get("/api/status")
+        if _chat_scope() is not None:
+            # whatsmeow's last error line can name a chat from any workspace.
+            status.pop("last_client_error", None)
         merged = {**result, "status_detail": status}
         _audit("healthcheck", {}, "ok", int((time.time() - start) * 1000))
         return merged
     except Exception as e:  # noqa: BLE001
         _audit("healthcheck", {}, "failed", int((time.time() - start) * 1000), error=str(e))
         raise
+
+
+async def _scoped_chats(scope: tuple[str, frozenset[str]], params: dict[str, Any]) -> dict[str, Any]:
+    """The bridge pages every chat on the account; this pages until `limit`
+    of this workspace's chats (after `offset` of them) are found, or the
+    account runs out, so a workspace whose chats are not the newest still
+    sees them."""
+    want, skip = params["limit"], params["offset"]
+    kept: list[dict[str, Any]] = []
+    page: dict[str, Any] = {}
+    for start in range(0, 2000, 200):
+        page = await _bridge_get("/api/chats", {**params, "limit": 200, "offset": start})
+        rows = page.get("chats", [])
+        for chat in rows:
+            if not _family_allowed(scope, [chat.get("jid"), *(chat.get("aliases") or [])]):
+                continue
+            if skip > 0:
+                skip -= 1
+            elif len(kept) < want:
+                kept.append(chat)
+        if len(kept) >= want or len(rows) < 200:
+            break
+    return {**page, "chats": kept, "count": len(kept)}
 
 
 @mcp.tool()
@@ -523,10 +577,11 @@ async def list_chats(limit: int = 20, offset: int = 0, unread_only: bool = False
     start = time.time()
     params = {"limit": min(limit, 200), "offset": offset, "unread_only": str(unread_only).lower()}
     try:
-        result = await _bridge_get("/api/chats", params)
-        if _chat_scope() is not None:
-            result["chats"] = [c for c in result.get("chats", []) if _in_scope(c.get("jid"))]
-            result["count"] = len(result["chats"])
+        scope = _chat_scope()
+        if scope is None:
+            result = await _bridge_get("/api/chats", params)
+        else:
+            result = await _scoped_chats(scope, params)
         _audit("list_chats", params, f"{len(result.get('chats', []))} chats", int((time.time() - start) * 1000))
         return result
     except Exception as e:  # noqa: BLE001
@@ -542,9 +597,13 @@ async def search_contacts(query: str, limit: int = 10) -> dict[str, Any]:
     start = time.time()
     params = {"q": query, "limit": limit}
     try:
-        result = await _bridge_get("/api/contacts/search", params)
-        if _chat_scope() is not None:
-            result["contacts"] = [c for c in result.get("contacts", []) if _in_scope(*_contact_jids(c))]
+        scope = _chat_scope()
+        if scope is None:
+            result = await _bridge_get("/api/contacts/search", params)
+        else:
+            result = await _bridge_get("/api/contacts/search", {**params, "limit": 100})
+            kept = [c for c in result.get("contacts", []) if _family_allowed(scope, _contact_jids(c))]
+            result["contacts"] = kept[: max(limit, 0)]
             result["count"] = len(result["contacts"])
         _audit("search_contacts", params, f"{len(result.get('contacts', []))} matches", int((time.time() - start) * 1000))
         return result
@@ -579,7 +638,8 @@ async def search_groups(query: str, limit: int = 10) -> dict[str, Any]:
     params: dict[str, Any] = {"q": query, "limit": limit}
     try:
         result = await _bridge_get("/api/groups")
-        groups = [g for g in result.get("groups", []) if _in_scope(g.get("jid"))]
+        scope = _chat_scope()
+        groups = [g for g in result.get("groups", []) if _family_allowed(scope, [g.get("jid")])]
         needle = _fold(query)
         matches = [g for g in groups if needle in _fold(g.get("name") or "")]
         trimmed = []
@@ -620,10 +680,16 @@ async def list_messages(
     if before:
         params["before"] = before
     try:
+        scope = _chat_scope()
+        family = await _require_in_scope(scope, chat_jid)
         result = await _bridge_get("/api/messages", params)
-        _require_in_scope(chat_jid, *(result.get("merged_jids") or []))
-        if _chat_scope() is not None:
-            _scoped_messages.update(str(m.get("id")) for m in result.get("messages", []) if m.get("id"))
+        if scope is not None:
+            family = [*family, *(result.get("merged_jids") or [])]
+            if not _family_allowed(scope, family):
+                raise RuntimeError(OUT_OF_SCOPE)
+            for m in result.get("messages", []):
+                if m.get("id"):
+                    _remember(_scoped_messages, str(m["id"]), family)
 
         # Scrub incoming text for prompt injection.
         for msg in result.get("messages", []):
@@ -671,10 +737,13 @@ async def download_media(message_id: str) -> dict[str, Any]:
     start = time.time()
     body = {"message_id": message_id}
     try:
-        if _chat_scope() is not None and message_id not in _scoped_messages:
+        scope = _chat_scope()
+        if scope is not None and message_id not in _scoped_messages:
             raise RuntimeError(
                 "Open the chat with list_messages first: this workspace can download media only from its own chats."
             )
+        if scope is not None and not _family_allowed(scope, _scoped_messages[message_id]):
+            raise RuntimeError(OUT_OF_SCOPE)
         result = await _bridge_post("/api/media/download", body)
         _audit("download_media", body, f"{result.get('size', 0)} bytes -> {result.get('path')}",
                int((time.time() - start) * 1000))
@@ -702,7 +771,7 @@ async def request_history(chat_jid: str, count: int = 20) -> dict[str, Any]:
     start = time.time()
     body = {"chat_jid": chat_jid, "count": min(count, 200)}
     try:
-        _require_in_scope(chat_jid)
+        await _require_in_scope(_chat_scope(), chat_jid)
         result = await _bridge_post("/api/admin/request-history", body)
         bridge_hint = result.get("hint")
         mcp_hint = (
@@ -750,10 +819,11 @@ async def send_message(recipient_jid: str, text: str) -> dict[str, Any]:
     start = time.time()
     body = {"recipient_jid": recipient_jid, "text": text, "send_type": "text"}
     try:
-        _require_in_scope(recipient_jid)
+        scope = _chat_scope()
+        family = await _require_in_scope(scope, recipient_jid)
         result = await _bridge_post("/api/sends", body)
-        if result.get("draft_id"):
-            _scoped_drafts.add(str(result["draft_id"]))
+        if scope is not None and result.get("draft_id"):
+            _remember(_scoped_drafts, str(result["draft_id"]), family)
         _audit("send_message", {"recipient_jid": recipient_jid, "text_len": len(text)},
                f"draft_id={result.get('draft_id')} recipient={result.get('recipient_display')}",
                int((time.time() - start) * 1000))
@@ -787,8 +857,11 @@ async def confirm_send(draft_id: str) -> dict[str, Any]:
     """
     start = time.time()
     try:
-        if _chat_scope() is not None and draft_id not in _scoped_drafts:
+        scope = _chat_scope()
+        if scope is not None and draft_id not in _scoped_drafts:
             raise RuntimeError("That draft was made in another workspace, so it cannot be sent from this one.")
+        if scope is not None and not _family_allowed(scope, _scoped_drafts[draft_id]):
+            raise RuntimeError(OUT_OF_SCOPE)
         result = await _bridge_post(f"/api/sends/{draft_id}/confirm", {})
         _audit("confirm_send", {"draft_id": draft_id},
                f"status={result.get('status')} whatsapp_id={result.get('whatsapp_message_id')}",
@@ -821,10 +894,11 @@ async def send_reply_quote(recipient_jid: str, quoted_message_id: str, text: str
         "text": text,
     }
     try:
-        _require_in_scope(recipient_jid)
+        scope = _chat_scope()
+        family = await _require_in_scope(scope, recipient_jid)
         result = await _bridge_post("/api/sends", body)
-        if result.get("draft_id"):
-            _scoped_drafts.add(str(result["draft_id"]))
+        if scope is not None and result.get("draft_id"):
+            _remember(_scoped_drafts, str(result["draft_id"]), family)
         _audit("send_reply_quote",
                {"recipient_jid": recipient_jid, "quoted": quoted_message_id, "text_len": len(text)},
                f"draft_id={result.get('draft_id')}", int((time.time() - start) * 1000))
@@ -854,10 +928,11 @@ async def send_reaction(recipient_jid: str, target_message_id: str, emoji: str) 
         "reaction_emoji": emoji,
     }
     try:
-        _require_in_scope(recipient_jid)
+        scope = _chat_scope()
+        family = await _require_in_scope(scope, recipient_jid)
         result = await _bridge_post("/api/sends", body)
-        if result.get("draft_id"):
-            _scoped_drafts.add(str(result["draft_id"]))
+        if scope is not None and result.get("draft_id"):
+            _remember(_scoped_drafts, str(result["draft_id"]), family)
         _audit("send_reaction",
                {"recipient_jid": recipient_jid, "target": target_message_id, "emoji": emoji},
                f"draft_id={result.get('draft_id')}", int((time.time() - start) * 1000))
@@ -882,7 +957,7 @@ async def mark_chat_read(chat_jid: str, message_ids: list[str]) -> dict[str, Any
     start = time.time()
     body = {"chat_jid": chat_jid, "message_ids": message_ids}
     try:
-        _require_in_scope(chat_jid)
+        await _require_in_scope(_chat_scope(), chat_jid)
         result = await _bridge_post("/api/presence/mark_read", body)
         _audit("mark_chat_read", {"chat_jid": chat_jid, "count": len(message_ids)},
                "ok", int((time.time() - start) * 1000))
@@ -907,7 +982,7 @@ async def send_typing_indicator(chat_jid: str, state: str = "composing") -> dict
     start = time.time()
     body = {"chat_jid": chat_jid, "state": state}
     try:
-        _require_in_scope(chat_jid)
+        await _require_in_scope(_chat_scope(), chat_jid)
         result = await _bridge_post("/api/presence/typing", body)
         _audit("send_typing_indicator", {"chat_jid": chat_jid, "state": state},
                "ok", int((time.time() - start) * 1000))
