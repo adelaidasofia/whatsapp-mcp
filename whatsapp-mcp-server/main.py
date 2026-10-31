@@ -680,9 +680,13 @@ async def _voice_note_offer(messages: list[dict[str, Any]]) -> dict[str, Any] | 
 
     Shown where voice notes first appear without words, only while transcription
     is off, and only once ever: showing it is recorded on disk. It is a nicety,
-    so nothing here may break a read.
+    so nothing here may break a read. Never when an app runs the bridge
+    (WHATSAPP_BRIDGE_SUPERVISOR): that app owns transcription for its bridge,
+    and the terminal steps would change and restart a different one.
     """
     global _offer_in_flight, _transcription_on_until
+    if BRIDGE_SUPERVISOR:
+        return None
     try:
         if (not voice_setup.untranscribed(messages) or _offer_in_flight
                 or time.time() < _transcription_on_until or not voice_setup.hint_available()):
@@ -729,6 +733,13 @@ async def voice_note_transcription(not_now: bool = False) -> dict[str, Any]:
                 result = {"transcription": "on", "backend": tx.get("backend"),
                           "language": tx.get("language"),
                           "voice_notes_waiting": tx.get("pending_with_keys", 0)}
+            elif BRIDGE_SUPERVISOR:
+                # The app that runs this bridge owns its transcription. The
+                # terminal steps edit and restart a hand-set-up bridge, which
+                # is not this one.
+                result = {"transcription": "off", "managed_by": BRIDGE_SUPERVISOR,
+                          "say": f"{BRIDGE_SUPERVISOR} runs WhatsApp on this computer, so voice-note "
+                                 f"transcription is turned on in {BRIDGE_SUPERVISOR}, not from a session."}
             else:
                 result = voice_setup.how_to_turn_on()
                 if note:

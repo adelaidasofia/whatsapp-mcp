@@ -223,3 +223,20 @@ async def test_an_offer_that_cannot_be_recorded_is_not_shown(monkeypatch):
     second = await main.list_messages("chat@s.whatsapp.net")
 
     assert "voice_note_transcription" not in first and "voice_note_transcription" not in second
+
+
+@pytest.mark.asyncio
+async def test_an_app_that_runs_the_bridge_gets_no_terminal_steps(monkeypatch, alone):
+    """Mycelium runs its own bridge: the steps would edit and restart another one."""
+    monkeypatch.setattr(main, "BRIDGE_SUPERVISOR", "Mycelium")
+    asked = bridge(monkeypatch, [VOICE, dict(VOICE, id="A3")])
+
+    read = await main.list_messages("chat@s.whatsapp.net")
+    assert "voice_note_transcription" not in read
+    assert not (alone / "voice-note-hint.json").exists(), "an offer never shown is never recorded"
+
+    answer = await main.voice_note_transcription()
+    assert answer["transcription"] == "off"
+    assert answer["managed_by"] == "Mycelium"
+    assert "enable_transcription" not in json.dumps(answer)
+    assert "/healthcheck" in asked

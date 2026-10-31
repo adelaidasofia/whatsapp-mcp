@@ -8,10 +8,12 @@ import (
 
 // tokenGuard requires `Authorization: Bearer <WHATSAPP_API_TOKEN>` on every
 // request when a token is set. The loopback API otherwise answers any process
-// on the machine: an app that runs the bridge for a member (and gives the
-// token only to the MCP servers it starts) keeps a shell session, a script or
-// a prompt-injected agent from reading chats or sending around it. Unset, the
-// API stays open, as it always was for a bridge started by hand.
+// on the machine: an app that runs the bridge for a member gives the token only
+// to the MCP servers it starts, which keeps other accounts on the computer,
+// sandboxed apps and web pages from reading chats or sending around them. It is
+// not a sandbox: a program running as the same user can read the token from
+// this process's environment. Unset, the API stays open, as it always was for
+// a bridge started by hand.
 type tokenGuard struct {
 	next  http.Handler
 	token []byte
