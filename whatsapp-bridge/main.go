@@ -181,6 +181,7 @@ func run(args []string) int {
 	transcriber := NewTranscriber(cfg, db)
 	defer transcriber.Close()
 
+	applyDeviceProps(cfg)
 	bridge, err := NewBridge(ctx, cfg, db, dbKey, transcriber)
 	if err != nil {
 		// Printf + return, not Fatalf: db and transcriber are already open above

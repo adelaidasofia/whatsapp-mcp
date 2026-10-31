@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **An app can run the bridge for the member (Mycelium Studio, tickets#658).** Three settings make that work without a terminal, all off unless set:
+  - `WHATSAPP_FULL_HISTORY=true` asks the phone for its whole chat history when this device links, as whatsapp-vault-sync's `syncFullHistory` does, so one link brings in both the live chats and the history. WhatsApp reads it only when a device links for the first time; an already linked bridge changes nothing until it is unlinked and links again.
+  - `WHATSAPP_DEVICE_NAME` is the name the phone lists under Linked devices (Studio uses "Mycelium"), so the member can tell the bridge apart and unlink it. It also reports the device as a desktop.
+  - `WHATSAPP_BRIDGE_PORT_FILE` (MCP server) reads the bridge's port from its `bridge.port` file on every request, so a bridge restarted on a free port (`WHATSAPP_BRIDGE_PORT=0`) never strands the server on the old one. With `WHATSAPP_BRIDGE_SUPERVISOR` set to the app's name, an unreachable bridge is reported as that app's to fix, never as "start it in a terminal".
+- **Each release attaches the MCP server as a wheel** (`adelaidasofia_whatsapp_mcp-<version>-py3-none-any.whl` plus its `.sha256`), built reproducibly, so an app can install the exact file it pinned. The release check now requires it next to the four bridge binaries.
+
 ### Fixed
 
 - **A second bridge copy connected to WhatsApp before it found out the API port was taken.** The bridge opened the store and started the WhatsApp connection first and bound the API port last, so a copy started next to a running one (a hand-started bridge beside the login service, say) kicked the running copy's session off and marked its in-flight sends failed, and only then died on `bind: address already in use`. Under launchd that repeated every 30 seconds: 154 restarts in about 77 minutes. The port is now bound right after the config loads, and the copy exits non-zero before it opens the store or connects, so the service manager keeps retrying until the other copy is gone and then takes over. `--export-to-vault`, `--reconcile-vault` and `--import-baileys` never serve, so they skip the port and still run next to a live bridge.

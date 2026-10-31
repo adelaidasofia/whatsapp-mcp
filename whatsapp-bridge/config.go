@@ -74,6 +74,15 @@ type Config struct {
 	// failures self-heal instead of leaving permanent NULLs.
 	BackfillIntervalSeconds int
 	BackfillWindowDays      int
+
+	// DeviceName is the name this bridge shows in the phone's Linked devices
+	// list (WHATSAPP_DEVICE_NAME), so a member can tell it apart and unlink
+	// it. Empty keeps whatsmeow's own. FullHistory (WHATSAPP_FULL_HISTORY)
+	// asks the phone for its whole history when this device links, instead
+	// of the recent months it sends by default. Both take effect only on a
+	// device that has not linked yet: see device_props.go.
+	DeviceName  string
+	FullHistory bool
 }
 
 // LoadConfig reads every env var, applies defaults, and returns a populated Config.
@@ -126,6 +135,8 @@ func LoadConfig() (*Config, error) {
 		AutoDownloadMedia:       getenvBool("WHATSAPP_AUTO_DOWNLOAD_MEDIA", false),
 		BackfillIntervalSeconds: getenvInt("WHATSAPP_BACKFILL_INTERVAL_SECONDS", 900),
 		BackfillWindowDays:      getenvInt("WHATSAPP_BACKFILL_WINDOW_DAYS", 14),
+		DeviceName:              getenv("WHATSAPP_DEVICE_NAME", ""),
+		FullHistory:             getenvBool("WHATSAPP_FULL_HISTORY", false),
 	}
 
 	if err := c.Validate(); err != nil {

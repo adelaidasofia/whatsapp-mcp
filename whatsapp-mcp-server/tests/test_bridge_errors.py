@@ -21,8 +21,10 @@ from __future__ import annotations
 import httpx
 import pytest
 
+import main
 from main import (
-    BRIDGE_BASE,
+    _bridge_base,
+    _bridge_port,
     _bridge_timeout,
     _bridge_unreachable,
     _transport_error,
@@ -31,7 +33,7 @@ from main import (
 
 def test_unreachable_message_names_the_bridge_and_the_address():
     msg = str(_bridge_unreachable(httpx.ConnectError("nope")))
-    assert BRIDGE_BASE in msg, "must say WHERE it tried to connect"
+    assert _bridge_base() in msg, "must say WHERE it tried to connect"
     assert "bridge" in msg.lower(), "must name the bridge as the missing piece"
     assert "separate program" in msg, "must explain the bridge is not this process"
 
@@ -80,6 +82,41 @@ def test_read_timeout_is_not_reported_as_not_running():
 def test_timeout_message_points_at_the_log():
     msg = str(_bridge_timeout(httpx.ReadTimeout("slow")))
     assert "log" in msg.lower()
+
+
+def test_port_file_is_read_on_every_call(tmp_path, monkeypatch):
+    # An app that runs the bridge on a free port restarts it on a new one;
+    # the server must follow the bridge's own port file, not its first read.
+    port_file = tmp_path / "bridge.port"
+    port_file.write_text("54321", encoding="utf-8")
+    monkeypatch.setattr(main, "BRIDGE_PORT_FILE", str(port_file))
+    assert _bridge_port() == 54321
+    port_file.write_text("54322", encoding="utf-8")
+    assert _bridge_base().endswith(":54322")
+
+
+def test_a_missing_port_file_never_falls_back_to_another_bridge(tmp_path, monkeypatch):
+    # Before the app's bridge writes its port, the default port may belong to
+    # a different bridge on the same machine, with another account's chats.
+    monkeypatch.setattr(main, "BRIDGE_PORT_FILE", str(tmp_path / "missing.port"))
+    assert _bridge_port() is None
+    with pytest.raises(RuntimeError, match="not written yet"):
+        main._bridge_url("/api/chats")
+    garbage = tmp_path / "garbage.port"
+    garbage.write_text("not a port", encoding="utf-8")
+    monkeypatch.setattr(main, "BRIDGE_PORT_FILE", str(garbage))
+    assert _bridge_port() is None
+
+
+def test_supervised_bridge_points_at_the_app_not_a_terminal(monkeypatch):
+    # A member whose app runs the bridge has no terminal, and a second bridge
+    # started by hand would fight the app's for the same WhatsApp link.
+    monkeypatch.setattr(main, "BRIDGE_SUPERVISOR", "Mycelium")
+    msg = str(_bridge_unreachable(httpx.ConnectError("nope")))
+    assert "Mycelium" in msg
+    assert "Do not start one in a terminal" in msg
+    assert "install-bridge-autostart" not in msg
+    assert "whatsapp-bridge/bin" not in msg
 
 
 def test_transport_error_returns_runtimeerror_not_raises():
