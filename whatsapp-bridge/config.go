@@ -97,6 +97,11 @@ type Config struct {
 	// messages sent per local calendar day; 0 turns sending off. It and the
 	// other send rules are enforced at confirm: see send_policy.go.
 	DailySendLimit int
+
+	// ExitWithParent (WHATSAPP_EXIT_WITH_PARENT) shuts the bridge down when
+	// its stdin closes: set by an app that runs it, so the bridge never
+	// outlives the app. See parent_watch.go.
+	ExitWithParent bool
 }
 
 // LoadConfig reads every env var, applies defaults, and returns a populated Config.
@@ -153,6 +158,7 @@ func LoadConfig() (*Config, error) {
 		DeviceName:              getenv("WHATSAPP_DEVICE_NAME", ""),
 		FullHistory:             getenvBool("WHATSAPP_FULL_HISTORY", false),
 		DailySendLimit:          getenvInt("WHATSAPP_DAILY_SEND_LIMIT", 10),
+		ExitWithParent:          getenvBool("WHATSAPP_EXIT_WITH_PARENT", false),
 	}
 
 	if err := c.Validate(); err != nil {
