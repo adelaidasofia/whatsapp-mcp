@@ -59,6 +59,11 @@ SPARE_BYTES = 500 * 1024 * 1024  # free space to leave after the download
 
 LAUNCHD_LABEL = "co.myceliumai.whatsapp-mcp.bridge"  # scripts/install-bridge-autostart.sh
 SYSTEMD_UNIT = "whatsapp-mcp-bridge.service"
+# Said once transcription is on. The vault export is a separate job (the bridge's
+# --export-to-vault, often run on a schedule); it rewrites a chat's file when a
+# transcript arrives, at its next run.
+VAULT_NOTE = ("Transcripts reach your vault the next time the vault export runs (the bridge's "
+              "--export-to-vault); run it now if you want them sooner.")
 # The line above the settings this command adds. Finding it again means the
 # command has run here before, so a language chosen since is the member's.
 MARKER = "Voice-note transcription (set by enable_transcription.py)"
@@ -344,14 +349,19 @@ class Setup:
                              f"({h.formula}), {h.size}.")
             else:
                 lines.append(f"  NEEDED  {h.program}: {h.what}. You install it yourself: {self.manual(h)}")
-        lines += ["", "Then it will:", f"  - save the settings in {self.env_file}"]
-        if self.language_would_change():
-            lines.append("  - change the language setting from es (every note forced through Spanish) "
-                         "to auto (detected per note); put es back afterwards if you want it, and a "
-                         "later run will leave it")
-        lines += ["  - restart the bridge (WhatsApp reconnects within seconds)",
-                  "  - check that a voice note comes back with words",
-                  "", "Everything runs on this computer. The audio never leaves it."]
+        if self.settings_in_place(look):
+            lines += ["", (f"Your settings in {self.env_file} already say all of this, so none will be "
+                           "changed. It will check that the bridge is running them (restarting it only "
+                           "if it is not) and look at a waiting voice note.")]
+        else:
+            lines += ["", "Then it will:", f"  - save the settings in {self.env_file}"]
+            if self.language_would_change():
+                lines.append("  - change the language setting from es (every note forced through Spanish) "
+                             "to auto (detected per note); put es back afterwards if you want it, and a "
+                             "later run will leave it")
+            lines += ["  - restart the bridge (WhatsApp reconnects within seconds)",
+                      "  - check that a voice note comes back with words"]
+        lines += ["", "Everything runs on this computer. The audio never leaves it."]
         return "\n".join(lines)
 
     @staticmethod
@@ -433,19 +443,42 @@ class Setup:
         if self.run_streaming([brew, "install", *[h.formula for h in missing]], env=env) != 0:
             raise SetupError("Homebrew could not install them. Its message is above. Nothing was switched on.")
 
-    def write_settings(self, model: Path, helpers: dict[str, str]) -> str | None:
-        """Save the bridge's settings. Returns the file as it was (None if there was none)."""
-        original = read_text_exact(self.env_file)
+    def planned_settings(self, model: Path, helpers: dict[str, str]) -> dict[str, str]:
         updates = {"WHATSAPP_WHISPER_BACKEND": "local-cpp", "WHATSAPP_WHISPER_MODEL_PATH": str(model)}
         for h in HELPERS:
             updates[h.setting] = helpers[h.program]
         if not self.in_env_file("WHATSAPP_WHISPER_LANGUAGE") or self.language_would_change():
             updates["WHATSAPP_WHISPER_LANGUAGE"] = "auto"
+        return updates
+
+    def already_set(self, updates: dict[str, str]) -> bool:
+        """True when the .env already says everything in updates. Paths are compared the
+        way the bridge reads them, so ~/models and /home/me/models are the same."""
+        paths = {"WHATSAPP_WHISPER_MODEL_PATH", *(h.setting for h in HELPERS)}
+        for key, want in updates.items():
+            have = self.in_env_file(key)
+            if not have:
+                return False
+            if (self.resolve(have) != Path(want)) if key in paths else (have != want):
+                return False
+        return True
+
+    def settings_in_place(self, look: dict) -> bool:
+        return bool(look["model"] and all(look["helpers"].values())
+                    and self.already_set(self.planned_settings(look["model"], look["helpers"])))
+
+    def write_settings(self, model: Path, helpers: dict[str, str]) -> tuple[bool, str | None]:
+        """Save the bridge's settings. Returns (whether the file changed, the file as it was
+        or None if there was none). When the .env already says it all, it is not touched."""
+        original = read_text_exact(self.env_file)
+        updates = self.planned_settings(model, helpers)
+        if self.already_set(updates):
+            return False, original
         self.env_file.parent.mkdir(parents=True, exist_ok=True)
         write_text_atomic(self.env_file, update_env_text(original or "", updates))
         self.env = read_env(self.env_file)
         self.say(f"Settings saved in {self.env_file}")
-        return original
+        return True, original
 
     def restore_settings(self, original: str | None) -> None:
         if original is None:
@@ -479,6 +512,28 @@ class Setup:
                 return tx
             time.sleep(2)
         return None
+
+    def running_transcription(self, model: Path) -> dict | None:
+        """The bridge's transcription health when it is up and already running these settings."""
+        tx = (self.bridge("GET", "/healthcheck") or {}).get("transcription") or {}
+        language = self.in_env_file("WHATSAPP_WHISPER_LANGUAGE") or "auto"
+        if (tx.get("backend") == "local-cpp" and tx.get("language") == language
+                and tx.get("model_path") and Path(tx["model_path"]) == model):
+            return tx
+        return None
+
+    def report_running(self, tx: dict) -> int:
+        """The bridge is already doing it: say so, and look at one note only if none has come back lately."""
+        waiting = int(tx.get("pending_with_keys") or 0)
+        last = int(tx.get("last_transcript_at") or 0)
+        ago = int(time.time()) - last if last else None
+        self.say("Transcription is already on and the bridge is running these settings, so nothing "
+                 "was changed.")
+        if ago is not None and ago < 3600:
+            self.say(f"A voice note was transcribed {ago // 60} minute(s) ago; {waiting} are still "
+                     "waiting their turn.")
+            return 0
+        return self.check_a_note(tx)
 
     def check_a_note(self, tx: dict, seconds: int = 180) -> int:
         before = int(tx.get("last_transcript_at") or 0)
@@ -534,6 +589,10 @@ class Setup:
 
     # -- the whole thing -----------------------------------------------------
 
+    def finish(self, code: int) -> int:
+        self.say(VAULT_NOTE)
+        return code
+
     def run(self, yes: bool) -> int:
         if not supported():
             self.say("Local transcription is not available on Windows: whisper.cpp has no supported "
@@ -556,7 +615,14 @@ class Setup:
             if not all(helpers.values()):
                 raise SetupError("A helper program is still missing after the install: "
                                  + ", ".join(k for k, v in helpers.items() if not v))
-            original = self.write_settings(model, helpers)
+            changed, original = self.write_settings(model, helpers)
+            if not changed:
+                # Set up by hand, or by an earlier run: change nothing. If the bridge is
+                # already running these settings, do not even restart it.
+                self.say("Your settings already say all of this, so none were changed.")
+                tx = self.running_transcription(model)
+                if tx is not None:
+                    return self.finish(self.report_running(tx))
             if not self.restart_bridge():
                 self.say("The settings are saved. There is no background service to restart, so stop "
                          "the bridge and start it again to finish.")
@@ -564,12 +630,16 @@ class Setup:
             self.say("Bridge restarting ...")
             tx = self.wait_for_bridge()
             if tx is None:
+                if not changed:
+                    raise SetupError("The bridge did not come back with transcription on. Your "
+                                     "settings were already right and were not changed. "
+                                     f"Its log: {self.root / 'bridge.log'}")
                 self.restore_settings(original)
                 self.restart_bridge()
                 raise SetupError("The bridge did not come back with transcription on, so your old "
                                  "settings are back and it was asked to restart once more. "
                                  f"Its log: {self.root / 'bridge.log'}")
-            return self.check_a_note(tx)
+            return self.finish(self.check_a_note(tx))
         except SetupError as e:
             self.say(f"\n{e}")
             return 1
