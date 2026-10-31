@@ -124,3 +124,47 @@ def test_transport_error_returns_runtimeerror_not_raises():
     # an exception rather than raise one, or the original context is lost.
     got = _transport_error(httpx.ConnectError("nope"))
     assert isinstance(got, RuntimeError)
+
+
+def test_refused_send_carries_the_link_to_send_it_by_hand():
+    # Past the daily limit the bridge refuses the send and offers a wa.me link
+    # with the text filled in; the model must see it to hand it to the person.
+    from main import _bridge_error
+
+    request = httpx.Request("POST", "http://127.0.0.1:1/api/sends/d/confirm")
+    response = httpx.Response(
+        429,
+        request=request,
+        json={
+            "error": "daily_send_limit",
+            "details": "Mycelium sends at most 10 messages a day, and 10 went out today.",
+            "sent_today": 10,
+            "daily_limit": 10,
+            "open_in_whatsapp": "https://wa.me/15555550100?text=hola",
+        },
+    )
+    msg = str(_bridge_error(httpx.HTTPStatusError("429", request=request, response=response)))
+    assert "daily_send_limit" in msg
+    assert "at most 10 messages a day" in msg
+    assert "https://wa.me/15555550100?text=hola" in msg
+
+
+def test_the_audit_log_never_keeps_the_send_by_hand_link(tmp_path, monkeypatch):
+    # The link holds the recipient's number and the whole message; the model
+    # needs it, a plaintext log does not.
+    import json
+
+    log_path = tmp_path / "audit.log"
+    monkeypatch.setattr(main, "AUDIT_LOG_ENABLED", True)
+    monkeypatch.setattr(main, "AUDIT_LOG_PATH", str(log_path))
+    main._audit(
+        "confirm_send",
+        {"draft_id": "d"},
+        "failed",
+        3,
+        error="bridge 429: daily_send_limit — at most 10 a day. Give the person this link to send it themselves: https://wa.me/15555550100?text=hola%20secreto",
+    )
+    entry = json.loads(log_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert "15555550100" not in entry["error"]
+    assert "secreto" not in entry["error"]
+    assert "daily_send_limit" in entry["error"]

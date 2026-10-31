@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- **The bridge refuses mass messaging, at the moment a message would leave.** Drafting is never limited; `confirm_send` now refuses, with a reason the model can relay:
+  - a broadcast list, status or channel (`403 broadcast_not_allowed`);
+  - a first message (or a reaction) to someone with no conversation yet, looked up through every JID the person has, from `jid_aliases` and whatsmeow's own LID store. System notices and reactions do not count as a conversation (`403 no_existing_conversation`);
+  - a text of 20 characters or more already sent to a different chat in the last 24 hours, compared without case, spacing or invisible characters (`403 same_text_to_several_chats`);
+  - more than `WHATSAPP_DAILY_SEND_LIMIT` messages in the local calendar day, default 10 (`429 daily_send_limit`). A message to a group counts like any other; reactions and failed sends do not. `0` turns sending off, reactions included.
+  Messages to the account's own chat ("message yourself") are exempt: writing to yourself is not messaging anyone. A refusal for a phone-number chat carries `open_in_whatsapp`, a wa.me link with the text filled in, so the person can send it themselves; the MCP server passes it to the model and keeps it out of the audit log. The rules live in the bridge because its loopback API has no authentication, so a limit anywhere else binds only the callers that go through it. The check runs before any media upload and again under one lock with the flip to `confirmed`, so two confirms racing at the limit cannot both pass. `/api/status` adds `sends_today` and `daily_send_limit`. **This is new for existing installs:** anyone who sends more than 10 messages a day through the bridge, or the same long text to several people in a day, now gets a refusal and the link instead.
+
 ### Added
 
 - **An app can run the bridge for the member (Mycelium Studio, tickets#658).** Three settings make that work without a terminal, all off unless set:

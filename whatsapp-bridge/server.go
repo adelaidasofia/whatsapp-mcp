@@ -374,6 +374,11 @@ type statusResponse struct {
 	// being able to say it had been that way for a day. The duration is what
 	// makes the state actionable. See watchdog.go.
 	DisconnectedSeconds int64 `json:"disconnected_seconds,omitempty"`
+
+	// SendsToday of DailySendLimit, so an app can put the promise on its send
+	// button ("Send · 3 of 10 today"). See send_policy.go.
+	SendsToday     int `json:"sends_today"`
+	DailySendLimit int `json:"daily_send_limit"`
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -400,6 +405,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	if down := s.bridge.DisconnectedFor(); down > 0 {
 		resp.DisconnectedSeconds = int64(down.Seconds())
+	}
+	resp.DailySendLimit = s.cfg.DailySendLimit
+	if n, err := countSendsSince(r.Context(), s.db, localMidnight(time.Now()), s.ownJIDs()); err == nil {
+		resp.SendsToday = n
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
