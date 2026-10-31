@@ -37,6 +37,8 @@ from typing import Any
 import httpx
 from fastmcp import FastMCP
 
+import enable_transcription as voice_setup
+
 # --- Config -----------------------------------------------------------------
 
 BRIDGE_HOST = os.environ.get("WHATSAPP_BRIDGE_HOST", "127.0.0.1")
@@ -543,6 +545,81 @@ async def search_groups(query: str, limit: int = 10) -> dict[str, Any]:
         raise
 
 
+# One read at a time may be on its way to showing the offer. Reads run in
+# parallel, and between "is it still available?" and "recorded as shown" the
+# bridge is asked an await away, so without this every parallel read showed it.
+_offer_in_flight = False
+# Until when the bridge last said transcription is on, so a member who has it on
+# does not cost every read an extra /healthcheck.
+_transcription_on_until = 0.0
+
+
+async def _voice_note_offer(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The once-only offer to turn transcription on, or None.
+
+    Shown where voice notes first appear without words, only while transcription
+    is off, and only once ever: showing it is recorded on disk. It is a nicety,
+    so nothing here may break a read.
+    """
+    global _offer_in_flight, _transcription_on_until
+    try:
+        if (not voice_setup.untranscribed(messages) or _offer_in_flight
+                or time.time() < _transcription_on_until or not voice_setup.hint_available()):
+            return None
+        _offer_in_flight = True  # no await between the checks above and here
+        try:
+            health = await _bridge_get("/healthcheck")
+            if (health.get("transcription") or {}).get("backend") != "off":
+                _transcription_on_until = time.time() + 300
+                return None
+            return voice_setup.take_hint(voice_setup.untranscribed(messages))
+        finally:
+            _offer_in_flight = False
+    except Exception:  # noqa: BLE001
+        return None
+
+
+@mcp.tool()
+async def voice_note_transcription(not_now: bool = False) -> dict[str, Any]:
+    """Turn on voice-note transcription, or record that the member said "not now".
+
+    Voice notes arrive as audio with no words until transcription is on. It runs
+    on this computer (the audio never leaves it) and needs a one-time download of
+    about 1.6 GB.
+
+    Call it with no arguments to see whether transcription is on and, if not, the
+    steps to turn it on. If the member answers "not now" to the offer, call it
+    with not_now=true: it remembers that and returns the one line to tell them.
+    The offer itself is shown once; this tool is how to turn it on any time later.
+    """
+    start = time.time()
+    params = {"not_now": not_now}
+    try:
+        if not_now:
+            result = voice_setup.not_now()
+        else:
+            tx: dict[str, Any] = {}
+            note = None
+            try:
+                tx = (await _bridge_get("/healthcheck")).get("transcription") or {}
+            except Exception:  # noqa: BLE001 - the steps are still worth giving with the bridge down
+                note = "The bridge did not answer, so I could not check whether transcription is already on."
+            if tx.get("backend") not in (None, "off"):
+                result = {"transcription": "on", "backend": tx.get("backend"),
+                          "language": tx.get("language"),
+                          "voice_notes_waiting": tx.get("pending_with_keys", 0)}
+            else:
+                result = voice_setup.how_to_turn_on()
+                if note:
+                    result["note"] = note
+        _audit("voice_note_transcription", params, str(result.get("transcription", "recorded")),
+               int((time.time() - start) * 1000))
+        return result
+    except Exception as e:  # noqa: BLE001
+        _audit("voice_note_transcription", params, "failed", int((time.time() - start) * 1000), error=str(e))
+        raise
+
+
 @mcp.tool()
 async def list_messages(
     chat_jid: str,
@@ -565,13 +642,21 @@ async def list_messages(
     try:
         result = await _bridge_get("/api/messages", params)
 
-        # Scrub incoming text for prompt injection.
+        # Scrub incoming text for prompt injection. A voice-note transcript is
+        # text from outside too: whoever sent the audio chose the words.
         for msg in result.get("messages", []):
             raw = msg.get("content_text")
             scrubbed, flags = scrub(raw)
             msg["content_text"] = scrubbed
+            if msg.get("voice_note_transcript"):
+                msg["voice_note_transcript"], transcript_flags = scrub(msg["voice_note_transcript"])
+                flags = flags + transcript_flags
             if flags:
                 msg["_scrub_flags"] = flags
+
+        offer = await _voice_note_offer(result.get("messages", []))
+        if offer:
+            result["voice_note_transcription"] = offer
 
         # CRM injection.
         if include_crm_context and result.get("chat"):

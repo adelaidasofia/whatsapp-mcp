@@ -34,8 +34,11 @@ type Config struct {
 
 	VaultCRMPath string
 
-	WhisperBackend   string // "local-cpp" or "openai-api"
-	WhisperModel     string
+	WhisperBackend string // "local-cpp" or "openai-api"
+	WhisperModel   string
+	// WhisperLanguage is passed to whisper-cli as --language. "auto" lets the
+	// model detect it per note; a fixed code forces every note through that
+	// language, which is wrong for anyone who sends or receives more than one.
 	WhisperLanguage  string
 	WhisperBinPath   string
 	WhisperModelPath string
@@ -68,6 +71,12 @@ type Config struct {
 	CaptureCalls      bool
 	CaptureReactions  bool
 	AutoDownloadMedia bool
+
+	// KeepVoiceAudio saves each incoming voice note's audio under MediaPath, so
+	// turning transcription on later still covers notes older than the ~14 days
+	// WhatsApp keeps them. Chats the transcription filters exclude are never
+	// kept. See voice_audio.go.
+	KeepVoiceAudio bool
 
 	// Voice-note transcript backfill sweeper. Periodically re-enqueues any
 	// voice/audio rows with media keys but NULL transcripts, so transient
@@ -126,8 +135,8 @@ func LoadConfig() (*Config, error) {
 		// — Config.Validate refused to boot without it, stranding every new
 		// install. Transcription stays fail-loud once explicitly enabled.
 		WhisperBackend:          getenv("WHATSAPP_WHISPER_BACKEND", "off"),
-		WhisperModel:            getenv("WHATSAPP_WHISPER_MODEL", "large-v3"),
-		WhisperLanguage:         getenv("WHATSAPP_WHISPER_LANGUAGE", "es"),
+		WhisperModel:            getenv("WHATSAPP_WHISPER_MODEL", "large-v3-turbo"),
+		WhisperLanguage:         getenv("WHATSAPP_WHISPER_LANGUAGE", "auto"),
 		WhisperBinPath:          getenv("WHATSAPP_WHISPER_BIN_PATH", ""),
 		WhisperModelPath:        expandPath(getenv("WHATSAPP_WHISPER_MODEL_PATH", ""), home),
 		WhisperAPIKey:           getenv("WHATSAPP_WHISPER_API_KEY", ""),
@@ -143,6 +152,7 @@ func LoadConfig() (*Config, error) {
 		CaptureCalls:            getenvBool("WHATSAPP_CAPTURE_CALLS", true),
 		CaptureReactions:        getenvBool("WHATSAPP_CAPTURE_REACTIONS", true),
 		AutoDownloadMedia:       getenvBool("WHATSAPP_AUTO_DOWNLOAD_MEDIA", false),
+		KeepVoiceAudio:          getenvBool("WHATSAPP_KEEP_VOICE_AUDIO", true),
 		BackfillIntervalSeconds: getenvInt("WHATSAPP_BACKFILL_INTERVAL_SECONDS", 900),
 		BackfillWindowDays:      getenvInt("WHATSAPP_BACKFILL_WINDOW_DAYS", 14),
 		DeviceName:              getenv("WHATSAPP_DEVICE_NAME", ""),

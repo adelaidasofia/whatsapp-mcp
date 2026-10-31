@@ -54,13 +54,15 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-# main.py ships as a single top-level module. uvx consumers reach it via
-# the entry point above, not via direct import, so the top-level-name
+# main.py ships as a top-level module, with enable_transcription.py beside it
+# (the voice-note setup command and its once-only hint; stdlib only, so it also
+# runs on its own as `python3 enable_transcription.py`). uvx consumers reach
+# main via the entry point above, not via direct import, so the top-level-name
 # collision risk is bounded to people who explicitly `import main` from
 # their own code (vanishingly rare; if it becomes an issue, the rename to
 # a proper package directory lands cleanly with a tool.setuptools.packages
 # swap).
-py-modules = ["main"]
+py-modules = ["main", "enable_transcription"]
 
 [dependency-groups]
 dev = [

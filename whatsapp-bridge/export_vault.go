@@ -39,6 +39,7 @@ import (
 //	first_message: YYYY-MM-DD
 //	last_message: YYYY-MM-DD
 //	last_message_ts: <unix>
+//	last_transcript_ts: <unix>   (only when a voice note has a transcript: the newest one)
 //	last_sync: YYYY-MM-DD (date of export)
 //	participants_count: <N>      (groups only; stored count or distinct-sender floor)
 //
@@ -342,6 +343,7 @@ type exportUnit struct {
 	phone             string // real phone digits, or "" when none is known (never a LID)
 	participantsCount int    // stored chats.participants_count (groups)
 	lastMessageTs     int64  // max across members
+	transcriptTs      int64  // newest voice-note transcript across members; 0 when none
 	msgCount          int    // total message rows across members
 	filename          string // final basename, ".md" included
 	forceRewrite      bool   // set when the file was healed/renamed and must be regenerated
@@ -393,6 +395,25 @@ func buildExportUnits(db *sql.DB, includeGroups bool, minMessages int, entries [
 		counts[jid] = n
 	}
 	countRows.Close()
+
+	// When each chat's newest voice-note transcript was saved. It comes from the
+	// voice/audio rows alone (idx_messages_type), so it is a small read, and it is
+	// how a transcript that lands AFTER the chat's last message gets noticed:
+	// last_message_time does not move for it. See exportOneUnit.
+	transcripts := map[string]int64{}
+	trRows, err := db.Query(`SELECT chat_jid, MAX(voice_note_transcript_at) FROM messages WHERE type IN ('voice', 'audio') AND voice_note_transcript IS NOT NULL GROUP BY chat_jid`)
+	if err != nil {
+		return nil, 0, fmt.Errorf("query transcript times: %w", err)
+	}
+	for trRows.Next() {
+		var jid string
+		var ts sql.NullInt64
+		if err := trRows.Scan(&jid, &ts); err != nil || !ts.Valid {
+			continue
+		}
+		transcripts[jid] = ts.Int64
+	}
+	trRows.Close()
 
 	// Union-find over alias edges. An edge only merges DIRECT chats: any edge
 	// touching a group/broadcast chat row is corrupt data and is ignored.
@@ -468,6 +489,7 @@ func buildExportUnits(db *sql.DB, includeGroups bool, minMessages int, entries [
 				chatType:          c.chatType,
 				participantsCount: c.participantsCount,
 				lastMessageTs:     c.lastMessageTs,
+				transcriptTs:      transcripts[c.jid],
 				msgCount:          counts[c.jid],
 			})
 			continue
@@ -482,6 +504,9 @@ func buildExportUnits(db *sql.DB, includeGroups bool, minMessages int, entries [
 			u.msgCount += counts[jid]
 			if c.lastMessageTs > u.lastMessageTs {
 				u.lastMessageTs = c.lastMessageTs
+			}
+			if transcripts[jid] > u.transcriptTs {
+				u.transcriptTs = transcripts[jid]
 			}
 			if u.primary == "" || c.lastMessageTs > chats[u.primary].lastMessageTs ||
 				(c.lastMessageTs == chats[u.primary].lastMessageTs && jid < u.primary) {
@@ -893,6 +918,7 @@ type chatFileIdentity struct {
 	aliasJIDs    []string
 	chatType     string
 	lastTs       int64
+	transcriptTs int64 // newest voice-note transcript the file holds; 0 for a file from before this field
 	messageCount int
 }
 
@@ -936,6 +962,8 @@ func readChatFileIdentity(path string) chatFileIdentity {
 			id.chatType = strings.Trim(val, `"'`)
 		case "last_message_ts":
 			fmt.Sscanf(val, "%d", &id.lastTs)
+		case "last_transcript_ts":
+			fmt.Sscanf(val, "%d", &id.transcriptTs)
 		case "message_count":
 			fmt.Sscanf(val, "%d", &id.messageCount)
 		case "alias_jids":
@@ -1015,7 +1043,15 @@ func exportOneUnit(db *sql.DB, outputDir string, u exportUnit, todayStr string) 
 	// must trigger a merge rewrite), and nothing newer in the DB. Mirrors
 	// iMessage's _is_unchanged behavior; saves significant I/O on
 	// iCloud-synced vaults.
-	if !u.forceRewrite && id.exists && fileIsOurs && id.jid != "" && u.lastMessageTs > 0 && id.lastTs >= u.lastMessageTs {
+	//
+	// A transcript that lands after the chat's last message (a backfilled voice
+	// note, or one transcribed minutes after it arrived) does not move
+	// last_message_ts, so it also has to be newer than the file's own
+	// last_transcript_ts. A file written before that field existed reads 0, so
+	// every chat that has transcripts is rewritten once: which also replaces
+	// transcripts an earlier export wrote before they were scrubbed.
+	transcriptTs := u.transcriptTs
+	if !u.forceRewrite && id.exists && fileIsOurs && id.jid != "" && u.lastMessageTs > 0 && id.lastTs >= u.lastMessageTs && id.transcriptTs >= transcriptTs {
 		fileClosure := append([]string{id.jid}, id.aliasJIDs...)
 		sort.Strings(fileClosure)
 		if strings.Join(fileClosure, "\n") == strings.Join(unitClosure, "\n") {
@@ -1119,6 +1155,11 @@ func exportOneUnit(db *sql.DB, outputDir string, u exportUnit, todayStr string) 
 		fmt.Sprintf("first_message: %s", dates[0]),
 		fmt.Sprintf("last_message: %s", dates[len(dates)-1]),
 		fmt.Sprintf("last_message_ts: %d", u.lastMessageTs),
+	)
+	if transcriptTs > 0 {
+		lines = append(lines, fmt.Sprintf("last_transcript_ts: %d", transcriptTs))
+	}
+	lines = append(lines,
 		fmt.Sprintf("last_sync: %s", todayStr),
 	)
 	// Only emit participants_count for groups; direct chats stay clean.
@@ -1180,6 +1221,10 @@ func renderMessageText(msgType, text, transcript string) string {
 			label = "[Audio]"
 		}
 		if transcript != "" {
+			// A transcript is words from outside, like message text: whoever sent
+			// the audio chose them, and a vault file is something Claude reads
+			// later. The stored transcript stays as spoken; only the file is scrubbed.
+			transcript, _ = Scrub(transcript)
 			return fmt.Sprintf("%s %s", label, transcript)
 		}
 		return label
@@ -1291,6 +1336,7 @@ var canonicalFrontmatterKeys = map[string]bool{
 	"first_message":      true,
 	"last_message":       true,
 	"last_message_ts":    true,
+	"last_transcript_ts": true,
 	"last_sync":          true,
 	"participants_count": true,
 }

@@ -20,7 +20,8 @@ import (
 //
 //  1. Download the audio blob from WhatsApp (via whatsmeow.Client.Download).
 //  2. Convert the .ogg (Opus) container to 16 kHz mono WAV with ffmpeg.
-//  3. Run whisper-cli (local-cpp) with the configured Spanish-tuned model,
+//  3. Run whisper-cli (local-cpp) with the configured model and language
+//     ("auto" by default: the model detects it per note),
 //     OR call the OpenAI Whisper API when backend == "openai-api".
 //  4. Write the transcript into messages.voice_note_transcript along with
 //     the backend name + timestamp.
@@ -36,6 +37,71 @@ type Transcriber struct {
 	jobs    chan transcriptionJob
 	workers int
 	wg      sync.WaitGroup
+
+	// Which notes are queued or running, and how often each has failed. Without
+	// this the live path, the 15-minute sweep and a manual
+	// /api/admin/backfill-transcripts could queue the same note twice, and a
+	// note that never succeeds (silence, a file ffmpeg rejects) was retried by
+	// every sweep. That used to stop when the note left the 14-day window; a
+	// note whose audio is saved here never leaves it. Only a failure that is the
+	// note's own counts (see outcomeFailed): a laptop offline for an hour, or a
+	// helper program briefly missing, must not use up a note's tries. In memory
+	// only: a restart gives every note a fresh set of tries.
+	mu       sync.Mutex
+	inflight map[string]bool
+	failures map[string]int
+}
+
+// maxTranscribeAttempts is how many times a note is tried before sweeps leave
+// it alone until the bridge restarts.
+const maxTranscribeAttempts = 3
+
+// jobOutcome is what a finished job tells the transcriber about its note.
+type jobOutcome int
+
+const (
+	// outcomeUnknown: nothing learned about the note itself. The job was dropped
+	// from a full queue, or stopped before it had the audio (the transcriber was
+	// not ready, there was no network, WhatsApp was not connected). The note's
+	// count of failures is left as it was.
+	outcomeUnknown jobOutcome = iota
+	// outcomeDone: the transcript was saved. The note's failures are forgotten.
+	outcomeDone
+	// outcomeFailed: the audio was in hand and still did not become words
+	// (silence, a file ffmpeg rejects, a whisper error). That is the note's own
+	// problem, and the same input will fail the same way, so it counts.
+	outcomeFailed
+)
+
+// claim reserves a note for transcription. False means it is already queued or
+// running, or has failed too often to keep trying.
+func (t *Transcriber) claim(id string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.inflight[id] || t.failures[id] >= maxTranscribeAttempts {
+		return false
+	}
+	if t.inflight == nil {
+		t.inflight = map[string]bool{}
+	}
+	t.inflight[id] = true
+	return true
+}
+
+// release gives a note back after a job ended.
+func (t *Transcriber) release(id string, outcome jobOutcome) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.inflight, id)
+	switch outcome {
+	case outcomeDone:
+		delete(t.failures, id)
+	case outcomeFailed:
+		if t.failures == nil {
+			t.failures = map[string]int{}
+		}
+		t.failures[id]++
+	}
 }
 
 type transcriptionJob struct {
@@ -68,26 +134,34 @@ func (t *Transcriber) Close() {
 	t.wg.Wait()
 }
 
-// Enqueue schedules a transcription. Non-blocking; drops the job if the queue
-// is full and logs a warning so the caller knows.
-func (t *Transcriber) Enqueue(j transcriptionJob) {
+// Enqueue schedules a transcription and reports whether it did. Non-blocking;
+// drops the job if the queue is full and logs a warning so the caller knows. A
+// note that is already queued or running, or has failed too often, is not
+// queued again.
+func (t *Transcriber) Enqueue(j transcriptionJob) bool {
 	if t.cfg.WhisperBackend == "off" {
 		// Transcription disabled. Media keys are still persisted at receive
 		// time (Lesson 21), so enabling a backend later + the backfill sweep
 		// recovers recent voice notes.
-		return
+		return false
 	}
 	if t.chatExcluded(j.ChatJID) {
 		// Privacy filter: personal chats listed in WHATSAPP_WHISPER_EXCLUDE_CHATS
 		// are never transcribed. Single chokepoint — covers both the live
 		// receive path and the backfill sweep.
 		log.Printf("transcriber: chat %s excluded by WHATSAPP_WHISPER_EXCLUDE_CHATS; skipping %s", j.ChatJID, j.MessageID)
-		return
+		return false
+	}
+	if !t.claim(j.MessageID) {
+		return false
 	}
 	select {
 	case t.jobs <- j:
+		return true
 	default:
+		t.release(j.MessageID, outcomeUnknown) // dropped, not failed: the next sweep can queue it again
 		log.Printf("transcriber queue full; dropping job for message %s (increase queue or reduce traffic)", j.MessageID)
+		return false
 	}
 }
 
@@ -148,6 +222,11 @@ func (t *Transcriber) process(ctx context.Context, workerID int, j transcription
 	start := time.Now()
 	log.Printf("transcriber[%d]: starting job for message %s", workerID, j.MessageID)
 
+	// Until the audio is in hand, whatever stops the job says nothing about the
+	// note. From then on a failure is the note's own.
+	outcome := outcomeUnknown
+	defer func() { t.release(j.MessageID, outcome) }()
+
 	// Validate prerequisites early.
 	switch t.cfg.WhisperBackend {
 	case "local-cpp":
@@ -191,6 +270,7 @@ func (t *Transcriber) process(ctx context.Context, workerID int, j transcription
 		log.Printf("transcriber[%d]: write ogg: %v", workerID, err)
 		return
 	}
+	outcome = outcomeFailed // the audio is on disk and ready: from here a failure is the note's own
 
 	wavPath, err := t.convertToWav(ctx, oggPath, workDir)
 	if err != nil {
@@ -218,17 +298,21 @@ func (t *Transcriber) process(ctx context.Context, workerID int, j transcription
 
 	// Persist.
 	now := time.Now().Unix()
+	// Only while the column is still NULL: a note that two paths both got as far
+	// as transcribing keeps the first transcript.
 	_, err = t.db.ExecContext(ctx, `
 		UPDATE messages
 		SET voice_note_transcript = ?,
 		    voice_note_transcript_backend = ?,
 		    voice_note_transcript_at = ?
-		WHERE id = ?
+		WHERE id = ? AND voice_note_transcript IS NULL
 	`, transcript, t.cfg.WhisperBackend, now, j.MessageID)
 	if err != nil {
+		outcome = outcomeUnknown // a busy database says nothing about the note
 		log.Printf("transcriber[%d]: db update failed for %s: %v", workerID, j.MessageID, err)
 		return
 	}
+	outcome = outcomeDone
 
 	dur := time.Since(start).Round(time.Millisecond)
 	log.Printf("transcriber[%d]: done %s in %s (%d chars)", workerID, j.MessageID, dur, len(transcript))

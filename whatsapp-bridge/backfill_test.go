@@ -31,6 +31,7 @@ func TestSweepOnceNoDeadlockWithExcludeFilter(t *testing.T) {
 			type TEXT NOT NULL,
 			timestamp INTEGER NOT NULL,
 			voice_note_transcript TEXT,
+			media_path TEXT,
 			media_key BLOB,
 			media_direct_path TEXT,
 			media_url TEXT,
