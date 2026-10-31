@@ -168,3 +168,25 @@ def test_the_audit_log_never_keeps_the_send_by_hand_link(tmp_path, monkeypatch):
     assert "15555550100" not in entry["error"]
     assert "secreto" not in entry["error"]
     assert "daily_send_limit" in entry["error"]
+
+
+@pytest.mark.asyncio
+async def test_the_api_token_rides_on_every_request(monkeypatch):
+    # A bridge an app runs refuses requests without its token; the server must
+    # send it on all of them, the preflight included.
+    seen = []
+
+    def handler(request):
+        seen.append(request.headers.get("authorization"))
+        return httpx.Response(200, json={"status": "ok"})
+
+    monkeypatch.setattr(main, "BRIDGE_TOKEN", "t0ken")
+    real_client = httpx.AsyncClient
+
+    def client_with_transport(**kwargs):
+        return real_client(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(main.httpx, "AsyncClient", client_with_transport)
+    async with main.lifespan(None):
+        await main._bridge_get("/api/status")
+    assert seen and all(value == "Bearer t0ken" for value in seen)

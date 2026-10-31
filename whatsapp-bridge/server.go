@@ -31,7 +31,7 @@ func NewServer(cfg *Config, db *sql.DB, bridge *Bridge, backfiller *TranscriptBa
 	s := &Server{cfg: cfg, db: db, bridge: bridge, backfiller: backfiller, mux: http.NewServeMux()}
 	s.registerRoutes()
 	s.server = &http.Server{
-		Handler:           newOriginGuard(s.mux, cfg.AllowedOrigins),
+		Handler:           newOriginGuard(newTokenGuard(s.mux, cfg.APIToken), cfg.AllowedOrigins),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      60 * time.Second,
@@ -55,6 +55,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/chats", s.handleListChats)
 	s.mux.HandleFunc("GET /api/messages", s.handleListMessages)
 	s.mux.HandleFunc("GET /api/contacts/search", s.handleSearchContacts)
+	s.mux.HandleFunc("GET /api/aliases", s.handleAliases)
 	s.mux.HandleFunc("GET /api/groups", s.handleListGroups)
 
 	s.mux.HandleFunc("POST /api/sends", s.handleCreateDraft)
@@ -506,6 +507,9 @@ type chatRow struct {
 	LastMessageTime    int64  `json:"last_message_time"`
 	LastMessagePreview string `json:"last_message_preview"`
 	UnreadCount        int    `json:"unread_count"`
+	// Aliases are the chat's other JIDs (see jid_family.go), so a client
+	// can tell that a phone-JID row and a LID row are the same person.
+	Aliases []string `json:"aliases,omitempty"`
 }
 
 type chatListResponse struct {
@@ -546,6 +550,12 @@ func (s *Server) handleListChats(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		out.Chats = append(out.Chats, c)
+	}
+	rows.Close()
+	for i := range out.Chats {
+		if family := s.jidFamily(r.Context(), out.Chats[i].JID); len(family) > 1 {
+			out.Chats[i].Aliases = family[1:]
+		}
 	}
 	out.Count = len(out.Chats)
 	out.BridgeState = s.currentBridgeState()
