@@ -143,10 +143,17 @@ func (s *Server) Serve(ln net.Listener) error {
 }
 
 // writePortFile drops the bound port next to the database so a supervisor
-// can discover it without parsing stdout. Best-effort; never fatal.
+// can discover it without parsing stdout. Best-effort; never fatal. Written
+// to a temp name and renamed, so a reader (the MCP server reads it on every
+// request) never sees a half-written file.
 func (s *Server) writePortFile(port int) {
 	path := filepath.Join(filepath.Dir(s.cfg.DBPath), "bridge.port")
-	if err := os.WriteFile(path, []byte(strconv.Itoa(port)), 0o600); err != nil {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(strconv.Itoa(port)), 0o600); err != nil {
+		log.Printf("port file write failed (non-fatal): %v", err)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
 		log.Printf("port file write failed (non-fatal): %v", err)
 	}
 }
@@ -401,7 +408,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		resp.DisconnectedSeconds = int64(down.Seconds())
 	}
 	resp.DailySendLimit = s.cfg.DailySendLimit
-	if n, err := countSendsSince(r.Context(), s.db, localMidnight(time.Now())); err == nil {
+	if n, err := countSendsSince(r.Context(), s.db, localMidnight(time.Now()), s.ownJIDs()); err == nil {
 		resp.SendsToday = n
 	}
 	writeJSON(w, http.StatusOK, resp)

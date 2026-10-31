@@ -95,13 +95,17 @@ def test_port_file_is_read_on_every_call(tmp_path, monkeypatch):
     assert _bridge_base().endswith(":54322")
 
 
-def test_unreadable_port_file_falls_back_to_the_configured_port(tmp_path, monkeypatch):
+def test_a_missing_port_file_never_falls_back_to_another_bridge(tmp_path, monkeypatch):
+    # Before the app's bridge writes its port, the default port may belong to
+    # a different bridge on the same machine, with another account's chats.
     monkeypatch.setattr(main, "BRIDGE_PORT_FILE", str(tmp_path / "missing.port"))
-    assert _bridge_port() == main.BRIDGE_PORT
+    assert _bridge_port() is None
+    with pytest.raises(RuntimeError, match="not written yet"):
+        main._bridge_url("/api/chats")
     garbage = tmp_path / "garbage.port"
     garbage.write_text("not a port", encoding="utf-8")
     monkeypatch.setattr(main, "BRIDGE_PORT_FILE", str(garbage))
-    assert _bridge_port() == main.BRIDGE_PORT
+    assert _bridge_port() is None
 
 
 def test_supervised_bridge_points_at_the_app_not_a_terminal(monkeypatch):
@@ -143,3 +147,24 @@ def test_refused_send_carries_the_link_to_send_it_by_hand():
     assert "daily_send_limit" in msg
     assert "at most 10 messages a day" in msg
     assert "https://wa.me/15555550100?text=hola" in msg
+
+
+def test_the_audit_log_never_keeps_the_send_by_hand_link(tmp_path, monkeypatch):
+    # The link holds the recipient's number and the whole message; the model
+    # needs it, a plaintext log does not.
+    import json
+
+    log_path = tmp_path / "audit.log"
+    monkeypatch.setattr(main, "AUDIT_LOG_ENABLED", True)
+    monkeypatch.setattr(main, "AUDIT_LOG_PATH", str(log_path))
+    main._audit(
+        "confirm_send",
+        {"draft_id": "d"},
+        "failed",
+        3,
+        error="bridge 429: daily_send_limit — at most 10 a day. Give the person this link to send it themselves: https://wa.me/15555550100?text=hola%20secreto",
+    )
+    entry = json.loads(log_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert "15555550100" not in entry["error"]
+    assert "secreto" not in entry["error"]
+    assert "daily_send_limit" in entry["error"]

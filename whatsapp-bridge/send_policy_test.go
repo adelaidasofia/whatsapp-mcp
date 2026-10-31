@@ -136,8 +136,51 @@ func TestSendPolicyCapsMessagesPerDayAndGroupsCount(t *testing.T) {
 func TestSendPolicyLimitZeroTurnsSendingOff(t *testing.T) {
 	db := newSendsTestDB(t)
 	insertPolicyMessage(t, db, "m1", policyPhone, "text")
-	if got := policyCheck(t, db, 0, noon(), pendingSend{RecipientJID: policyPhone, SendType: "text", Text: "hola"}); got == nil || got.Error != "daily_send_limit" {
-		t.Fatalf("limit 0: got %+v, want daily_send_limit", got)
+	for _, kind := range []string{"text", "reaction"} {
+		if got := policyCheck(t, db, 0, noon(), pendingSend{RecipientJID: policyPhone, SendType: kind, Text: "hola"}); got == nil || got.Error != "daily_send_limit" {
+			t.Fatalf("limit 0, %s: got %+v, want daily_send_limit", kind, got)
+		}
+	}
+}
+
+// A reaction to a stranger must not open the door to a first message: the
+// stored reaction row is not a conversation, and the reaction itself needs one.
+func TestSendPolicyAReactionCannotOpenAConversation(t *testing.T) {
+	db := newSendsTestDB(t)
+	if got := policyCheck(t, db, 10, noon(), pendingSend{RecipientJID: policyPhone, SendType: "reaction", Text: "👍"}); got == nil || got.Error != "no_existing_conversation" {
+		t.Fatalf("a reaction into no conversation: got %+v, want no_existing_conversation", got)
+	}
+	insertPolicyMessage(t, db, "my-reaction", policyPhone, "reaction")
+	if got := policyCheck(t, db, 10, noon(), pendingSend{RecipientJID: policyPhone, SendType: "text", Text: "hola"}); got == nil || got.Error != "no_existing_conversation" {
+		t.Fatalf("a stored reaction counted as a conversation: got %+v", got)
+	}
+}
+
+// Writing to yourself ("message yourself", owner notifications) is not
+// messaging anyone: no conversation needed, and it never uses up the day.
+func TestSendPolicyMessagesToYourselfAreExempt(t *testing.T) {
+	db := newSendsTestDB(t)
+	own := []string{"15555550142@s.whatsapp.net", "88888888888888@lid"}
+	insertPolicyMessage(t, db, "m1", policyPhone, "text")
+	now := noon()
+	for i := range 12 {
+		insertPolicySend(t, db, fmt.Sprintf("self%d", i), own[0], "text", fmt.Sprintf("nota %d", i), "sent", now)
+	}
+	if got := policyCheck(t, db, 10, now, pendingSend{RecipientJID: own[1], SendType: "text", Text: "otra nota", Own: own}); got != nil {
+		t.Fatalf("a note to yourself was refused: %+v", got)
+	}
+	if got := policyCheck(t, db, 10, now, pendingSend{RecipientJID: policyPhone, SendType: "text", Text: "hola", Own: own}); got != nil {
+		t.Fatalf("twelve notes to yourself used up the day: %+v", got)
+	}
+}
+
+// whatsmeow's own LID store can know a person's other JID before
+// jid_aliases does (that table is backfilled at startup).
+func TestSendPolicyUsesTheLIDStoreAlias(t *testing.T) {
+	db := newSendsTestDB(t)
+	insertPolicyMessage(t, db, "m1", policyLID, "text")
+	if got := policyCheck(t, db, 10, noon(), pendingSend{RecipientJID: policyPhone, SendType: "text", Text: "hola", Alts: []string{policyLID}}); got != nil {
+		t.Fatalf("a chat known only through the LID store was refused: %+v", got)
 	}
 }
 
@@ -146,12 +189,19 @@ func TestSendPolicyNeverSendsTheSameTextToSeveralChats(t *testing.T) {
 	insertPolicyMessage(t, db, "m1", policyPhone, "text")
 	insertPolicyMessage(t, db, "m2", policyOther, "text")
 	now := noon()
-	insertPolicySend(t, db, "s1", policyPhone, "text", "Te comparto la propuesta para la reunión de mañana", "sent", now.Add(-48*time.Hour))
+	insertPolicySend(t, db, "s1", policyPhone, "text", "Te comparto la propuesta para la reunión de mañana", "sent", now.Add(-2*time.Hour))
 
 	// Same words, different case and spacing, to a different chat.
 	got := policyCheck(t, db, 10, now, pendingSend{RecipientJID: policyOther, SendType: "text", Text: "te comparto  la propuesta para la reunión de MAÑANA"})
 	if got == nil || got.Error != "same_text_to_several_chats" {
 		t.Fatalf("same text to a second chat: got %+v, want same_text_to_several_chats", got)
+	}
+	if !strings.HasPrefix(got.OpenInWhatsApp, "https://wa.me/15555550199?text=") {
+		t.Errorf("open_in_whatsapp = %q, want the link to send it by hand", got.OpenInWhatsApp)
+	}
+	// An invisible character does not make it a different message.
+	if got := policyCheck(t, db, 10, now, pendingSend{RecipientJID: policyOther, SendType: "text", Text: "Te comparto la propuesta para la reunión de mañana​"}); got == nil {
+		t.Error("a trailing zero-width space got the same text through")
 	}
 	// The same chat again is not "several chats".
 	if got := policyCheck(t, db, 10, now, pendingSend{RecipientJID: policyPhone, SendType: "text", Text: "Te comparto la propuesta para la reunión de mañana"}); got != nil {
@@ -162,12 +212,12 @@ func TestSendPolicyNeverSendsTheSameTextToSeveralChats(t *testing.T) {
 	if got := policyCheck(t, db, 10, now, pendingSend{RecipientJID: policyOther, SendType: "text", Text: "muchas gracias"}); got != nil {
 		t.Errorf("a short courtesy text was refused: %+v", got)
 	}
-	// Outside the window it is history, not a broadcast.
+	// A day later it is not a burst any more.
 	db2 := newSendsTestDB(t)
 	insertPolicyMessage(t, db2, "m2", policyOther, "text")
-	insertPolicySend(t, db2, "old", policyPhone, "text", "Te comparto la propuesta para la reunión de mañana", "sent", now.Add(-31*24*time.Hour))
+	insertPolicySend(t, db2, "old", policyPhone, "text", "Te comparto la propuesta para la reunión de mañana", "sent", now.Add(-25*time.Hour))
 	if got := policyCheck(t, db2, 10, now, pendingSend{RecipientJID: policyOther, SendType: "text", Text: "Te comparto la propuesta para la reunión de mañana"}); got != nil {
-		t.Errorf("a text sent 31 days ago blocked a new send: %+v", got)
+		t.Errorf("a text sent 25 hours ago blocked a new send: %+v", got)
 	}
 }
 
