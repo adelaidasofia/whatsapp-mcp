@@ -58,7 +58,8 @@ class FakeSetup(et.Setup):
         return (self.model, "found") if self.model else super().find_model()
 
     def find_helper(self, h):
-        return None if h.program in self.missing else f"/opt/bin/{h.program}"
+        # An absolute path on every OS (a rooted "/opt/bin/x" is not one on Windows).
+        return None if h.program in self.missing else str(self.root / "bin" / h.program)
 
     def download_model(self):
         self.calls.append("download_model")
@@ -129,7 +130,7 @@ def test_steps_run_in_order_and_the_model_is_on_disk_before_the_bridge_is_switch
     assert settings["WHATSAPP_WHISPER_BACKEND"] == "local-cpp"
     assert Path(settings["WHATSAPP_WHISPER_MODEL_PATH"]).is_file()
     assert settings["WHATSAPP_WHISPER_LANGUAGE"] == "auto"
-    assert settings["WHATSAPP_FFMPEG_BIN_PATH"] == "/opt/bin/ffmpeg"
+    assert settings["WHATSAPP_FFMPEG_BIN_PATH"] == str(s.root / "bin" / "ffmpeg")
 
 
 def test_a_model_already_on_disk_is_not_downloaded_again(world):
@@ -472,8 +473,8 @@ def configured(world, **kw):
     s.env_file.write_text(
         "WHATSAPP_WHISPER_BACKEND=local-cpp\n"
         f"WHATSAPP_WHISPER_MODEL_PATH={model}\n"
-        "WHATSAPP_WHISPER_BIN_PATH=/opt/bin/whisper-cli\n"
-        "WHATSAPP_FFMPEG_BIN_PATH=/opt/bin/ffmpeg\n"
+        f"WHATSAPP_WHISPER_BIN_PATH={s.root / 'bin' / 'whisper-cli'}\n"
+        f"WHATSAPP_FFMPEG_BIN_PATH={s.root / 'bin' / 'ffmpeg'}\n"
         "WHATSAPP_WHISPER_LANGUAGE=auto\n", encoding="utf-8")
     s.env = et.read_env(s.env_file)
     return s
