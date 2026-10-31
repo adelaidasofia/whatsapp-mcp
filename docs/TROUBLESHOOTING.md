@@ -66,16 +66,17 @@ If history still looks split, run `/healthcheck` and inspect the `alias_coverage
 **Symptom.** A voice note arrives, `list_messages` shows the message but the `voice_note_transcript` field is empty.
 
 **Cause.** One of:
-0. Transcription is simply off — `WHATSAPP_WHISPER_BACKEND` defaults to `off` so fresh installs boot with zero downloads. Set it to `local-cpp` (plus a model) or `openai-api` (plus a key) to enable. Media keys are persisted either way, so recent voice notes backfill automatically once you enable a backend.
-1. `whisper.cpp` model missing (`models/ggml-large-v3.bin` not downloaded).
-2. FFmpeg not in `PATH` (whisper needs it to decode WhatsApp's `.ogg` Opus encoding).
+0. Transcription is simply off — `WHATSAPP_WHISPER_BACKEND` defaults to `off` so fresh installs boot with zero downloads. Media keys are persisted either way, and while it is off so is each voice note's audio (`WHATSAPP_KEEP_VOICE_AUDIO`), so voice notes backfill automatically once you turn it on, including ones older than WhatsApp's ~14 days.
+1. (If the `whisper.cpp` model file is missing, the bridge does not start at all, and every tool errors; its log says so. That is not a missing-transcript symptom.)
+2. `ffmpeg` or `whisper-cli` not found (whisper needs ffmpeg to decode WhatsApp's `.ogg` Opus encoding). The bridge still starts; each note fails with a line in the log.
 3. The bridge ran out of disk space and aborted the transcription.
 4. `WHATSAPP_WHISPER_BACKEND=openai-api` set but `WHATSAPP_WHISPER_API_KEY` missing.
 
 **Fix.**
+- Run `python3 whatsapp-mcp-server/enable_transcription.py` (from the repo). It lists what is missing without changing anything; add `--yes` to fix it: it reuses or downloads the model, installs the helper programs, writes the settings, restarts the bridge and checks a note. It is safe to run again.
 - `bash scripts/check_prerequisites.sh` runs all the checks (Go, Python, FFmpeg, SQLCipher, uv, whisper.cpp). Windows: `powershell -ExecutionPolicy ByPass -File scripts\check_prerequisites.ps1`. It will tell you exactly which one is missing.
-- For the Whisper model: download manually from the [whisper.cpp model repo](https://huggingface.co/ggerganov/whisper.cpp/tree/main) into `models/`. Default expected file is `models/ggml-large-v3.bin`.
-- For FFmpeg on macOS: `brew install ffmpeg`. On Linux: `sudo apt-get install ffmpeg`.
+- By hand: download `ggml-large-v3-turbo.bin` from the [whisper.cpp model repo](https://huggingface.co/ggerganov/whisper.cpp/tree/main) and point `WHATSAPP_WHISPER_MODEL_PATH` at it. FFmpeg on macOS: `brew install ffmpeg`. On Linux: `sudo apt-get install ffmpeg`.
+- Notes that were already transcribed in the wrong language (before `WHATSAPP_WHISPER_LANGUAGE` defaulted to `auto`) keep their old text; the setting applies to notes transcribed from now on.
 
 ## Voice notes silently fail under launchd / systemd / supervisord / cron / Docker
 

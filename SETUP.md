@@ -131,28 +131,58 @@ WHATSAPP_VAULT_CRM_PATH=/path/to/your/vault/CRM/
 
 This enables vault CRM auto-injection: when Claude reads a chat, the MCP pulls the matching CRM note frontmatter into the response so Claude knows who the person is. Leave empty to disable.
 
-## 4. Voice-note transcription (optional — off by default)
+## 4. Voice-note transcription (optional, off by default)
 
-Transcription ships disabled so a fresh install boots with zero downloads. To enable the private local backend:
+Voice notes arrive as audio. Transcription turns them into words on your own computer; the audio never leaves it. It ships off so a fresh install boots with zero downloads. Claude offers to turn it on once, the first time it reads a chat with voice notes that have no words, and if you say "not now" it does not ask again. You can also turn it on yourself, any time, with one command:
+
+```bash
+# macOS / Linux. Look first: it lists what it would download or install and changes nothing.
+python3 "$HOME/.claude/whatsapp-mcp/whatsapp-mcp-server/enable_transcription.py"
+# Then do it.
+python3 "$HOME/.claude/whatsapp-mcp/whatsapp-mcp-server/enable_transcription.py" --yes
+```
+
+With `--yes` it does five things, in this order:
+
+1. **The speech model.** It reuses a copy already on your computer (the bridge's `models/` folder, or `~/.local/share/whisper-models/`; a copy found in the second place is hard-linked into the first, which costs no space and keeps the bridge starting if the other tool later removes its file). Otherwise it downloads `ggml-large-v3-turbo.bin` (1.6 GB) from huggingface.co after checking you have the disk space, and checks it against a fixed checksum before using it. A download that stops carries on from where it stopped the next time. One model, no menu.
+2. **Two helper programs.** `whisper-cli` (Homebrew's `whisper-cpp`, about 70 MB with its libraries) and `ffmpeg` (about 34 MB), installed with Homebrew only if they are missing. On Linux it prints the install commands instead of running them.
+3. **The settings**, saved in the bridge's `.env` (`WHATSAPP_WHISPER_BACKEND=local-cpp`, the model path, the helper paths, and `WHATSAPP_WHISPER_LANGUAGE=auto` unless you already chose a language). Nothing else in your `.env` is touched, and its line endings and permissions are kept.
+4. **A restart** of the bridge, when it runs as a background service (see "Keep the bridge running"). Otherwise stop the bridge and start it again.
+5. **A check** that a waiting voice note comes back with words. WhatsApp keeps a note's audio for about 14 days, so a note older than that can be tried only if the bridge saved its audio (see below); otherwise your next new note is the real test.
+
+The order is the point. The bridge refuses to start when it is told to transcribe and the model file is missing, so the settings are written only after the model is on disk and verified and both helpers are found. If the bridge does not come back after the restart, your old settings are put back.
+
+Good to know:
+
+- **Language is detected per note** (`auto`), so Spanish and English notes each come out in their own language. Set `WHATSAPP_WHISPER_LANGUAGE=es` (or another code) only if you want every note forced through one language. The command replaces an `es` it finds the first time it runs (that is the old default a copied `.env.example` carries, and it says so when it looks); after that it leaves your choice alone.
+- **Older notes.** While transcription is off, the bridge saves the audio of each voice note it receives under `WHATSAPP_MEDIA_PATH` (files readable only by you, and not encrypted like the database), so turning transcription on later also covers notes older than WhatsApp's 14 days. It saves voice notes only: not forwarded audio, not view-once notes, and not chats with disappearing messages. Once transcription is on, nothing more is saved, since new notes are read straight away. Chats you keep out of transcription with `WHATSAPP_WHISPER_EXCLUDE_CHATS` / `WHATSAPP_WHISPER_ONLY_CHATS` are not saved (decided when the note arrives). Notes that arrived while the bridge was not running are not saved. Set `WHATSAPP_KEEP_VOICE_AUDIO=false` to stop; files already saved stay until you delete them.
+- **The backlog fills in over time**: the bridge transcribes up to 50 waiting notes every 15 minutes. `POST /api/admin/backfill-transcripts` runs one round now.
+- **Transcripts are scrubbed** for prompt-injection phrases before Claude reads them or the vault export writes them, like message text. The stored transcript stays as spoken.
+- **Turn it on later** by asking Claude to "turn on voice-note transcription", or run the command above.
+
+**Windows:** whisper.cpp has no supported Windows package, so the command stops there. Use the cloud backend instead (`WHATSAPP_WHISPER_BACKEND=openai-api` + `WHATSAPP_WHISPER_API_KEY=sk-...`, opt-in, sends audio to OpenAI) or leave transcription off.
+
+<details>
+<summary>By hand, without the command</summary>
 
 ```
 WHATSAPP_WHISPER_BACKEND=local-cpp
-WHATSAPP_WHISPER_MODEL_PATH=/absolute/path/to/models/ggml-large-v3.bin
+WHATSAPP_WHISPER_MODEL_PATH=/absolute/path/to/ggml-large-v3-turbo.bin
+WHATSAPP_WHISPER_LANGUAGE=auto
 ```
 
-Download a model (~3 GB for `large-v3`; `ggml-small.bin` at ~500 MB also works but is meaningfully worse for Latin American Spanish):
+Download the model first (the bridge refuses to boot when `local-cpp` is set and this file is missing), then switch on:
 
 ```bash
-# macOS / Linux
 mkdir -p "$HOME/.claude/whatsapp-mcp/models"
-curl -L -o "$HOME/.claude/whatsapp-mcp/models/ggml-large-v3.bin" \
-  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin
+curl -L -o "$HOME/.claude/whatsapp-mcp/models/ggml-large-v3-turbo.bin" \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3-turbo.bin
 brew install whisper-cpp ffmpeg   # macOS; Linux: build whisper.cpp + apt-get install ffmpeg
 ```
 
-**Windows note:** whisper.cpp has no supported Windows package. Use the cloud backend instead (`WHATSAPP_WHISPER_BACKEND=openai-api` + `WHATSAPP_WHISPER_API_KEY=sk-...`, opt-in, sends audio to OpenAI) — or leave transcription off. FFmpeg, needed by `local-cpp` only: `winget install ffmpeg`.
+A missing `whisper-cli` or `ffmpeg` does not stop the bridge from booting; it makes every voice note fail with a line in the bridge log. Under a background service, also set `WHATSAPP_WHISPER_BIN_PATH` and `WHATSAPP_FFMPEG_BIN_PATH` to absolute paths (see the troubleshooting guide).
 
-With `local-cpp` enabled, the bridge refuses to boot if the model, `whisper-cli`, or `ffmpeg` are missing — fail-loud at startup instead of silent per-message failures.
+</details>
 
 ## 5. Authenticate
 

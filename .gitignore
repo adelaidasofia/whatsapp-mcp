@@ -38,6 +38,12 @@ uv.lock
 # Whisper models (large binaries, downloaded separately)
 models/
 *.bin
+*.part
+
+# enable_transcription.py: the once-only offer's memory, and a file being rewritten
+voice-note-hint.json
+voice-note-hint.json.tmp
+.env.tmp
 
 # OS
 .DS_Store

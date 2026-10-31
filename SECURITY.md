@@ -36,6 +36,8 @@ This MCP reads and writes your personal WhatsApp. Treat it as equivalent to your
 
 5. **Prompt-injection scrubber.** Every incoming message text passes through a scrubber that strips known injection patterns (`ignore previous instructions`, `system: reveal tokens`, etc.) before Claude sees it. Scrubbed patterns are logged. The original message is preserved in the database; only the representation shown to Claude is scrubbed.
 
+   A voice-note transcript is scrubbed the same way, because whoever sent the audio chose its words: in the bridge API's message list, in the vault export, and again in the MCP layer before Claude sees it. The stored transcript stays as spoken.
+
    The scrubber's coverage is enforced by `whatsapp-bridge/scrubber_test.go`, a 73-case eval corpus that exercises every pattern in `InjectionPatterns` across lowercase, mixed-case, and prose-sandwich variants, plus an 18-entry false-positive control corpus. The `.github/workflows/scrubber-eval.yml` workflow runs the corpus on every PR + push to main + weekly schedule and BLOCKS merge on any catch-rate or false-positive regression. The same test file also documents 10 explicitly-skipped attack classes the substring scrubber does not yet catch (Unicode homoglyphs, whitespace padding, embedded delimiters, base64-encoded instructions, RTL override, zero-width joiners, indirect URL preview, tool-spoofing, exfiltration phrasing, markdown-with-javascript-scheme). Promoting a skipped gap to a passing case is how the scrubber gets hardened over time.
 
 6. **`whatsmeow` pinned.** The Go module pins to a specific commit in `go.mod`. Upgrades require manual diff review and a version bump in `CHANGELOG.md`.
@@ -58,6 +60,7 @@ This MCP reads and writes your personal WhatsApp. Treat it as equivalent to your
 7. **No telemetry.** Zero external network calls except:
    - WhatsApp's multidevice endpoint (required for the tool to function).
    - OpenAI Whisper API only if `WHATSAPP_WHISPER_BACKEND=openai-api` is explicitly set (default is local `whisper.cpp`).
+   - huggingface.co, once, for the speech model, and only when you run `whatsapp-mcp-server/enable_transcription.py --yes` yourself (or tell Claude to). Neither the bridge nor the MCP server downloads anything at run time. The file is pinned to one revision and checked against a fixed SHA-256 before it is used. The same command installs `whisper-cpp` and `ffmpeg` with Homebrew when they are missing, and says so before it does.
    - The host named by `file_url` on a `send_file` / `send_audio` draft, and only when the caller passes one. This is the only call whose destination the caller chooses, which is why it is guarded separately — see decision 11.
 
 8. **No webhooks by default.** Set `WHATSAPP_WEBHOOK_URL` to enable; off by default.
@@ -106,13 +109,15 @@ This MCP reads and writes your personal WhatsApp. Treat it as equivalent to your
 
     Enforced by `whatsapp-bridge/fetch_url_test.go`. `TestRedirectToInstanceMetadataIsBlockedAtTheHop` is deliberately the first test in the file: it is the one that breaks silently if someone "simplifies" the redirect handling into following redirects automatically. The test-only address policy permits loopback (the only place an `httptest` server can live) and delegates to the real `blockedIP` for every other address, so a test that expects a refusal is still judged by the production guard.
 
+12. **Voice-note audio is saved on disk while transcription is off, readable only by you, and not encrypted.** So that turning transcription on later also covers notes older than the ~14 days WhatsApp keeps them, the bridge saves each incoming voice note's audio under `WHATSAPP_MEDIA_PATH` (files `0600` in a `0700` folder, the same as other downloaded media). Unlike the message database, these files are not SQLCipher-encrypted, and a backup tool such as Time Machine copies them. The saving is narrow on purpose: voice notes only (not forwarded audio, which can be large), never a view-once note or a chat with disappearing messages (their senders asked for them not to stick around), only while transcription is off (once it is on, a note is read straight away and nothing more is saved), and not for chats kept out of transcription by `WHATSAPP_WHISPER_EXCLUDE_CHATS` / `WHATSAPP_WHISPER_ONLY_CHATS`. That last check happens when the note arrives, using the chat name the bridge knows at that moment. Files stay after their note is transcribed; delete the folder's contents any time, or set `WHATSAPP_KEEP_VOICE_AUDIO=false` to stop saving. This is a deliberate exception to the stance taken for backups, which are off by default because an upgrade should not silently start writing extra copies of private data: it is on by default so that "turn it on later" works for people who never saw this setting. The opt-out is one setting.
+
 ## Tool risk-tier classification
 
 Every tool exposed by this MCP is classified by risk tier. Claude should treat higher-tier tools with more care (confirmation patterns, additional logging, user prompts).
 
 | Tier | Meaning | Tools |
 |---|---|---|
-| **Read-only** | Does not modify state. Safe to call freely. | `search_contacts`, `list_messages`, `list_chats`, `get_chat`, `get_direct_chat_by_contact`, `get_contact_chats`, `get_last_interaction`, `get_message_context`, `get_contact`, `list_calls`, `get_call_details`, `get_contact_crm_context`, `search_messages_fuzzy`, `transcribe_voice_note`, `download_media` (downloads to local path, does not exfiltrate) |
+| **Read-only** | Does not modify state. Safe to call freely. | `search_contacts`, `list_messages`, `list_chats`, `get_chat`, `get_direct_chat_by_contact`, `get_contact_chats`, `get_last_interaction`, `get_message_context`, `get_contact`, `list_calls`, `get_call_details`, `get_contact_crm_context`, `search_messages_fuzzy`, `transcribe_voice_note`, `download_media` (downloads to local path, does not exfiltrate), `voice_note_transcription` (explains how to turn transcription on; with `not_now=true` it only writes a one-line note to a local file). `list_messages` writes that same small file once, the first time it shows the transcription offer |
 | **Mutating (presence / receipts)** | Changes WhatsApp state in low-impact ways (e.g., marks a chat as read, signals typing). Reversible. | `mark_chat_read`, `send_typing_indicator`, `set_online_presence` |
 | **Draft (pre-send)** | Creates a draft but does not send. Requires `confirm_send` to execute. | `send_message`, `send_file`, `send_audio_message`, `send_reply_quote`, `send_reaction` |
 | **Confirm (commits a send)** | Commits a previously-drafted send. Must match a valid `draft_id`. | `confirm_send` |

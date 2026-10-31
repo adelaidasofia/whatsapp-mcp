@@ -30,7 +30,7 @@ The most-starred WhatsApp MCP (`lharries/whatsapp-mcp`, 5.6K stars) is the archi
 | Prompt-injection scrubber | None | Every inbound message |
 | Send safety | Fires immediately | Mandatory `confirm_send` between draft and delivery |
 | Audit log | None | Every tool call, 30-day retention |
-| Voice notes | Not transcribed | `whisper.cpp` local, Spanish-tuned default |
+| Voice notes | Not transcribed | `whisper.cpp` local, language detected per note, turned on with one command |
 | LID alias resolution | Open issue cluster upstream | Shipped, with backfill migration for legacy threads |
 | CI security | None | `govulncheck` + `pip-audit` + Dependabot, daily |
 
@@ -42,7 +42,7 @@ Claude can:
 
 - Read your WhatsApp chats, messages, and contacts
 - Search messages with accent-insensitive, typo-tolerant matching
-- Transcribe voice notes locally via `whisper.cpp` (Spanish-tuned by default)
+- Transcribe voice notes locally via `whisper.cpp` (language detected per note). Off until you say yes; Claude offers it once, and `python3 whatsapp-mcp-server/enable_transcription.py` turns it on in one step
 - Resolve LID (Linked IDentifier) names instead of numeric placeholders
 - Send text messages, reactions, and reply-quotes, with a mandatory `confirm_send` step between draft and delivery
 - Pull matching CRM context from your Obsidian vault when reading a chat
@@ -79,7 +79,7 @@ See [SETUP.md](SETUP.md) for step-by-step install per OS. In short:
 6. Register the MCP in your Claude Code `.mcp.json`
 7. Restart Claude Code
 
-FFmpeg and whisper.cpp are only needed if you enable voice-note transcription (off by default).
+FFmpeg and whisper.cpp are only needed if you enable voice-note transcription (off by default); `enable_transcription.py` configures them for you, and installs them with Homebrew on a Mac (SETUP.md step 4).
 
 </details>
 
@@ -97,7 +97,9 @@ Key variables:
 | `WHATSAPP_VAULT_CRM_PATH` | empty | Absolute path to your vault CRM folder for auto-injection (e.g., Obsidian `👤 CRM/`). When unset, CRM injection is disabled. |
 | `WHATSAPP_WHISPER_BACKEND` | `off` | `off` (zero-config boot), `local-cpp` (private, needs a whisper model), or `openai-api` (opt-in) |
 | `WHATSAPP_WHISPER_API_KEY` | empty | Required only when backend is `openai-api` |
-| `WHATSAPP_WHISPER_MODEL` | `large-v3` | whisper.cpp model name |
+| `WHATSAPP_WHISPER_MODEL` | `large-v3-turbo` | whisper.cpp model name |
+| `WHATSAPP_WHISPER_LANGUAGE` | `auto` | Language passed to whisper. `auto` detects it per voice note; a fixed code (`es`, `en`) forces every note through it |
+| `WHATSAPP_KEEP_VOICE_AUDIO` | `true` | While transcription is off, save each incoming voice note's audio (voice notes only, never view-once or disappearing ones) under `WHATSAPP_MEDIA_PATH`, so turning transcription on later also covers notes older than WhatsApp's ~14 days. Set `false` to stop |
 | `WHATSAPP_SCRUB_PROMPT_INJECTION` | `true` | Strip known prompt-injection patterns from incoming messages before Claude sees them |
 | `WHATSAPP_AUDIT_LOG` | `true` | Log every tool call to `audit.log` |
 | `WHATSAPP_ENCRYPT_DB` | `true` | Enable SQLCipher DB encryption; key in the platform secret store (macOS Keychain / Windows Credential Manager / libsecret) |

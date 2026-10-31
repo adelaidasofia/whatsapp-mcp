@@ -521,6 +521,10 @@ func (b *Bridge) onMessage(evt *events.Message) {
 	// writes back to messages.voice_note_transcript when done.
 	if b.transcriber != nil && (msgType == "voice" || msgType == "audio") {
 		if audio := evt.Message.GetAudioMessage(); audio != nil {
+			// While transcription is off, save the audio for when it is turned on.
+			if b.keepsVoiceAudio(msgType, chatJID, evt.IsViewOnce, evt.IsEphemeral) {
+				go b.keepVoiceAudio(id)
+			}
 			audioMsg := audio // closure capture
 			client := b.client
 			b.transcriber.Enqueue(transcriptionJob{

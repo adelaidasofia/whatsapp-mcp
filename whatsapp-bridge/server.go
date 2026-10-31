@@ -628,6 +628,12 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		m.IsFromMe = fromMe == 1
+		if m.Transcript != nil {
+			// Same as the message text beside it (scrubbed_text): a transcript is
+			// words from outside. The stored transcript stays as spoken.
+			scrubbed, _ := Scrub(*m.Transcript)
+			m.Transcript = &scrubbed
+		}
 		out.Messages = append(out.Messages, m)
 	}
 	out.Count = len(out.Messages)
