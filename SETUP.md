@@ -152,10 +152,13 @@ With `--yes` it does five things, in this order:
 
 The order is the point. The bridge refuses to start when it is told to transcribe and the model file is missing, so the settings are written only after the model is on disk and verified and both helpers are found. If the bridge does not come back after the restart, your old settings are put back.
 
+If your settings already say all of this (you set it up by hand, or ran the command before), it changes nothing: it checks that the bridge is running them, restarts it only if it is not, and looks at a waiting voice note. Running it again is always safe.
+
 Good to know:
 
 - **Language is detected per note** (`auto`), so Spanish and English notes each come out in their own language. Set `WHATSAPP_WHISPER_LANGUAGE=es` (or another code) only if you want every note forced through one language. The command replaces an `es` it finds the first time it runs (that is the old default a copied `.env.example` carries, and it says so when it looks); after that it leaves your choice alone.
 - **Older notes.** While transcription is off, the bridge saves the audio of each voice note it receives under `WHATSAPP_MEDIA_PATH` (files readable only by you, and not encrypted like the database), so turning transcription on later also covers notes older than WhatsApp's 14 days. It saves voice notes only: not forwarded audio, not view-once notes, and not chats with disappearing messages. Once transcription is on, nothing more is saved, since new notes are read straight away. Chats you keep out of transcription with `WHATSAPP_WHISPER_EXCLUDE_CHATS` / `WHATSAPP_WHISPER_ONLY_CHATS` are not saved (decided when the note arrives). Notes that arrived while the bridge was not running are not saved. Set `WHATSAPP_KEEP_VOICE_AUDIO=false` to stop; files already saved stay until you delete them.
+- **The vault export.** Transcripts reach your vault files the next time the bridge's `--export-to-vault` runs (a chat file is rewritten once a newer transcript exists). Run it by hand to see them sooner.
 - **The backlog fills in over time**: the bridge transcribes up to 50 waiting notes every 15 minutes. `POST /api/admin/backfill-transcripts` runs one round now.
 - **Transcripts are scrubbed** for prompt-injection phrases before Claude reads them or the vault export writes them, like message text. The stored transcript stays as spoken.
 - **Turn it on later** by asking Claude to "turn on voice-note transcription", or run the command above.
