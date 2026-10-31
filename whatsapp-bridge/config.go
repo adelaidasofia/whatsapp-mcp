@@ -83,6 +83,11 @@ type Config struct {
 	// device that has not linked yet: see device_props.go.
 	DeviceName  string
 	FullHistory bool
+
+	// DailySendLimit (WHATSAPP_DAILY_SEND_LIMIT, default 10) caps the
+	// messages sent per local calendar day; 0 turns sending off. It and the
+	// other send rules are enforced at confirm: see send_policy.go.
+	DailySendLimit int
 }
 
 // LoadConfig reads every env var, applies defaults, and returns a populated Config.
@@ -137,6 +142,7 @@ func LoadConfig() (*Config, error) {
 		BackfillWindowDays:      getenvInt("WHATSAPP_BACKFILL_WINDOW_DAYS", 14),
 		DeviceName:              getenv("WHATSAPP_DEVICE_NAME", ""),
 		FullHistory:             getenvBool("WHATSAPP_FULL_HISTORY", false),
+		DailySendLimit:          getenvInt("WHATSAPP_DAILY_SEND_LIMIT", 10),
 	}
 
 	if err := c.Validate(); err != nil {
@@ -176,6 +182,9 @@ func (c *Config) Validate() error {
 	}
 	if c.AuditLogRetention < 1 {
 		return fmt.Errorf("WHATSAPP_AUDIT_LOG_RETENTION_DAYS must be >= 1")
+	}
+	if c.DailySendLimit < 0 {
+		return fmt.Errorf("WHATSAPP_DAILY_SEND_LIMIT=%d must be 0 (no sending) or more", c.DailySendLimit)
 	}
 	return nil
 }

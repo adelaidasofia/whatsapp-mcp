@@ -120,3 +120,26 @@ def test_transport_error_returns_runtimeerror_not_raises():
     # an exception rather than raise one, or the original context is lost.
     got = _transport_error(httpx.ConnectError("nope"))
     assert isinstance(got, RuntimeError)
+
+
+def test_refused_send_carries_the_link_to_send_it_by_hand():
+    # Past the daily limit the bridge refuses the send and offers a wa.me link
+    # with the text filled in; the model must see it to hand it to the person.
+    from main import _bridge_error
+
+    request = httpx.Request("POST", "http://127.0.0.1:1/api/sends/d/confirm")
+    response = httpx.Response(
+        429,
+        request=request,
+        json={
+            "error": "daily_send_limit",
+            "details": "Mycelium sends at most 10 messages a day, and 10 went out today.",
+            "sent_today": 10,
+            "daily_limit": 10,
+            "open_in_whatsapp": "https://wa.me/15555550100?text=hola",
+        },
+    )
+    msg = str(_bridge_error(httpx.HTTPStatusError("429", request=request, response=response)))
+    assert "daily_send_limit" in msg
+    assert "at most 10 messages a day" in msg
+    assert "https://wa.me/15555550100?text=hola" in msg

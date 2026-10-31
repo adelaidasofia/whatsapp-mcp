@@ -290,18 +290,25 @@ def _bridge_error(e: httpx.HTTPStatusError) -> RuntimeError:
     re-raising the bare httpx exception discarded that body, so every
     failure mode (unauthenticated, disconnected, bad args) reached Claude
     as an opaque status-code string.
+
+    A send the bridge's rules refuse may carry `open_in_whatsapp`, a wa.me
+    link with the text filled in, so the person can send it themselves.
     """
     err = ""
     details = ""
+    open_link = ""
     try:
         body = e.response.json()
         err = body.get("error") or ""
         details = body.get("details") or ""
+        open_link = body.get("open_in_whatsapp") or ""
     except Exception:  # noqa: BLE001 — non-JSON error body
         err = (e.response.text or "")[:200]
     msg = f"bridge {e.response.status_code}: {err or e.response.reason_phrase}"
     if details:
         msg += f" — {details}"
+    if open_link:
+        msg += f" Give the person this link to send it themselves: {open_link}"
     return RuntimeError(msg)
 
 
@@ -641,6 +648,13 @@ async def send_message(recipient_jid: str, text: str) -> dict[str, Any]:
     Two-step pattern rationale: prevents "replied to wrong person" disasters.
     Claude must show you the draft_id + recipient_display + preview and wait for
     you to authorize before calling confirm_send.
+
+    Never use this for mass messages. The bridge refuses, at confirm: a first
+    message to someone with no conversation yet, the same text to several
+    chats, broadcast lists, status and channels, and more than the daily limit
+    (10 by default; a group counts like any other chat). Drafting is never
+    limited: past a refusal, give the person the draft and the link the error
+    carries so they send it themselves.
     """
     start = time.time()
     body = {"recipient_jid": recipient_jid, "text": text, "send_type": "text"}
@@ -672,6 +686,9 @@ async def confirm_send(draft_id: str) -> dict[str, Any]:
         404: draft not found
         409: draft already confirmed/sent/failed (each draft can only be confirmed once)
         410: draft expired (>1 hour since creation)
+        403: the send rules refused it (no existing conversation, the same text
+             already sent to another chat, or a broadcast/status/channel)
+        429: the daily send limit is reached
         502: send failed at whatsmeow layer (bridge disconnected, invalid recipient, etc.)
     """
     start = time.time()
