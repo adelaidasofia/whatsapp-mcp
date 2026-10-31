@@ -95,13 +95,17 @@ def test_port_file_is_read_on_every_call(tmp_path, monkeypatch):
     assert _bridge_base().endswith(":54322")
 
 
-def test_unreadable_port_file_falls_back_to_the_configured_port(tmp_path, monkeypatch):
+def test_a_missing_port_file_never_falls_back_to_another_bridge(tmp_path, monkeypatch):
+    # Before the app's bridge writes its port, the default port may belong to
+    # a different bridge on the same machine, with another account's chats.
     monkeypatch.setattr(main, "BRIDGE_PORT_FILE", str(tmp_path / "missing.port"))
-    assert _bridge_port() == main.BRIDGE_PORT
+    assert _bridge_port() is None
+    with pytest.raises(RuntimeError, match="not written yet"):
+        main._bridge_url("/api/chats")
     garbage = tmp_path / "garbage.port"
     garbage.write_text("not a port", encoding="utf-8")
     monkeypatch.setattr(main, "BRIDGE_PORT_FILE", str(garbage))
-    assert _bridge_port() == main.BRIDGE_PORT
+    assert _bridge_port() is None
 
 
 def test_supervised_bridge_points_at_the_app_not_a_terminal(monkeypatch):

@@ -50,17 +50,34 @@ BRIDGE_PORT_FILE = os.environ.get("WHATSAPP_BRIDGE_PORT_FILE", "").strip()
 BRIDGE_SUPERVISOR = os.environ.get("WHATSAPP_BRIDGE_SUPERVISOR", "").strip()
 
 
-def _bridge_port() -> int:
+def _bridge_port() -> int | None:
+    """The bridge's port. None when an app runs the bridge and its port file
+    is missing or unreadable: that bridge is not up yet, and falling back to
+    the default port could reach a different bridge on the same machine (one
+    started by hand, holding another WhatsApp account's chats)."""
     if BRIDGE_PORT_FILE:
         try:
             return int(Path(BRIDGE_PORT_FILE).read_text(encoding="utf-8").strip())
         except (OSError, ValueError):
-            pass
+            return None
     return BRIDGE_PORT
 
 
-def _bridge_base() -> str:
-    return f"http://{BRIDGE_HOST}:{_bridge_port()}"
+def _bridge_base() -> str | None:
+    port = _bridge_port()
+    return None if port is None else f"http://{BRIDGE_HOST}:{port}"
+
+
+def _bridge_where() -> str:
+    """Where this server is looking, for error messages."""
+    return _bridge_base() or f"the port in {BRIDGE_PORT_FILE} (not written yet)"
+
+
+def _bridge_url(path: str) -> str:
+    base = _bridge_base()
+    if base is None:
+        raise _bridge_unreachable(FileNotFoundError(BRIDGE_PORT_FILE))
+    return f"{base}{path}"
 
 
 VAULT_CRM_PATH = os.environ.get("WHATSAPP_VAULT_CRM_PATH", "").strip()
@@ -115,7 +132,7 @@ async def lifespan(_app: FastMCP):
     try:
         # Preflight: confirm the Go bridge is reachable.
         try:
-            r = await _http.get(f"{_bridge_base()}/healthcheck")
+            r = await _http.get(_bridge_url("/healthcheck"))
             r.raise_for_status()
             log.info("bridge healthcheck OK: %s", r.json())
         except Exception as e:  # noqa: BLE001
@@ -328,7 +345,7 @@ def _bridge_unreachable(e: Exception) -> RuntimeError:
     """
     if BRIDGE_SUPERVISOR:
         return RuntimeError(
-            f"Cannot reach the WhatsApp bridge at {_bridge_base()} ({type(e).__name__}). "
+            f"Cannot reach the WhatsApp bridge at {_bridge_where()} ({type(e).__name__}). "
             f"{BRIDGE_SUPERVISOR} runs the bridge on this computer, and no WhatsApp tool "
             "works until it is running. Do not start one in a terminal. "
             f"Ask the person to open {BRIDGE_SUPERVISOR}'s WhatsApp page, which shows "
@@ -341,7 +358,7 @@ def _bridge_unreachable(e: Exception) -> RuntimeError:
         start = '"$HOME/.claude/whatsapp-mcp/whatsapp-bridge/bin/whatsapp-bridge"'
         autostart = "./scripts/install-bridge-autostart.sh"
     return RuntimeError(
-        f"Cannot reach the whatsapp-mcp bridge at {_bridge_base()} ({type(e).__name__}). "
+        f"Cannot reach the whatsapp-mcp bridge at {_bridge_where()} ({type(e).__name__}). "
         "The bridge is a separate program from this MCP server, and no WhatsApp tool "
         "works until it is running.\n"
         "\n"
@@ -356,14 +373,14 @@ def _bridge_unreachable(e: Exception) -> RuntimeError:
         f"  {autostart}\n"
         "\n"
         f"If your bridge listens elsewhere, set WHATSAPP_BRIDGE_HOST / WHATSAPP_BRIDGE_PORT "
-        f"(this server is looking at {BRIDGE_HOST}:{_bridge_port()})."
+        f"(this server is looking at {_bridge_where()})."
     )
 
 
 def _bridge_timeout(e: Exception) -> RuntimeError:
     """The bridge accepted the connection and then went quiet."""
     return RuntimeError(
-        f"The whatsapp-mcp bridge at {_bridge_base()} accepted the connection but did not "
+        f"The whatsapp-mcp bridge at {_bridge_where()} accepted the connection but did not "
         f"answer in time ({type(e).__name__}). It is running but wedged or very busy. "
         "Check its log (bridge.log next to the store), then restart it."
     )
@@ -381,7 +398,7 @@ def _transport_error(e: httpx.TransportError) -> RuntimeError:
 async def _bridge_get(path: str, params: dict[str, Any] | None = None) -> Any:
     assert _http is not None, "http client not initialized"
     try:
-        r = await _http.get(f"{_bridge_base()}{path}", params=params)
+        r = await _http.get(_bridge_url(path), params=params)
     except httpx.TransportError as e:
         raise _transport_error(e) from e
     try:
@@ -394,7 +411,7 @@ async def _bridge_get(path: str, params: dict[str, Any] | None = None) -> Any:
 async def _bridge_post(path: str, body: dict[str, Any]) -> Any:
     assert _http is not None, "http client not initialized"
     try:
-        r = await _http.post(f"{_bridge_base()}{path}", json=body)
+        r = await _http.post(_bridge_url(path), json=body)
     except httpx.TransportError as e:
         raise _transport_error(e) from e
     try:
