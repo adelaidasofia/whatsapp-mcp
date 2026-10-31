@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-31
+
 ### Changed
 
 - **The bridge refuses mass messaging, at the moment a message would leave.** Drafting is never limited; `confirm_send` now refuses, with a reason the model can relay:
@@ -167,6 +169,8 @@ Standup.md` is a legal filename, so the export wrote it and the run was green; W
 - **`server.json` registry manifest** with full 9-env-var schema covering bridge host/port, vault CRM path, Whisper backend selection, scrubber toggle, audit log toggle, and SQLCipher encryption toggle.
 
 ## [Unreleased]
+
+## [0.6.0] - 2026-10-31
 
 ### Fixed
 
