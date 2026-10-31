@@ -17,6 +17,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **`POST /api/auth/logout` unlinks this device from the member's WhatsApp**, so an app's "Disconnect" removes it from the phone's Linked devices list instead of leaving it there. With nothing linked it answers `{"unlinked": false}`. whatsmeow deletes the local device row afterwards, so the process then exits for a supervisor restart.
+- **`WHATSAPP_EXIT_WITH_PARENT=true` shuts the bridge down when its stdin closes.** An app that runs the bridge hands it a pipe it never writes to; the OS closes it when the app exits or crashes, so the bridge never outlives the app and the app's next bridge never fights an orphan for the same link. Off by default, so a terminal user's stdin is left alone.
 - **An app can run the bridge for the member (Mycelium Studio, tickets#658).** Three settings make that work without a terminal, all off unless set:
   - `WHATSAPP_FULL_HISTORY=true` asks the phone for its whole chat history when this device links, as whatsapp-vault-sync's `syncFullHistory` does, so one link brings in both the live chats and the history. WhatsApp reads it only when a device links for the first time; an already linked bridge changes nothing until it is unlinked and links again.
   - `WHATSAPP_DEVICE_NAME` is the name the phone lists under Linked devices (Studio uses "Mycelium"), so the member can tell the bridge apart and unlink it. It also reports the device as a desktop.

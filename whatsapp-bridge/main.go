@@ -286,6 +286,7 @@ func run(args []string) int {
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	parentGone := watchParent(cfg.ExitWithParent, os.Stdin)
 	go func() {
 		// Fatal is the bridge asking for a restart it cannot perform itself —
 		// currently a WhatsApp-side device deletion, which poisons the whatsmeow
@@ -297,6 +298,8 @@ func run(args []string) int {
 			log.Printf("received signal %s; shutting down", sig)
 		case <-bridge.Fatal():
 			log.Println("fatal condition reported; shutting down for a supervisor restart")
+		case <-parentGone:
+			log.Println("the app that runs this bridge is gone (stdin closed); shutting down")
 		}
 		cancel()
 		bridge.Disconnect()
