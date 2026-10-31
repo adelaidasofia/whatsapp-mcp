@@ -142,10 +142,17 @@ func (s *Server) Serve(ln net.Listener) error {
 }
 
 // writePortFile drops the bound port next to the database so a supervisor
-// can discover it without parsing stdout. Best-effort; never fatal.
+// can discover it without parsing stdout. Best-effort; never fatal. Written
+// to a temp name and renamed, so a reader (the MCP server reads it on every
+// request) never sees a half-written file.
 func (s *Server) writePortFile(port int) {
 	path := filepath.Join(filepath.Dir(s.cfg.DBPath), "bridge.port")
-	if err := os.WriteFile(path, []byte(strconv.Itoa(port)), 0o600); err != nil {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(strconv.Itoa(port)), 0o600); err != nil {
+		log.Printf("port file write failed (non-fatal): %v", err)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
 		log.Printf("port file write failed (non-fatal): %v", err)
 	}
 }
@@ -367,6 +374,11 @@ type statusResponse struct {
 	// being able to say it had been that way for a day. The duration is what
 	// makes the state actionable. See watchdog.go.
 	DisconnectedSeconds int64 `json:"disconnected_seconds,omitempty"`
+
+	// SendsToday of DailySendLimit, so an app can put the promise on its send
+	// button ("Send · 3 of 10 today"). See send_policy.go.
+	SendsToday     int `json:"sends_today"`
+	DailySendLimit int `json:"daily_send_limit"`
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -393,6 +405,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	if down := s.bridge.DisconnectedFor(); down > 0 {
 		resp.DisconnectedSeconds = int64(down.Seconds())
+	}
+	resp.DailySendLimit = s.cfg.DailySendLimit
+	if n, err := countSendsSince(r.Context(), s.db, localMidnight(time.Now()), s.ownJIDs()); err == nil {
+		resp.SendsToday = n
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

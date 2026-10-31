@@ -306,6 +306,13 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The send rules (send_policy.go), checked before any media upload so a
+	// refused send uploads nothing, and again under the lock at the flip.
+	pending := pendingSend{RecipientJID: recipientJID, SendType: sendType, Text: contentText}
+	if s.refuseSend(w, r, pending) {
+		return
+	}
+
 	// Parse JID.
 	recipient, err := types.ParseJID(recipientJID)
 	if err != nil {
@@ -393,10 +400,17 @@ func (s *Server) handleConfirmSend(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Flip to confirmed BEFORE sending, so double-confirm races are blocked.
+	// The rules are re-checked under the same lock as the flip, so two
+	// confirms racing at the daily limit cannot both pass.
 	now := time.Now().Unix()
-	res, err := s.db.ExecContext(r.Context(),
-		`UPDATE sends SET status='confirmed', confirmed_at=? WHERE draft_id=? AND status='draft'`,
-		now, draftID)
+	var res sql.Result
+	if s.refuseSendLocked(w, r, pending, func() {
+		res, err = s.db.ExecContext(r.Context(),
+			`UPDATE sends SET status='confirmed', confirmed_at=? WHERE draft_id=? AND status='draft'`,
+			now, draftID)
+	}) {
+		return
+	}
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "confirm update failed", Details: err.Error()})
 		return

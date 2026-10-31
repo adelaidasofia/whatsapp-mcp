@@ -21,8 +21,10 @@ from __future__ import annotations
 import httpx
 import pytest
 
+import main
 from main import (
-    BRIDGE_BASE,
+    _bridge_base,
+    _bridge_port,
     _bridge_timeout,
     _bridge_unreachable,
     _transport_error,
@@ -31,7 +33,7 @@ from main import (
 
 def test_unreachable_message_names_the_bridge_and_the_address():
     msg = str(_bridge_unreachable(httpx.ConnectError("nope")))
-    assert BRIDGE_BASE in msg, "must say WHERE it tried to connect"
+    assert _bridge_base() in msg, "must say WHERE it tried to connect"
     assert "bridge" in msg.lower(), "must name the bridge as the missing piece"
     assert "separate program" in msg, "must explain the bridge is not this process"
 
@@ -82,8 +84,87 @@ def test_timeout_message_points_at_the_log():
     assert "log" in msg.lower()
 
 
+def test_port_file_is_read_on_every_call(tmp_path, monkeypatch):
+    # An app that runs the bridge on a free port restarts it on a new one;
+    # the server must follow the bridge's own port file, not its first read.
+    port_file = tmp_path / "bridge.port"
+    port_file.write_text("54321", encoding="utf-8")
+    monkeypatch.setattr(main, "BRIDGE_PORT_FILE", str(port_file))
+    assert _bridge_port() == 54321
+    port_file.write_text("54322", encoding="utf-8")
+    assert _bridge_base().endswith(":54322")
+
+
+def test_a_missing_port_file_never_falls_back_to_another_bridge(tmp_path, monkeypatch):
+    # Before the app's bridge writes its port, the default port may belong to
+    # a different bridge on the same machine, with another account's chats.
+    monkeypatch.setattr(main, "BRIDGE_PORT_FILE", str(tmp_path / "missing.port"))
+    assert _bridge_port() is None
+    with pytest.raises(RuntimeError, match="not written yet"):
+        main._bridge_url("/api/chats")
+    garbage = tmp_path / "garbage.port"
+    garbage.write_text("not a port", encoding="utf-8")
+    monkeypatch.setattr(main, "BRIDGE_PORT_FILE", str(garbage))
+    assert _bridge_port() is None
+
+
+def test_supervised_bridge_points_at_the_app_not_a_terminal(monkeypatch):
+    # A member whose app runs the bridge has no terminal, and a second bridge
+    # started by hand would fight the app's for the same WhatsApp link.
+    monkeypatch.setattr(main, "BRIDGE_SUPERVISOR", "Mycelium")
+    msg = str(_bridge_unreachable(httpx.ConnectError("nope")))
+    assert "Mycelium" in msg
+    assert "Do not start one in a terminal" in msg
+    assert "install-bridge-autostart" not in msg
+    assert "whatsapp-bridge/bin" not in msg
+
+
 def test_transport_error_returns_runtimeerror_not_raises():
     # The call sites do `raise _transport_error(e) from e`, so this must RETURN
     # an exception rather than raise one, or the original context is lost.
     got = _transport_error(httpx.ConnectError("nope"))
     assert isinstance(got, RuntimeError)
+
+
+def test_refused_send_carries_the_link_to_send_it_by_hand():
+    # Past the daily limit the bridge refuses the send and offers a wa.me link
+    # with the text filled in; the model must see it to hand it to the person.
+    from main import _bridge_error
+
+    request = httpx.Request("POST", "http://127.0.0.1:1/api/sends/d/confirm")
+    response = httpx.Response(
+        429,
+        request=request,
+        json={
+            "error": "daily_send_limit",
+            "details": "Mycelium sends at most 10 messages a day, and 10 went out today.",
+            "sent_today": 10,
+            "daily_limit": 10,
+            "open_in_whatsapp": "https://wa.me/15555550100?text=hola",
+        },
+    )
+    msg = str(_bridge_error(httpx.HTTPStatusError("429", request=request, response=response)))
+    assert "daily_send_limit" in msg
+    assert "at most 10 messages a day" in msg
+    assert "https://wa.me/15555550100?text=hola" in msg
+
+
+def test_the_audit_log_never_keeps_the_send_by_hand_link(tmp_path, monkeypatch):
+    # The link holds the recipient's number and the whole message; the model
+    # needs it, a plaintext log does not.
+    import json
+
+    log_path = tmp_path / "audit.log"
+    monkeypatch.setattr(main, "AUDIT_LOG_ENABLED", True)
+    monkeypatch.setattr(main, "AUDIT_LOG_PATH", str(log_path))
+    main._audit(
+        "confirm_send",
+        {"draft_id": "d"},
+        "failed",
+        3,
+        error="bridge 429: daily_send_limit — at most 10 a day. Give the person this link to send it themselves: https://wa.me/15555550100?text=hola%20secreto",
+    )
+    entry = json.loads(log_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert "15555550100" not in entry["error"]
+    assert "secreto" not in entry["error"]
+    assert "daily_send_limit" in entry["error"]

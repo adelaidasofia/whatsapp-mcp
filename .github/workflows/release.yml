@@ -188,6 +188,61 @@ jobs:
           shasum -a 256 "${ARTIFACT}" > "${ARTIFACT}.sha256" 2>/dev/null || sha256sum "${ARTIFACT}" > "${ARTIFACT}.sha256"
           gh release upload "${TAG}" "${ARTIFACT}" "${ARTIFACT}.sha256" --clobber
 
+  # -- The MCP server as a wheel, for an app that runs it without a clone -----
+  # Mycelium Studio installs the server from this exact file and checks it
+  # against a SHA-256 it pins, so a member never clones the repo or builds a
+  # Python environment by hand (tickets#658). SOURCE_DATE_EPOCH makes the
+  # wheel byte-identical when this job is re-run for the same tag, so a
+  # rebuild never breaks that pin.
+  wheel:
+    name: MCP server wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Refuse a dispatch input that is not a release tag
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          if [[ ! "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]*)?$ ]]; then
+            echo "::error::the tag input must be an existing release tag like v1.2.3; the ${#TAG}-character value given is not one"
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || '' }}
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
+      - name: Build and attach the wheel
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
+          uv build --wheel --build-constraints whatsapp-mcp-server/build-constraints.txt --out-dir dist whatsapp-mcp-server
+          name="adelaidasofia_whatsapp_mcp-${TAG#v}-py3-none-any.whl"
+          if [ ! -f "dist/${name}" ]; then
+            echo "::error::expected dist/${name}: whatsapp-mcp-server/pyproject.toml's version must match the tag"
+            ls dist
+            exit 1
+          fi
+          (cd dist && sha256sum "${name}" > "${name}.sha256")
+          # A re-run must never swap the wheel an app already pinned for one
+          # with different bytes: same bytes, nothing to do; different, stop.
+          mkdir -p published
+          if gh release download "${TAG}" --pattern "${name}" --dir published 2>/dev/null; then
+            if cmp -s "published/${name}" "dist/${name}"; then
+              echo "${name} is already attached with the same bytes."
+              exit 0
+            fi
+            echo "::error::${TAG} already carries a different ${name}; apps may pin it by SHA-256, so it is not replaced. Cut a new version instead."
+            exit 1
+          fi
+          gh release upload "${TAG}" "dist/${name}" "dist/${name}.sha256"
+
   # -- The release has not happened until every promised asset is attached ----
   # `fail-fast: false` above is deliberate: one broken target should not deny
   # the other three their binaries. The cost is that a leg which is cancelled,
@@ -201,20 +256,20 @@ jobs:
   # matrix leg fails, which is precisely the case it exists to catch.
   verify-release-assets:
     name: verify every promised asset is attached
-    needs: build
+    needs: [build, wheel]
     if: always()
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
-      - name: Assert all four binaries and their checksums are on the tag
+      - name: Assert all four binaries, the wheel and their checksums are on the tag
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name || inputs.tag }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          expected='whatsapp-bridge-linux-amd64 whatsapp-bridge-darwin-arm64 whatsapp-bridge-darwin-amd64 whatsapp-bridge-windows-amd64.exe'
+          expected="whatsapp-bridge-linux-amd64 whatsapp-bridge-darwin-arm64 whatsapp-bridge-darwin-amd64 whatsapp-bridge-windows-amd64.exe adelaidasofia_whatsapp_mcp-${TAG#v}-py3-none-any.whl"
 
           actual=$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name')
           echo "attached assets:"

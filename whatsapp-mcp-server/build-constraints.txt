@@ -1,0 +1,3 @@
+# The release wheel build pins its build backend so a re-run for the same tag
+# produces the same bytes (an app pins the wheel by SHA-256). Bump on purpose.
+setuptools==84.2.1
