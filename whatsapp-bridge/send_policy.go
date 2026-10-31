@@ -10,6 +10,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+
+	"go.mau.fi/whatsmeow/types"
 )
 
 // The rules every outbound message passes before it leaves. They live here,
@@ -20,20 +23,22 @@ import (
 //
 //  1. Never to a broadcast list, status or channel.
 //  2. Only into a conversation that already exists: the chat, or another JID
-//     of the same person, has a stored message. No first contact with
-//     strangers.
+//     of the same person, has a stored message that someone wrote (not a
+//     system notice, not a reaction). No first contact with strangers, and a
+//     reaction cannot open a conversation either.
 //  3. Never the same text to several chats: a text of at least
-//     duplicateMinRunes characters already sent to a different chat in the
-//     last duplicateWindow is refused.
-//  4. At most cfg.DailySendLimit messages a day (local calendar day). A
-//     message to a group counts like any other. Reactions do not count.
+//     duplicateMinRunes characters already sent to a different chat within
+//     duplicateWindow is refused. That is the burst pattern WhatsApp bans.
+//  4. At most cfg.DailySendLimit messages a local calendar day. A message to
+//     a group counts like any other. Reactions do not count, but a limit of 0
+//     stops them too: 0 means no sending at all.
 //
-// These come from WhatsApp's own ban patterns (first contact with strangers,
-// one text to many chats, bursts), which matter more than the count.
+// Messages to the account's own chat ("message yourself") are exempt from
+// 2 to 4: writing to yourself is not messaging anyone.
 
 const (
 	duplicateMinRunes = 20
-	duplicateWindow   = 30 * 24 * time.Hour
+	duplicateWindow   = 24 * time.Hour
 )
 
 // sendPolicyMu holds the rules check and the flip to 'confirmed' together,
@@ -53,6 +58,11 @@ type pendingSend struct {
 	RecipientJID string
 	SendType     string
 	Text         string
+	// Alts are other JIDs of the recipient that whatsmeow's own LID store
+	// knows and jid_aliases may not have yet (it is backfilled at startup).
+	Alts []string
+	// Own are the account's own JIDs: its phone JID and its LID.
+	Own []string
 }
 
 // checkSendPolicy returns nil when the send may go, or the refusal to return.
@@ -61,20 +71,27 @@ func checkSendPolicy(ctx context.Context, db *sql.DB, limit int, now time.Time, 
 		return &sendRefusal{
 			Status:  403,
 			Error:   "broadcast_not_allowed",
-			Details: "Mycelium never sends mass messages, so it does not send to broadcast lists, status or channels.",
+			Details: "This WhatsApp bridge never sends mass messages, so it does not send to broadcast lists, status or channels.",
 		}, nil
-	}
-	if send.SendType == "reaction" {
-		return nil, nil
 	}
 	aliases, err := resolveAliases(ctx, db, send.RecipientJID)
 	if err != nil {
 		return nil, err
 	}
+	aliases = appendNew(aliases, send.Alts...)
+	if overlaps(aliases, send.Own) {
+		return nil, nil
+	}
+	link := openInWhatsAppURL(aliases, send.Text)
+
+	if send.SendType == "reaction" && limit == 0 {
+		return &sendRefusal{Status: 429, Error: "daily_send_limit", Details: "Sending is turned off on this WhatsApp bridge.", DailyLimit: limit}, nil
+	}
 
 	var exists int
 	err = db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM (SELECT 1 FROM messages WHERE chat_jid IN (`+inClausePlaceholders(len(aliases))+`) AND type != 'system' LIMIT 1)`,
+		`SELECT COUNT(*) FROM (SELECT 1 FROM messages WHERE chat_jid IN (`+inClausePlaceholders(len(aliases))+`)
+		 AND type NOT IN ('system', 'reaction') LIMIT 1)`,
 		jidsToArgs(aliases)...,
 	).Scan(&exists)
 	if err != nil {
@@ -84,12 +101,15 @@ func checkSendPolicy(ctx context.Context, db *sql.DB, limit int, now time.Time, 
 		return &sendRefusal{
 			Status:         403,
 			Error:          "no_existing_conversation",
-			Details:        "Mycelium sends only into conversations that already exist, never a first message to someone new. Send the first message yourself in WhatsApp.",
-			OpenInWhatsApp: openInWhatsAppURL(aliases, send.Text),
+			Details:        "This WhatsApp bridge sends only into conversations that already exist, never a first message to someone new. Send the first message yourself in WhatsApp.",
+			OpenInWhatsApp: link,
 		}, nil
 	}
+	if send.SendType == "reaction" {
+		return nil, nil
+	}
 
-	sentToday, err := countSendsSince(ctx, db, localMidnight(now))
+	sentToday, err := countSendsSince(ctx, db, localMidnight(now), send.Own)
 	if err != nil {
 		return nil, err
 	}
@@ -97,23 +117,24 @@ func checkSendPolicy(ctx context.Context, db *sql.DB, limit int, now time.Time, 
 		return &sendRefusal{
 			Status:         429,
 			Error:          "daily_send_limit",
-			Details:        fmt.Sprintf("Mycelium sends at most %d messages a day, and %d went out today. Copy this one and send it yourself in WhatsApp.", limit, sentToday),
+			Details:        fmt.Sprintf("This WhatsApp bridge sends at most %d messages a day, and %d went out today. Copy this one and send it yourself in WhatsApp.", limit, sentToday),
 			SentToday:      sentToday,
 			DailyLimit:     limit,
-			OpenInWhatsApp: openInWhatsAppURL(aliases, send.Text),
+			OpenInWhatsApp: link,
 		}, nil
 	}
 
 	if norm := normalizeSendText(send.Text); len([]rune(norm)) >= duplicateMinRunes {
-		dup, err := sentElsewhere(ctx, db, norm, aliases, now.Add(-duplicateWindow))
+		dup, err := sentElsewhere(ctx, db, norm, appendNew(aliases, send.Own...), now.Add(-duplicateWindow))
 		if err != nil {
 			return nil, err
 		}
 		if dup {
 			return &sendRefusal{
-				Status:  403,
-				Error:   "same_text_to_several_chats",
-				Details: "Mycelium never sends the same text to several chats, and this exact text already went to another chat. Change it for this person, or send it yourself in WhatsApp.",
+				Status:         403,
+				Error:          "same_text_to_several_chats",
+				Details:        "This WhatsApp bridge never sends the same text to several chats, and this exact text went to another chat in the last day. Change it for this person, or send it yourself in WhatsApp.",
+				OpenInWhatsApp: link,
 			}, nil
 		}
 	}
@@ -124,6 +145,7 @@ func checkSendPolicy(ctx context.Context, db *sql.DB, limit int, now time.Time, 
 // send. Only the rule's code is logged: the recipient and text stay out of
 // the log.
 func (s *Server) refuseSend(w http.ResponseWriter, r *http.Request, send pendingSend) bool {
+	send.Own, send.Alts = s.ownJIDs(), s.altJIDs(r.Context(), send.RecipientJID)
 	refusal, err := checkSendPolicy(r.Context(), s.db, s.cfg.DailySendLimit, time.Now(), send)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "send rules check failed", Details: err.Error()})
@@ -137,21 +159,68 @@ func (s *Server) refuseSend(w http.ResponseWriter, r *http.Request, send pending
 	return true
 }
 
-// countSendsSince counts the messages that left (or are leaving) since t.
-// A failed send did not reach anyone, so it does not use up the day.
-func countSendsSince(ctx context.Context, db *sql.DB, t time.Time) (int, error) {
-	var n int
-	err := db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM sends WHERE status IN ('confirmed', 'sent') AND send_type != 'reaction' AND confirmed_at >= ?`,
-		t.Unix(),
-	).Scan(&n)
+// refuseSendLocked is refuseSend under sendPolicyMu, released even if the
+// check panics. A refused send returns true; otherwise flip runs under the
+// same lock.
+func (s *Server) refuseSendLocked(w http.ResponseWriter, r *http.Request, send pendingSend, flip func()) bool {
+	sendPolicyMu.Lock()
+	defer sendPolicyMu.Unlock()
+	if s.refuseSend(w, r, send) {
+		return true
+	}
+	flip()
+	return false
+}
+
+func (s *Server) ownJIDs() []string {
+	if s.bridge == nil || s.bridge.client == nil || s.bridge.client.Store == nil {
+		return nil
+	}
+	var own []string
+	if id := s.bridge.client.Store.ID; id != nil {
+		own = append(own, id.ToNonAD().String())
+	}
+	if lid := s.bridge.client.Store.LID; !lid.IsEmpty() {
+		own = append(own, lid.ToNonAD().String())
+	}
+	return own
+}
+
+func (s *Server) altJIDs(ctx context.Context, jid string) []string {
+	if s.bridge == nil || s.bridge.client == nil || s.bridge.client.Store == nil {
+		return nil
+	}
+	parsed, err := types.ParseJID(jid)
 	if err != nil {
+		return nil
+	}
+	alt, err := s.bridge.client.Store.GetAltJID(ctx, parsed)
+	if err != nil || alt.IsEmpty() {
+		return nil
+	}
+	return []string{alt.ToNonAD().String()}
+}
+
+// countSendsSince counts the messages that left (or are leaving) since t,
+// leaving out messages to the account's own chat. A failed send did not
+// reach anyone, so it does not use up the day.
+func countSendsSince(ctx context.Context, db *sql.DB, t time.Time, own []string) (int, error) {
+	query := `SELECT COUNT(*) FROM sends WHERE status IN ('confirmed', 'sent') AND send_type != 'reaction' AND confirmed_at >= ?`
+	args := []any{t.Unix()}
+	if len(own) > 0 {
+		query += ` AND recipient_jid NOT IN (` + inClausePlaceholders(len(own)) + `)`
+		args = append(args, jidsToArgs(own)...)
+	}
+	var n int
+	if err := db.QueryRowContext(ctx, query, args...).Scan(&n); err != nil {
 		return 0, fmt.Errorf("daily send count: %w", err)
 	}
 	return n, nil
 }
 
-func sentElsewhere(ctx context.Context, db *sql.DB, norm string, recipientAliases []string, since time.Time) (bool, error) {
+// sentElsewhere reports whether `norm` already went to a chat outside
+// `same` (the recipient's JIDs and the account's own) since `since`.
+func sentElsewhere(ctx context.Context, db *sql.DB, norm string, same []string, since time.Time) (bool, error) {
 	rows, err := db.QueryContext(ctx,
 		`SELECT recipient_jid, COALESCE(content_text, '') FROM sends
 		 WHERE status IN ('confirmed', 'sent') AND send_type != 'reaction' AND confirmed_at >= ?`,
@@ -161,26 +230,33 @@ func sentElsewhere(ctx context.Context, db *sql.DB, norm string, recipientAliase
 		return false, fmt.Errorf("duplicate text check: %w", err)
 	}
 	defer rows.Close()
-	same := map[string]bool{}
-	for _, jid := range recipientAliases {
-		same[jid] = true
+	skip := map[string]bool{}
+	for _, jid := range same {
+		skip[jid] = true
 	}
 	for rows.Next() {
 		var jid, text string
 		if err := rows.Scan(&jid, &text); err != nil {
 			return false, err
 		}
-		if !same[jid] && normalizeSendText(text) == norm {
+		if !skip[jid] && normalizeSendText(text) == norm {
 			return true, nil
 		}
 	}
 	return false, rows.Err()
 }
 
-// normalizeSendText compares texts the way a reader would: case and spacing
-// do not make a message different.
+// normalizeSendText compares texts the way a reader would: case, spacing and
+// invisible characters (a zero-width space, a direction mark) do not make a
+// message different.
 func normalizeSendText(text string) string {
-	return strings.Join(strings.Fields(strings.ToLower(text)), " ")
+	visible := strings.Map(func(r rune) rune {
+		if unicode.Is(unicode.Cf, r) {
+			return -1
+		}
+		return r
+	}, text)
+	return strings.Join(strings.Fields(strings.ToLower(visible)), " ")
 }
 
 func isBroadcastJID(jid string) bool {
@@ -212,4 +288,29 @@ func openInWhatsAppURL(aliases []string, text string) string {
 		return link
 	}
 	return ""
+}
+
+func appendNew(list []string, more ...string) []string {
+	seen := map[string]bool{}
+	for _, item := range list {
+		seen[item] = true
+	}
+	for _, item := range more {
+		if item != "" && !seen[item] {
+			seen[item] = true
+			list = append(list, item)
+		}
+	}
+	return list
+}
+
+func overlaps(a, b []string) bool {
+	for _, x := range a {
+		for _, y := range b {
+			if x == y {
+				return true
+			}
+		}
+	}
+	return false
 }

@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 import time
 import unicodedata
@@ -150,10 +151,18 @@ mcp = FastMCP("whatsapp-mcp", lifespan=lifespan)
 # --- Audit ------------------------------------------------------------------
 
 
+_WA_ME_LINK = re.compile(r"https://wa\.me/\S+")
+
+
 def _audit(tool: str, params: dict[str, Any], result_summary: str, duration_ms: int, error: str | None = None) -> None:
     """Append a structured audit record. Redacts nothing at this layer; the bridge is expected to redact media blobs upstream."""
     if not AUDIT_LOG_ENABLED:
         return
+    if error:
+        # A refused send's error carries a wa.me link holding the number and
+        # the whole message, for the model to hand over. It has no place in a
+        # plaintext log.
+        error = _WA_ME_LINK.sub("[wa.me link]", error)
     try:
         Path(AUDIT_LOG_PATH).parent.mkdir(parents=True, exist_ok=True)
         entry = {

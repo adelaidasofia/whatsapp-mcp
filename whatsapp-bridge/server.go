@@ -407,7 +407,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		resp.DisconnectedSeconds = int64(down.Seconds())
 	}
 	resp.DailySendLimit = s.cfg.DailySendLimit
-	if n, err := countSendsSince(r.Context(), s.db, localMidnight(time.Now())); err == nil {
+	if n, err := countSendsSince(r.Context(), s.db, localMidnight(time.Now()), s.ownJIDs()); err == nil {
 		resp.SendsToday = n
 	}
 	writeJSON(w, http.StatusOK, resp)
