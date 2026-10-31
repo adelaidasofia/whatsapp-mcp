@@ -89,6 +89,10 @@ type Config struct {
 	// other send rules are enforced at confirm: see send_policy.go.
 	DailySendLimit int
 
+	// APIToken (WHATSAPP_API_TOKEN), when set, is required as a bearer token
+	// on every API request: see api_token.go. Never logged.
+	APIToken string
+
 	// ExitWithParent (WHATSAPP_EXIT_WITH_PARENT) shuts the bridge down when
 	// its stdin closes: set by an app that runs it, so the bridge never
 	// outlives the app. See parent_watch.go.
@@ -148,6 +152,7 @@ func LoadConfig() (*Config, error) {
 		DeviceName:              getenv("WHATSAPP_DEVICE_NAME", ""),
 		FullHistory:             getenvBool("WHATSAPP_FULL_HISTORY", false),
 		DailySendLimit:          getenvInt("WHATSAPP_DAILY_SEND_LIMIT", 10),
+		APIToken:                getenv("WHATSAPP_API_TOKEN", ""),
 		ExitWithParent:          getenvBool("WHATSAPP_EXIT_WITH_PARENT", false),
 	}
 

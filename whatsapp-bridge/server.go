@@ -31,7 +31,7 @@ func NewServer(cfg *Config, db *sql.DB, bridge *Bridge, backfiller *TranscriptBa
 	s := &Server{cfg: cfg, db: db, bridge: bridge, backfiller: backfiller, mux: http.NewServeMux()}
 	s.registerRoutes()
 	s.server = &http.Server{
-		Handler:           newOriginGuard(s.mux, cfg.AllowedOrigins),
+		Handler:           newOriginGuard(newTokenGuard(s.mux, cfg.APIToken), cfg.AllowedOrigins),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      60 * time.Second,

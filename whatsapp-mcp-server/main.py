@@ -49,6 +49,9 @@ BRIDGE_PORT_FILE = os.environ.get("WHATSAPP_BRIDGE_PORT_FILE", "").strip()
 # The app that runs the bridge for the member (e.g. "Mycelium"), so an
 # unreachable bridge is reported as that app's to fix, never as a terminal step.
 BRIDGE_SUPERVISOR = os.environ.get("WHATSAPP_BRIDGE_SUPERVISOR", "").strip()
+# The bridge's API token, when the app that runs it set one (the bridge then
+# refuses any request without it). Sent on every request; never logged.
+BRIDGE_TOKEN = os.environ.get("WHATSAPP_API_TOKEN", "").strip()
 
 
 def _bridge_port() -> int | None:
@@ -208,7 +211,8 @@ async def lifespan(_app: FastMCP):
     global _http
     # No base_url: every call names `_bridge_base()` itself, so the port is
     # read when the request is made (see BRIDGE_PORT_FILE).
-    _http = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=5.0))
+    headers = {"Authorization": f"Bearer {BRIDGE_TOKEN}"} if BRIDGE_TOKEN else {}
+    _http = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=5.0), headers=headers)
     try:
         # Preflight: confirm the Go bridge is reachable.
         try:
