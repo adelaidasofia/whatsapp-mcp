@@ -50,6 +50,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/auth/qr", s.handleAuthQR)
 	s.mux.HandleFunc("POST /api/auth/pair-phone", s.handlePairPhone)
 	s.mux.HandleFunc("POST /api/auth/reconnect", s.handleAuthReconnect)
+	s.mux.HandleFunc("POST /api/auth/logout", s.handleAuthLogout)
 
 	s.mux.HandleFunc("GET /api/chats", s.handleListChats)
 	s.mux.HandleFunc("GET /api/messages", s.handleListMessages)
@@ -480,6 +481,22 @@ func (s *Server) handleAuthReconnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"auth_state": string(snap.State)})
+}
+
+// handleAuthLogout unlinks this device from the member's WhatsApp, so it
+// leaves the phone's Linked devices list instead of lingering there after an
+// app's "Disconnect". whatsmeow deletes the local device row afterwards, so
+// this process then exits for a supervisor restart (exitIfDeviceDeleted).
+func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
+	if s.bridge.client.Store.ID == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"unlinked": false, "auth_state": string(s.bridge.AuthSnapshot().State)})
+		return
+	}
+	if err := s.bridge.client.Logout(r.Context()); err != nil {
+		writeJSON(w, http.StatusBadGateway, errorResponse{Error: "logout_failed", Details: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"unlinked": true})
 }
 
 type chatRow struct {
