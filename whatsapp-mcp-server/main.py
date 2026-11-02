@@ -214,7 +214,10 @@ async def lifespan(_app: FastMCP):
     # No base_url: every call names `_bridge_base()` itself, so the port is
     # read when the request is made (see BRIDGE_PORT_FILE).
     headers = {"Authorization": f"Bearer {BRIDGE_TOKEN}"} if BRIDGE_TOKEN else {}
-    _http = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=5.0), headers=headers)
+    # trust_env=False: the bridge is a local program. A proxy named in the environment
+    # would be shown every message on its way, and could answer for the bridge (a 503
+    # included) after the bridge had already sent it.
+    _http = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=5.0), headers=headers, trust_env=False)
     try:
         # Preflight: confirm the Go bridge is reachable.
         try:
@@ -946,13 +949,30 @@ async def send_message(recipient_jid: str, text: str) -> dict[str, Any]:
         raise
 
 
-# The statuses the bridge's confirm handler answers BEFORE it flips the draft or calls
-# WhatsApp: a bad request, a missing token, the send rules (403, 429), a draft that is
-# missing (404) or expired (410), a bridge that is not connected (503). Nothing was
-# sent. 409 (an earlier confirm may have sent the draft), 500 and 502 (the send itself
-# failed, which includes a timeout after WhatsApp took it) can follow a send, so they
-# keep raising, like a connection that fails.
-_REFUSED_BEFORE_SEND = frozenset({400, 401, 403, 404, 410, 429, 503})
+# The statuses the bridge's confirm handler answers, after it has read the draft and found
+# it unsent, BEFORE it flips the draft or calls WhatsApp: a bad request (400), the send
+# rules (403, 429), a draft that is missing (404) or expired (410). Nothing was sent by
+# that request. 401 (the token guard) and 503 (not connected) are answered before the
+# draft is read at all, so they say nothing about an earlier confirm of the same draft;
+# 409 (an earlier confirm may have sent it), 500 and 502 (the send itself failed,
+# which includes a timeout after WhatsApp took it) can follow a send. Those keep
+# raising, like a connection that fails.
+_REFUSED_BEFORE_SEND = frozenset({400, 403, 404, 410, 429})
+
+# Draft ids whose confirm was posted and has not been answered with a definite "nothing
+# was sent": the connection failed, or the bridge answered 409, 500, 502 or 503. The
+# message may have gone out, so a refusal answered to a LATER confirm of the same draft
+# (a retry after a restart, or one racing a slow upload) says only that the retry sent
+# nothing, and raises like any other failure. Bounded: drafts expire after an hour.
+_unresolved_confirms: dict[str, None] = {}
+_UNRESOLVED_CONFIRMS_MAX = 512
+
+
+def _note_unresolved_confirm(draft_id: str) -> None:
+    _unresolved_confirms.pop(draft_id, None)
+    _unresolved_confirms[draft_id] = None
+    while len(_unresolved_confirms) > _UNRESOLVED_CONFIRMS_MAX:
+        _unresolved_confirms.pop(next(iter(_unresolved_confirms)))
 
 
 @mcp.tool()
@@ -967,37 +987,44 @@ async def confirm_send(draft_id: str) -> dict[str, Any]:
     persisted into the local message database so it shows up in list_messages
     for the recipient chat.
 
-    When the bridge refuses the send before it starts, nothing was sent and the
-    answer says so: {"sent": false, "status": "refused", "draft_id": ..., "error":
-    "bridge <status>: ..."}. That covers:
+    When the bridge refuses the send before it starts, nothing was sent by this call
+    and the answer says so: {"sent": false, "status": "refused", "draft_id": ...,
+    "error": "bridge <status>: ..."}. That covers:
         404: draft not found
         410: draft expired (>1 hour since creation)
         403: the send rules refused it (no existing conversation, the same text
              already sent to another chat, or a broadcast/status/channel)
         429: the daily send limit is reached
-        503: the bridge is not connected to WhatsApp
-        400, 401: a bad request, or the bridge's token was refused
+        400: a bad request
 
     Errors (raised, because the message may have gone out):
         409: draft already confirmed/sent/failed (each draft can only be confirmed once)
         500, 502: the send failed at the whatsmeow layer, or the bridge failed mid-way
+        401, 503: the bridge's token was refused, or it is not connected to WhatsApp
         a connection that reset or timed out after the request was sent
+    If a confirm of a draft raised, do not confirm it again: check the chat first. A
+    later refusal for that draft is raised too, because the first call may have sent it.
     """
     start = time.time()
+    retried = False
     try:
         scope = _chat_scope()
         if scope is not None and draft_id not in _scoped_drafts:
             raise RuntimeError("That draft was made in another workspace, so it cannot be sent from this one.")
         if scope is not None and not _family_allowed(scope, _scoped_drafts[draft_id]):
             raise RuntimeError(OUT_OF_SCOPE)
+        retried = draft_id in _unresolved_confirms
+        _note_unresolved_confirm(draft_id)
         result = await _bridge_post(f"/api/sends/{draft_id}/confirm", {})
+        _unresolved_confirms.pop(draft_id, None)
         _audit("confirm_send", {"draft_id": draft_id},
                f"status={result.get('status')} whatsapp_id={result.get('whatsapp_message_id')}",
                int((time.time() - start) * 1000))
         return result
     except BridgeError as e:
         elapsed = int((time.time() - start) * 1000)
-        if e.status_code in _REFUSED_BEFORE_SEND:
+        if e.status_code in _REFUSED_BEFORE_SEND and not retried:
+            _unresolved_confirms.pop(draft_id, None)
             _audit("confirm_send", {"draft_id": draft_id}, "refused", elapsed, error=str(e))
             return {"sent": False, "status": "refused", "draft_id": draft_id, "error": str(e)}
         _audit("confirm_send", {"draft_id": draft_id}, "failed", elapsed, error=str(e))
