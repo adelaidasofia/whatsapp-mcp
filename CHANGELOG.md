@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- **`confirm_send` answers a send the bridge refused as data, and keeps raising when the message may have gone out.** A refusal that comes before the send starts (`400`, `401`, `403`, `404`, `410`, `429`, `503`: the send rules, the daily limit, a draft that is missing or expired, a bridge that is not connected) now returns `{"sent": false, "status": "refused", "draft_id": ..., "error": "bridge <status>: ..."}` instead of raising, and the by-hand link stays in `error`. `409`, `500`, `502`, and a connection that resets or times out after the request was sent, still raise: the message may have gone out in each, and an app that told a person "not sent" would have them send it twice. An app reading the result can now tell "not sent" from "could not be confirmed".
+
 ## [0.6.0] - 2026-10-31
 
 ### Changed
