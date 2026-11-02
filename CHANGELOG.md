@@ -12,6 +12,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **An edit changes the message it names instead of adding a row.** An edit used to be stored as a new message under its own id, so a later delete-for-everyone of the original left the edited text behind. Now it updates the original (`is_edited = 1`), live or from history, only when it comes from the message's own author in its own chat. An edit of a message the bridge has not stored is dropped: it cannot be checked against its author, and history delivers the message with its last text. Edits stored before this version stay separate rows (they name no message).
 - **A chat's preview is read back from its newest remaining message** after a delete or an edit, so `/api/chats` never shows a deleted message, including a preview history sync wrote without naming its message. In a broadcast chat (status), a live revoke must come from the status's own sender.
 
+### Changed
+
+- **`confirm_send` answers a send the bridge refused as data, and keeps raising when the message may have gone out.** A refusal that comes before the send starts (`400`, `401`, `403`, `404`, `410`, `429`, `503`: the send rules, the daily limit, a draft that is missing or expired, a bridge that is not connected) now returns `{"sent": false, "status": "refused", "draft_id": ..., "error": "bridge <status>: ..."}` instead of raising, and the by-hand link stays in `error`. `409`, `500`, `502`, and a connection that resets or times out after the request was sent, still raise: the message may have gone out in each, and an app that told a person "not sent" would have them send it twice. An app reading the result can now tell "not sent" from "could not be confirmed".
+
 ## [0.6.0] - 2026-10-31
 
 ### Changed

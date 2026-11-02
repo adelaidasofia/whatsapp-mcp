@@ -394,7 +394,19 @@ def lookup_crm_context(phone: str | None, display_name: str | None) -> CRMContex
 # --- Tool implementations (v0.1.0 stubs, real wiring in commit 2) -----------
 
 
-def _bridge_error(e: httpx.HTTPStatusError) -> RuntimeError:
+class BridgeError(RuntimeError):
+    """A failure the bridge itself answered, with the HTTP status it used.
+
+    A connection that failed (reset, timed out, refused) is a plain RuntimeError
+    from `_transport_error`: no answer came back, so nothing says what happened.
+    """
+
+    def __init__(self, message: str, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _bridge_error(e: httpx.HTTPStatusError) -> BridgeError:
     """Surface the Go bridge's structured errorResponse to the model.
 
     The bridge writes {"error": ..., "details": ...} on every failure;
@@ -420,7 +432,7 @@ def _bridge_error(e: httpx.HTTPStatusError) -> RuntimeError:
         msg += f" — {details}"
     if open_link:
         msg += f" Give the person this link to send it themselves: {open_link}"
-    return RuntimeError(msg)
+    return BridgeError(msg, e.response.status_code)
 
 
 def _bridge_unreachable(e: Exception) -> RuntimeError:
@@ -934,6 +946,15 @@ async def send_message(recipient_jid: str, text: str) -> dict[str, Any]:
         raise
 
 
+# The statuses the bridge's confirm handler answers BEFORE it flips the draft or calls
+# WhatsApp: a bad request, a missing token, the send rules (403, 429), a draft that is
+# missing (404) or expired (410), a bridge that is not connected (503). Nothing was
+# sent. 409 (an earlier confirm may have sent the draft), 500 and 502 (the send itself
+# failed, which includes a timeout after WhatsApp took it) can follow a send, so they
+# keep raising, like a connection that fails.
+_REFUSED_BEFORE_SEND = frozenset({400, 401, 403, 404, 410, 429, 503})
+
+
 @mcp.tool()
 async def confirm_send(draft_id: str) -> dict[str, Any]:
     """Commit a previously-drafted send. This is where the actual WhatsApp network
@@ -946,14 +967,21 @@ async def confirm_send(draft_id: str) -> dict[str, Any]:
     persisted into the local message database so it shows up in list_messages
     for the recipient chat.
 
-    Errors:
+    When the bridge refuses the send before it starts, nothing was sent and the
+    answer says so: {"sent": false, "status": "refused", "draft_id": ..., "error":
+    "bridge <status>: ..."}. That covers:
         404: draft not found
-        409: draft already confirmed/sent/failed (each draft can only be confirmed once)
         410: draft expired (>1 hour since creation)
         403: the send rules refused it (no existing conversation, the same text
              already sent to another chat, or a broadcast/status/channel)
         429: the daily send limit is reached
-        502: send failed at whatsmeow layer (bridge disconnected, invalid recipient, etc.)
+        503: the bridge is not connected to WhatsApp
+        400, 401: a bad request, or the bridge's token was refused
+
+    Errors (raised, because the message may have gone out):
+        409: draft already confirmed/sent/failed (each draft can only be confirmed once)
+        500, 502: the send failed at the whatsmeow layer, or the bridge failed mid-way
+        a connection that reset or timed out after the request was sent
     """
     start = time.time()
     try:
@@ -967,6 +995,13 @@ async def confirm_send(draft_id: str) -> dict[str, Any]:
                f"status={result.get('status')} whatsapp_id={result.get('whatsapp_message_id')}",
                int((time.time() - start) * 1000))
         return result
+    except BridgeError as e:
+        elapsed = int((time.time() - start) * 1000)
+        if e.status_code in _REFUSED_BEFORE_SEND:
+            _audit("confirm_send", {"draft_id": draft_id}, "refused", elapsed, error=str(e))
+            return {"sent": False, "status": "refused", "draft_id": draft_id, "error": str(e)}
+        _audit("confirm_send", {"draft_id": draft_id}, "failed", elapsed, error=str(e))
+        raise
     except Exception as e:  # noqa: BLE001
         _audit("confirm_send", {"draft_id": draft_id}, "failed", int((time.time() - start) * 1000), error=str(e))
         raise
