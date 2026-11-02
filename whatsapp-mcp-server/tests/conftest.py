@@ -17,3 +17,11 @@ import main
 def _no_real_audit_log(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "AUDIT_LOG_ENABLED", False)
     monkeypatch.setattr(main, "AUDIT_LOG_PATH", str(tmp_path / "audit.log"))
+
+
+@pytest.fixture(autouse=True)
+def _no_unanswered_confirms_from_an_earlier_test():
+    """confirm_send remembers drafts whose confirm raised; that must not cross tests."""
+    main._unresolved_confirms.clear()
+    yield
+    main._unresolved_confirms.clear()
