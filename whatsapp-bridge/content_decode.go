@@ -74,13 +74,7 @@ func unwrapEnvelope(m *waE2E.Message) *waE2E.Message {
 			inner = m.GetProtocolMessage().GetEditedMessage()
 		}
 		if inner == nil {
-			m.ProtoReflect().Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
-				if fd.IsList() || fd.Message() == nil || fd.Message().FullName() != futureProofName {
-					return true
-				}
-				inner = v.Message().Interface().(*waE2E.FutureProofMessage).GetMessage()
-				return inner == nil
-			})
+			inner = futureProofInner(m)
 		}
 		if inner == nil {
 			return m
@@ -88,6 +82,40 @@ func unwrapEnvelope(m *waE2E.Message) *waE2E.Message {
 		m = inner
 	}
 	return m
+}
+
+// futureProofInner returns the message a FutureProofMessage field of m wraps,
+// or nil when m has none.
+func futureProofInner(m *waE2E.Message) *waE2E.Message {
+	var inner *waE2E.Message
+	m.ProtoReflect().Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
+		if fd.IsList() || fd.Message() == nil || fd.Message().FullName() != futureProofName {
+			return true
+		}
+		inner = v.Message().Interface().(*waE2E.FutureProofMessage).GetMessage()
+		return inner == nil
+	})
+	return inner
+}
+
+// editedMessageID returns the id of the message an edit replaces, or "" when m
+// is not an edit. It walks the same envelopes as unwrapEnvelope and stops at
+// the protocol message that carries the edit, whose Key names the original.
+func editedMessageID(m *waE2E.Message) string {
+	for depth := 0; m != nil && depth < maxUnwrapDepth; depth++ {
+		if pm := m.GetProtocolMessage(); pm.GetEditedMessage() != nil {
+			return pm.GetKey().GetID()
+		}
+		inner := m.GetDeviceSentMessage().GetMessage()
+		if inner == nil {
+			inner = futureProofInner(m)
+		}
+		if inner == nil {
+			return ""
+		}
+		m = inner
+	}
+	return ""
 }
 
 // decodeExtraContent handles content types the main switch does not, returning

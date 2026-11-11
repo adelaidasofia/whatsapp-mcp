@@ -39,6 +39,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"time"
 
 	"go.mau.fi/whatsmeow"
@@ -100,6 +101,11 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 			if wm == nil {
 				continue
 			}
+			// Edits and revokes are about another message, never the chat's
+			// newest words.
+			if revokedHistoryID(wm) != "" || editedMessageID(wm.GetMessage()) != "" {
+				continue
+			}
 			if ts := int64(wm.GetMessageTimestamp()); ts >= convMaxTS {
 				convMaxTS = ts
 				c, _ := extractContentFromProto(wm.GetMessage())
@@ -131,6 +137,11 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 		// it the walk would re-request the same window forever.
 		var oldest chunkAnchor
 
+		// Edits and revokes name another message, which may come later in the
+		// same chunk (history is not listed oldest first). They are applied
+		// after every message of the chunk is stored, oldest first.
+		var later []historyChange
+
 		for _, hsMsg := range msgs {
 
 			scanned++
@@ -143,9 +154,37 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 				continue
 			}
 
-			content, msgType := extractContentFromProto(wm.GetMessage())
 			ts := int64(wm.GetMessageTimestamp())
 			fromMe := key.GetFromMe()
+
+			// Extend the chunk's backward anchor to this message if it is the
+			// oldest seen so far (see the `oldest` declaration above). Before
+			// the revoke and tombstone skips below, so a chunk whose oldest
+			// entry is a deleted message still moves the walk back.
+			if ts > 0 && (oldest.TS == 0 || ts < oldest.TS) {
+				oldest = chunkAnchor{ID: key.GetID(), TS: ts, FromMe: fromMe}
+			}
+
+			// A message history says was deleted for everyone, or a revoke
+			// history carries, clears the message and is stored as nothing
+			// else (tickets#5656, revoke.go).
+			if target := revokedHistoryID(wm); target != "" {
+				later = append(later, historyChange{revoke: true, target: target, fromMe: fromMe, ts: ts})
+				continue
+			}
+
+			// An edit in history changes the message it names and is stored as
+			// nothing else, as on live receive.
+			if target := editedMessageID(wm.GetMessage()); target != "" && target != key.GetID() {
+				later = append(later, historyChange{target: target, fromMe: fromMe, editor: key.GetParticipant(), ts: ts, msg: wm.GetMessage()})
+				continue
+			}
+
+			if b.landsOnTombstone(key.GetID(), chatJID, chatTypeFromJIDString(chatJID) == "group", fromMe) {
+				continue
+			}
+
+			content, msgType := extractContentFromProto(wm.GetMessage())
 
 			senderJID := chatJID
 			switch {
@@ -185,12 +224,6 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 				inserted += int(n)
 			}
 
-			// Extend the chunk's backward anchor to this message if it is the
-			// oldest seen so far (see the `oldest` declaration above).
-			if ts > 0 && (oldest.TS == 0 || ts < oldest.TS) {
-				oldest = chunkAnchor{ID: key.GetID(), TS: ts, FromMe: fromMe}
-			}
-
 			// Re-decode rows the pre-MYC-3284 decoder stored empty. Runs BEFORE
 			// the media branch and must not share its `continue`: a recoverable
 			// row is usually not media-bearing at all — the common case is text
@@ -222,6 +255,7 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 				       media_mime           = COALESCE(media_mime, ?)
 				 WHERE id = ?
 				   AND media_key IS NULL
+				   AND is_deleted = 0
 			`,
 				fields.MediaKey, fields.MediaDirectPath, fields.MediaURL,
 				fields.MediaEncSHA, fields.MediaSHA, fields.MediaFileLength,
@@ -234,6 +268,8 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 			n, _ := ures.RowsAffected()
 			updated += int(n)
 		}
+
+		b.applyHistoryChanges(chatJID, later)
 
 		// Decide whether this chat keeps walking backwards. Every stop
 		// condition lives in the walker, so delivery just reports where the
@@ -454,6 +490,7 @@ func (b *Bridge) backfillDecodedContent(msgID string, m *waE2E.Message) (int, er
 		       raw_type           = ?
 		 WHERE id = ?
 		   AND type = 'system'
+		   AND is_deleted = 0
 		   AND (content_text IS NULL OR content_text = ''
 		        OR (content_text LIKE '[unsupported: %' AND ? <> 'system'))
 	`, msgType, text, Normalize(text), scrubbed, ScrubFlagsJSON(flags), rawTypeNullable(msgType, text), msgID, msgType)
@@ -470,7 +507,7 @@ func (b *Bridge) CountEmptySystemRows(ctx context.Context) (int, error) {
 	var n int
 	err := b.db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM messages
-		 WHERE type = 'system' AND (content_text IS NULL OR content_text = '')
+		 WHERE type = 'system' AND is_deleted = 0 AND (content_text IS NULL OR content_text = '')
 	`).Scan(&n)
 	return n, err
 }
@@ -580,7 +617,7 @@ func (b *Bridge) decodeBackfillTargets(ctx context.Context, opts DecodeBackfillO
 		if err := b.db.QueryRowContext(ctx, `
 			SELECT COUNT(*) FROM messages
 			 WHERE chat_jid = ?
-			   AND type = 'system' AND (content_text IS NULL OR content_text = '')
+			   AND type = 'system' AND is_deleted = 0 AND (content_text IS NULL OR content_text = '')
 		`, opts.ChatJID).Scan(&n); err != nil {
 			return nil, fmt.Errorf("count empty rows for %s: %w", opts.ChatJID, err)
 		}
@@ -593,7 +630,7 @@ func (b *Bridge) decodeBackfillTargets(ctx context.Context, opts DecodeBackfillO
 	rows, err := b.db.QueryContext(ctx, `
 		SELECT chat_jid, COUNT(*) AS n
 		  FROM messages
-		 WHERE type = 'system' AND (content_text IS NULL OR content_text = '')
+		 WHERE type = 'system' AND is_deleted = 0 AND (content_text IS NULL OR content_text = '')
 		   AND chat_jid <> 'status@broadcast'
 		 GROUP BY chat_jid
 		 ORDER BY n DESC
@@ -617,4 +654,34 @@ func (b *Bridge) decodeBackfillTargets(ctx context.Context, opts DecodeBackfillO
 		return nil, fmt.Errorf("iterate affected chats: %w", err)
 	}
 	return targets, nil
+}
+
+// historyChange is an edit or a revoke found in a history chunk, applied once
+// the chunk's messages are stored (see processHistorySyncEvent).
+type historyChange struct {
+	revoke bool
+	target string
+	fromMe bool
+	editor string // the key's participant: who wrote it, in a group
+	ts     int64
+	msg    *waE2E.Message
+}
+
+// applyHistoryChanges applies a chunk's edits and revokes, oldest first, so an
+// edit lands before a revoke that came after it and each finds its message.
+func (b *Bridge) applyHistoryChanges(chatJID string, changes []historyChange) {
+	sort.SliceStable(changes, func(i, j int) bool { return changes[i].ts < changes[j].ts })
+	isGroup := chatTypeFromJIDString(chatJID) == "group"
+	for _, c := range changes {
+		if c.revoke {
+			b.applyRevoke(chatJID, isGroup, c.fromMe, "", c.target, c.ts)
+			continue
+		}
+		// In a group only the author's own edit counts, and a key that does not
+		// say who wrote it cannot be checked.
+		if isGroup && !c.fromMe && c.editor == "" {
+			continue
+		}
+		b.applyEdit(chatJID, isGroup, c.fromMe, c.editor, c.target, c.msg)
+	}
 }

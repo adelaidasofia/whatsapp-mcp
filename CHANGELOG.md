@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **A message deleted "for everyone" is gone from the bridge.** A revoke used to be stored as an `[unsupported: protocolMessage]` row of its own while the message it took back kept its text, transcript and media, and `/api/messages` and the vault export kept serving it (mycelium-hq/tickets#5656). Now a revoke, live or from history sync (a revoke stub), clears the message's text, its normalized and scrubbed copies, its transcript, its media keys and any file downloaded for it, and sets `is_deleted`. `/api/messages`, the vault export, media download and the transcriber skip deleted rows. The chat's `last_message_time` moves to the revoke, so the vault export rewrites that chat's file without the message and apps that watch the chat list read it again. A revoke must name a message in the same chat; in a direct chat only the message's own sender's revoke counts. A revoke that arrives before its message leaves a tombstone, so the message is never written later. Revokes stored before this version named no message and cannot be applied backwards.
+- **An edit changes the message it names instead of adding a row.** An edit used to be stored as a new message under its own id, so a later delete-for-everyone of the original left the edited text behind. Now it updates the original (`is_edited = 1`), live or from history, only when it comes from the message's own author in its own chat. An edit of a message the bridge has not stored is dropped: it cannot be checked against its author, and history delivers the message with its last text. Edits stored before this version stay separate rows (they name no message).
+- **A chat's preview is read back from its newest remaining message** after a delete or an edit, so `/api/chats` never shows a deleted message, including a preview history sync wrote without naming its message. In a broadcast chat (status), a live revoke must come from the status's own sender.
+
 ## [0.6.0] - 2026-10-31
 
 ### Changed

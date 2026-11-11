@@ -222,6 +222,7 @@ func (b *Bridge) hasEmptyRowsOlderThan(ctx context.Context, chatJID string, ts i
 			 WHERE chat_jid = ?
 			   AND timestamp < ?
 			   AND type = 'system'
+			   AND is_deleted = 0
 			   AND (content_text IS NULL OR content_text = '')
 		)
 	`, chatJID, ts).Scan(&n)
