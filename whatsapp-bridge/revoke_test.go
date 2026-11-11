@@ -437,3 +437,25 @@ func TestAnEditInHistoryLandsOnItsMessage(t *testing.T) {
 		t.Fatalf("the edited text goes with the delete")
 	}
 }
+
+func TestAHistoryChunkListedNewestFirstAppliesItsEditAndRevoke(t *testing.T) {
+	b, db, _ := revokeBridge(t)
+	chat := revokeClient.String()
+	b.processHistorySyncEvent(historyOf(chat,
+		&waWeb.WebMessageInfo{Key: revokeKey("E2", false), Message: editFrom(revokeClient, revokeMe, "M2", "editado"), MessageTimestamp: proto.Uint64(1_790_000_040)},
+		&waWeb.WebMessageInfo{Key: revokeKey("E1", false), Message: editFrom(revokeClient, revokeMe, "M1", "también editado"), MessageTimestamp: proto.Uint64(1_790_000_030)},
+		&waWeb.WebMessageInfo{Key: revokeKey("M2", false), Message: &waE2E.Message{Conversation: proto.String("segundo")}, MessageTimestamp: proto.Uint64(1_790_000_010)},
+		&waWeb.WebMessageInfo{Key: revokeKey("M1", false), Message: &waE2E.Message{Conversation: proto.String("primero")}, MessageTimestamp: proto.Uint64(1_790_000_000)},
+	))
+	if r, _ := readRow(t, db, "M2"); r.content.String != "editado" {
+		t.Fatalf("an edit listed before its message still lands on it: %+v", r)
+	}
+	b.processHistorySyncEvent(historyOf(chat,
+		&waWeb.WebMessageInfo{Key: revokeKey("R1", false), Message: revokeFrom(revokeClient, revokeMe, types.EmptyJID, "M1"), MessageTimestamp: proto.Uint64(1_790_000_050)},
+	))
+	assertCleared(t, db, "M1")
+	body := listMessages(t, db, chat)
+	if strings.Contains(body, "primero") || strings.Contains(body, "también editado") || !strings.Contains(body, "editado") {
+		t.Fatalf("the edited message stays, the deleted one is gone: %s", body)
+	}
+}

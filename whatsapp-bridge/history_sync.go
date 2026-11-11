@@ -39,6 +39,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"time"
 
 	"go.mau.fi/whatsmeow"
@@ -100,6 +101,11 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 			if wm == nil {
 				continue
 			}
+			// Edits and revokes are about another message, never the chat's
+			// newest words.
+			if revokedHistoryID(wm) != "" || editedMessageID(wm.GetMessage()) != "" {
+				continue
+			}
 			if ts := int64(wm.GetMessageTimestamp()); ts >= convMaxTS {
 				convMaxTS = ts
 				c, _ := extractContentFromProto(wm.GetMessage())
@@ -131,6 +137,11 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 		// it the walk would re-request the same window forever.
 		var oldest chunkAnchor
 
+		// Edits and revokes name another message, which may come later in the
+		// same chunk (history is not listed oldest first). They are applied
+		// after every message of the chunk is stored, oldest first.
+		var later []historyChange
+
 		for _, hsMsg := range msgs {
 
 			scanned++
@@ -158,18 +169,14 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 			// history carries, clears the message and is stored as nothing
 			// else (tickets#5656, revoke.go).
 			if target := revokedHistoryID(wm); target != "" {
-				b.applyRevoke(chatJID, chatTypeFromJIDString(chatJID) == "group", fromMe, "", target, ts)
+				later = append(later, historyChange{revoke: true, target: target, fromMe: fromMe, ts: ts})
 				continue
 			}
 
 			// An edit in history changes the message it names and is stored as
 			// nothing else, as on live receive.
 			if target := editedMessageID(wm.GetMessage()); target != "" && target != key.GetID() {
-				editor := ""
-				if !fromMe && key.GetParticipant() != "" {
-					editor = key.GetParticipant()
-				}
-				b.applyEdit(chatJID, chatTypeFromJIDString(chatJID) == "group", fromMe, editor, target, wm.GetMessage())
+				later = append(later, historyChange{target: target, fromMe: fromMe, editor: key.GetParticipant(), ts: ts, msg: wm.GetMessage()})
 				continue
 			}
 
@@ -261,6 +268,8 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 			n, _ := ures.RowsAffected()
 			updated += int(n)
 		}
+
+		b.applyHistoryChanges(chatJID, later)
 
 		// Decide whether this chat keeps walking backwards. Every stop
 		// condition lives in the walker, so delivery just reports where the
@@ -645,4 +654,34 @@ func (b *Bridge) decodeBackfillTargets(ctx context.Context, opts DecodeBackfillO
 		return nil, fmt.Errorf("iterate affected chats: %w", err)
 	}
 	return targets, nil
+}
+
+// historyChange is an edit or a revoke found in a history chunk, applied once
+// the chunk's messages are stored (see processHistorySyncEvent).
+type historyChange struct {
+	revoke bool
+	target string
+	fromMe bool
+	editor string // the key's participant: who wrote it, in a group
+	ts     int64
+	msg    *waE2E.Message
+}
+
+// applyHistoryChanges applies a chunk's edits and revokes, oldest first, so an
+// edit lands before a revoke that came after it and each finds its message.
+func (b *Bridge) applyHistoryChanges(chatJID string, changes []historyChange) {
+	sort.SliceStable(changes, func(i, j int) bool { return changes[i].ts < changes[j].ts })
+	isGroup := chatTypeFromJIDString(chatJID) == "group"
+	for _, c := range changes {
+		if c.revoke {
+			b.applyRevoke(chatJID, isGroup, c.fromMe, "", c.target, c.ts)
+			continue
+		}
+		// In a group only the author's own edit counts, and a key that does not
+		// say who wrote it cannot be checked.
+		if isGroup && !c.fromMe && c.editor == "" {
+			continue
+		}
+		b.applyEdit(chatJID, isGroup, c.fromMe, c.editor, c.target, c.msg)
+	}
 }
