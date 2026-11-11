@@ -403,3 +403,37 @@ func TestAStatusCanOnlyBeDeletedByItsOwnSender(t *testing.T) {
 	receive(b, status, revokeOther, false, "R2", 1_790_000_040, revokeFrom(revokeOther, status, types.EmptyJID, "S1"))
 	assertCleared(t, db, "S1")
 }
+
+func TestAnEditOfAMessageNotStoredYetIsDropped(t *testing.T) {
+	b, db, _ := revokeBridge(t)
+	// The client sends an "edit" naming my message M1 before M1 is stored.
+	receive(b, revokeClient, revokeClient, false, "E1", 1_790_000_030, editFrom(revokeClient, revokeMe, "M1", "texto ajeno"))
+	if _, ok := readRow(t, db, "M1"); ok {
+		t.Fatalf("an edit of a message not stored writes nothing")
+	}
+	receive(b, revokeClient, revokeMe, true, "M1", 1_790_000_000, &waE2E.Message{Conversation: proto.String("lo que yo escribí")})
+	if r, _ := readRow(t, db, "M1"); r.content.String != "lo que yo escribí" {
+		t.Fatalf("my message is stored as I wrote it: %+v", r)
+	}
+}
+
+func TestAnEditInHistoryLandsOnItsMessage(t *testing.T) {
+	b, db, _ := revokeBridge(t)
+	chat := revokeClient.String()
+	receive(b, revokeClient, revokeClient, false, "M1", 1_790_000_000, &waE2E.Message{Conversation: proto.String("primera")})
+	b.processHistorySyncEvent(historyOf(chat, &waWeb.WebMessageInfo{
+		Key:              revokeKey("E1", false),
+		Message:          editFrom(revokeClient, revokeMe, "M1", "editada en historia"),
+		MessageTimestamp: proto.Uint64(1_790_000_030),
+	}))
+	if r, _ := readRow(t, db, "M1"); r.content.String != "editada en historia" {
+		t.Fatalf("a history edit changes its message: %+v", r)
+	}
+	if _, ok := readRow(t, db, "E1"); ok {
+		t.Fatalf("a history edit is not a message of its own")
+	}
+	receive(b, revokeClient, revokeClient, false, "R1", 1_790_000_060, revokeFrom(revokeClient, revokeMe, types.EmptyJID, "M1"))
+	if strings.Contains(listMessages(t, db, chat), "editada") {
+		t.Fatalf("the edited text goes with the delete")
+	}
+}

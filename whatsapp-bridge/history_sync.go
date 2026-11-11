@@ -162,6 +162,17 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 				continue
 			}
 
+			// An edit in history changes the message it names and is stored as
+			// nothing else, as on live receive.
+			if target := editedMessageID(wm.GetMessage()); target != "" && target != key.GetID() {
+				editor := ""
+				if !fromMe && key.GetParticipant() != "" {
+					editor = key.GetParticipant()
+				}
+				b.applyEdit(chatJID, chatTypeFromJIDString(chatJID) == "group", fromMe, editor, target, wm.GetMessage())
+				continue
+			}
+
 			if b.landsOnTombstone(key.GetID(), chatJID, chatTypeFromJIDString(chatJID) == "group", fromMe) {
 				continue
 			}

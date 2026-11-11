@@ -42,7 +42,6 @@ import (
 
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waWeb"
-	"go.mau.fi/whatsmeow/types/events"
 )
 
 // revokedMessageID returns the id of the message a live message revokes, or ""
@@ -202,9 +201,11 @@ func (b *Bridge) refreshChatPreview(chatJID string) {
 
 // applyEdit writes an edit onto the message it names, which must be in the
 // same chat and from the same sender (only a message's author can edit it).
-// Returns false when the original is not stored, so the caller stores the edit
-// under the original's id; true when the edit was applied or refused.
-func (b *Bridge) applyEdit(chatJID string, isGroup, editorFromMe bool, editorJID, targetID string, evt *events.Message) bool {
+// An edit of a message the bridge has not stored is dropped: it could not be
+// checked against its author, and the message itself, when history delivers
+// it, already carries its last text. editorJID is "" when history reports the
+// edit (its key's side is still checked). Returns whether the edit was applied.
+func (b *Bridge) applyEdit(chatJID string, isGroup, editorFromMe bool, editorJID, targetID string, m *waE2E.Message) bool {
 	var (
 		storedChat string
 		fromMe     int
@@ -218,19 +219,17 @@ func (b *Bridge) applyEdit(chatJID string, isGroup, editorFromMe bool, editorJID
 	}
 	if err != nil {
 		log.Printf("edit: lookup failed: %v", err)
-		return true
+		return false
 	}
 	if deleted == 1 {
-		// Deleted already: the edit writes nothing, unless the tombstone is not
-		// this message's (then it is dropped and the edit is stored).
-		return b.landsOnTombstone(targetID, chatJID, isGroup, editorFromMe)
+		return false
 	}
 	if !b.sameChat(chatJID, storedChat) || (fromMe == 1) != editorFromMe ||
-		(!editorFromMe && chatTypeFromJIDString(chatJID) != "direct" && !b.sameChat(editorJID, sender.String)) {
+		(!editorFromMe && editorJID != "" && chatTypeFromJIDString(chatJID) != "direct" && !b.sameChat(editorJID, sender.String)) {
 		log.Printf("edit: ignored, only a message's author can edit it, in its own chat")
-		return true
+		return false
 	}
-	content, msgType := extractContent(evt)
+	content, msgType := extractContentFromProto(m)
 	scrubbed, flags := Scrub(content)
 	if _, err := b.db.Exec(`
 		UPDATE messages
@@ -239,7 +238,7 @@ func (b *Bridge) applyEdit(chatJID string, isGroup, editorFromMe bool, editorJID
 		 WHERE id = ? AND is_deleted = 0
 	`, content, Normalize(content), scrubbed, ScrubFlagsJSON(flags), rawTypeNullable(msgType, content), targetID); err != nil {
 		log.Printf("edit: update failed: %v", err)
-		return true
+		return false
 	}
 	b.refreshChatPreview(storedChat)
 	return true

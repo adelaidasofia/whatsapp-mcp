@@ -365,13 +365,10 @@ func (b *Bridge) onMessage(evt *events.Message) {
 		return
 	}
 	// An edit changes the message it names, so a later revoke of that message
-	// clears the edited text too. One the bridge has not stored yet is kept
-	// under the original's id, for the same reason (revoke.go).
+	// clears the edited text too, and stores nothing of its own (revoke.go).
 	if target := editedMessageID(evt.Message); target != "" && target != id {
-		if b.applyEdit(chatJID, evt.Info.IsGroup, evt.Info.IsFromMe, senderJID, target, evt) {
-			return
-		}
-		id = target
+		b.applyEdit(chatJID, evt.Info.IsGroup, evt.Info.IsFromMe, senderJID, target, evt.Message)
+		return
 	}
 	// A message deleted for everyone before it reached the bridge arrives to a
 	// tombstone: nothing of it is written, not even the chat's preview.
