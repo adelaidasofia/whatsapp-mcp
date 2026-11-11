@@ -42,6 +42,7 @@ import (
 
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waWeb"
+	"go.mau.fi/whatsmeow/types/events"
 )
 
 // revokedMessageID returns the id of the message a live message revokes, or ""
@@ -73,8 +74,12 @@ func revokedHistoryID(wm *waWeb.WebMessageInfo) string {
 // ours is ignored. In a group an admin can delete anyone's message, so any
 // revoke in the chat counts.
 //
+// In a broadcast chat (status, a list) the chat is shared by every contact, so
+// a live revoke must also come from the message's own sender. revokerJID is ""
+// for history, which reports a deletion rather than asking for one.
+//
 // Returns whether a stored message was cleared.
-func (b *Bridge) applyRevoke(chatJID string, isGroup, revokerFromMe bool, targetID string, ts int64) bool {
+func (b *Bridge) applyRevoke(chatJID string, isGroup, revokerFromMe bool, revokerJID, targetID string, ts int64) bool {
 	if targetID == "" || chatJID == "" {
 		return false
 	}
@@ -83,11 +88,16 @@ func (b *Bridge) applyRevoke(chatJID string, isGroup, revokerFromMe bool, target
 		fromMe     int
 		deleted    int
 		mediaPath  sql.NullString
+		sender     sql.NullString
 	)
-	err := b.db.QueryRow(`SELECT chat_jid, is_from_me, is_deleted, media_path FROM messages WHERE id = ?`, targetID).
-		Scan(&storedChat, &fromMe, &deleted, &mediaPath)
+	broadcast := chatTypeFromJIDString(chatJID) == "broadcast"
+	err := b.db.QueryRow(`SELECT chat_jid, is_from_me, is_deleted, media_path, sender_jid FROM messages WHERE id = ?`, targetID).
+		Scan(&storedChat, &fromMe, &deleted, &mediaPath, &sender)
 	if errors.Is(err, sql.ErrNoRows) {
-		b.storeRevokeTombstone(chatJID, revokerFromMe, targetID, ts)
+		// A broadcast tombstone could not be checked against its sender later.
+		if !broadcast {
+			b.storeRevokeTombstone(chatJID, revokerFromMe, targetID, ts)
+		}
 		return false
 	}
 	if err != nil {
@@ -103,6 +113,10 @@ func (b *Bridge) applyRevoke(chatJID string, isGroup, revokerFromMe bool, target
 	}
 	if !isGroup && (fromMe == 1) != revokerFromMe {
 		log.Printf("revoke: ignored, a direct chat's message can only be taken back by its sender")
+		return false
+	}
+	if broadcast && revokerJID != "" && !revokerFromMe && !b.sameChat(revokerJID, sender.String) {
+		log.Printf("revoke: ignored, a broadcast message can only be taken back by its sender")
 		return false
 	}
 
@@ -143,18 +157,91 @@ func (b *Bridge) applyRevoke(chatJID string, isGroup, revokerFromMe bool, target
 	}
 	b.removeMediaFile(mediaPath)
 
-	// The deletion is the chat's newest activity, never an older one, and the
-	// preview stops showing the message when it was the last one.
+	// The deletion is the chat's newest activity, never an older one.
 	if _, err := b.db.Exec(`
 		UPDATE chats
 		   SET last_message_time = MAX(COALESCE(last_message_time, 0), ?),
-		       last_message_preview = CASE WHEN last_message_id = ? THEN NULL ELSE last_message_preview END,
 		       updated_at = ?
 		 WHERE jid = ?
-	`, ts, targetID, time.Now().Unix(), storedChat); err != nil {
+	`, ts, time.Now().Unix(), storedChat); err != nil {
 		log.Printf("revoke: chat update failed: %v", err)
 	}
+	b.refreshChatPreview(storedChat)
 	log.Printf("revoke: a message deleted for everyone was cleared")
+	return true
+}
+
+// refreshChatPreview sets a chat's preview from its newest message still
+// stored. Every writer of last_message_preview (live receive, history sync,
+// the Baileys import) wrote it from some message, not always naming which, so
+// after a delete or an edit the only preview that is surely right is the one
+// read back from what the chat holds now.
+func (b *Bridge) refreshChatPreview(chatJID string) {
+	var (
+		id      sql.NullString
+		content sql.NullString
+	)
+	err := b.db.QueryRow(`
+		SELECT id, content_text FROM messages
+		 WHERE chat_jid = ? AND is_deleted = 0
+		 ORDER BY timestamp DESC, id DESC
+		 LIMIT 1
+	`, chatJID).Scan(&id, &content)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		log.Printf("revoke: reading the chat's newest message failed: %v", err)
+		return
+	}
+	var preview sql.NullString
+	if content.Valid && content.String != "" {
+		preview = sql.NullString{String: truncate(content.String, 120), Valid: true}
+	}
+	if _, err := b.db.Exec(`UPDATE chats SET last_message_id = ?, last_message_preview = ? WHERE jid = ?`, id, preview, chatJID); err != nil {
+		log.Printf("revoke: chat preview update failed: %v", err)
+	}
+}
+
+// applyEdit writes an edit onto the message it names, which must be in the
+// same chat and from the same sender (only a message's author can edit it).
+// Returns false when the original is not stored, so the caller stores the edit
+// under the original's id; true when the edit was applied or refused.
+func (b *Bridge) applyEdit(chatJID string, isGroup, editorFromMe bool, editorJID, targetID string, evt *events.Message) bool {
+	var (
+		storedChat string
+		fromMe     int
+		deleted    int
+		sender     sql.NullString
+	)
+	err := b.db.QueryRow(`SELECT chat_jid, is_from_me, is_deleted, sender_jid FROM messages WHERE id = ?`, targetID).
+		Scan(&storedChat, &fromMe, &deleted, &sender)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false
+	}
+	if err != nil {
+		log.Printf("edit: lookup failed: %v", err)
+		return true
+	}
+	if deleted == 1 {
+		// Deleted already: the edit writes nothing, unless the tombstone is not
+		// this message's (then it is dropped and the edit is stored).
+		return b.landsOnTombstone(targetID, chatJID, isGroup, editorFromMe)
+	}
+	if !b.sameChat(chatJID, storedChat) || (fromMe == 1) != editorFromMe ||
+		(!editorFromMe && chatTypeFromJIDString(chatJID) != "direct" && !b.sameChat(editorJID, sender.String)) {
+		log.Printf("edit: ignored, only a message's author can edit it, in its own chat")
+		return true
+	}
+	content, msgType := extractContent(evt)
+	scrubbed, flags := Scrub(content)
+	if _, err := b.db.Exec(`
+		UPDATE messages
+		   SET content_text = ?, content_normalized = ?, scrubbed_text = ?, scrub_flags_json = ?,
+		       raw_type = ?, is_edited = 1
+		 WHERE id = ? AND is_deleted = 0
+	`, content, Normalize(content), scrubbed, ScrubFlagsJSON(flags), rawTypeNullable(msgType, content), targetID); err != nil {
+		log.Printf("edit: update failed: %v", err)
+		return true
+	}
+	b.refreshChatPreview(storedChat)
 	return true
 }
 

@@ -337,3 +337,69 @@ func TestTheOtherSideCannotDeleteMyMessageBeforeItIsStored(t *testing.T) {
 		t.Fatalf("only a message's own side takes it back, even before it is stored: %+v", r)
 	}
 }
+
+// editFrom is the message `account` sends to edit its own message `id`, built
+// by whatsmeow's Client.BuildEdit.
+func editFrom(account, chat types.JID, id, text string) *waE2E.Message {
+	own := account
+	cli := whatsmeow.NewClient(&store.Device{ID: &own}, nil)
+	return cli.BuildEdit(chat, id, &waE2E.Message{Conversation: proto.String(text)})
+}
+
+func TestAnEditedMessageThenDeletedLeavesNeitherText(t *testing.T) {
+	b, db, _ := revokeBridge(t)
+	chat := revokeClient.String()
+	receive(b, revokeClient, revokeClient, false, "M1", 1_790_000_000, &waE2E.Message{Conversation: proto.String("primera versión")})
+	receive(b, revokeClient, revokeClient, false, "E1", 1_790_000_030, editFrom(revokeClient, revokeMe, "M1", "versión editada"))
+	if r, _ := readRow(t, db, "M1"); r.content.String != "versión editada" {
+		t.Fatalf("an edit changes the message it names: %+v", r)
+	}
+	if _, ok := readRow(t, db, "E1"); ok {
+		t.Fatalf("an edit is not a message of its own")
+	}
+	receive(b, revokeClient, revokeClient, false, "R1", 1_790_000_060, revokeFrom(revokeClient, revokeMe, types.EmptyJID, "M1"))
+	assertCleared(t, db, "M1")
+	body := listMessages(t, db, chat)
+	if strings.Contains(body, "versión") {
+		t.Fatalf("neither version is served: %s", body)
+	}
+}
+
+func TestOnlyAMessagesAuthorCanEditIt(t *testing.T) {
+	b, db, _ := revokeBridge(t)
+	receive(b, revokeClient, revokeMe, true, "M1", 1_790_000_000, &waE2E.Message{Conversation: proto.String("lo mío")})
+	receive(b, revokeClient, revokeClient, false, "E1", 1_790_000_030, editFrom(revokeClient, revokeMe, "M1", "cambiado por otro"))
+	if r, _ := readRow(t, db, "M1"); r.content.String != "lo mío" {
+		t.Fatalf("the other side cannot edit my message: %+v", r)
+	}
+}
+
+func TestThePreviewNeverShowsADeletedMessage(t *testing.T) {
+	b, db, _ := revokeBridge(t)
+	chat := revokeClient.String()
+	// History creates the chat with a preview and no last_message_id.
+	b.processHistorySyncEvent(historyOf(chat,
+		&waWeb.WebMessageInfo{Key: revokeKey("H1", false), Message: &waE2E.Message{Conversation: proto.String("antes")}, MessageTimestamp: proto.Uint64(1_790_000_000)},
+		&waWeb.WebMessageInfo{Key: revokeKey("H2", false), Message: &waE2E.Message{Conversation: proto.String("secreto en el preview")}, MessageTimestamp: proto.Uint64(1_790_000_010)},
+	))
+	receive(b, revokeClient, revokeClient, false, "R1", 1_790_000_060, revokeFrom(revokeClient, revokeMe, types.EmptyJID, "H2"))
+	var preview sql.NullString
+	if err := db.QueryRow(`SELECT last_message_preview FROM chats WHERE jid = ?`, chat).Scan(&preview); err != nil {
+		t.Fatal(err)
+	}
+	if preview.String != "antes" {
+		t.Fatalf("the preview is the newest message still there: %q", preview.String)
+	}
+}
+
+func TestAStatusCanOnlyBeDeletedByItsOwnSender(t *testing.T) {
+	b, db, _ := revokeBridge(t)
+	status := types.StatusBroadcastJID
+	receive(b, status, revokeOther, false, "S1", 1_790_000_000, &waE2E.Message{Conversation: proto.String("mi estado")})
+	receive(b, status, revokeClient, false, "R1", 1_790_000_030, revokeFrom(revokeClient, status, revokeOther, "S1"))
+	if r, _ := readRow(t, db, "S1"); r.deleted != 0 {
+		t.Fatalf("another contact cannot delete someone's status: %+v", r)
+	}
+	receive(b, status, revokeOther, false, "R2", 1_790_000_040, revokeFrom(revokeOther, status, types.EmptyJID, "S1"))
+	assertCleared(t, db, "S1")
+}

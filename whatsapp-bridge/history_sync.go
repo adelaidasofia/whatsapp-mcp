@@ -158,7 +158,7 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 			// history carries, clears the message and is stored as nothing
 			// else (tickets#5656, revoke.go).
 			if target := revokedHistoryID(wm); target != "" {
-				b.applyRevoke(chatJID, chatTypeFromJIDString(chatJID) == "group", fromMe, target, ts)
+				b.applyRevoke(chatJID, chatTypeFromJIDString(chatJID) == "group", fromMe, "", target, ts)
 				continue
 			}
 
