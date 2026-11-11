@@ -650,7 +650,7 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 		       COALESCE(scrubbed_text, COALESCE(content_text, '')),
 		       is_from_me, voice_note_transcript, COALESCE(quoted_message_id, '')
 		FROM messages
-		WHERE %s
+		WHERE %s AND is_deleted = 0
 		ORDER BY timestamp DESC, id DESC
 		LIMIT ?
 	`, where)

@@ -358,6 +358,18 @@ func (b *Bridge) onMessage(evt *events.Message) {
 	id := evt.Info.ID
 	ts := evt.Info.Timestamp.Unix()
 
+	// A delete-for-everyone is not a message of its own: it clears the one it
+	// names and stores nothing (tickets#5656, revoke.go).
+	if target := revokedMessageID(evt.Message); target != "" {
+		b.applyRevoke(chatJID, evt.Info.IsGroup, evt.Info.IsFromMe, target, ts)
+		return
+	}
+	// A message deleted for everyone before it reached the bridge arrives to a
+	// tombstone: nothing of it is written, not even the chat's preview.
+	if b.isDeleted(id) {
+		return
+	}
+
 	content, msgType := extractContent(evt)
 	normalized := Normalize(content)
 	scrubbed, flags := Scrub(content)

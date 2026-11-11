@@ -382,7 +382,7 @@ func buildExportUnits(db *sql.DB, includeGroups bool, minMessages int, entries [
 	chatRows.Close()
 
 	counts := map[string]int{}
-	countRows, err := db.Query(`SELECT chat_jid, COUNT(*) FROM messages GROUP BY chat_jid`)
+	countRows, err := db.Query(`SELECT chat_jid, COUNT(*) FROM messages WHERE is_deleted = 0 GROUP BY chat_jid`)
 	if err != nil {
 		return nil, 0, fmt.Errorf("query message counts: %w", err)
 	}
@@ -401,7 +401,7 @@ func buildExportUnits(db *sql.DB, includeGroups bool, minMessages int, entries [
 	// how a transcript that lands AFTER the chat's last message gets noticed:
 	// last_message_time does not move for it. See exportOneUnit.
 	transcripts := map[string]int64{}
-	trRows, err := db.Query(`SELECT chat_jid, MAX(voice_note_transcript_at) FROM messages WHERE type IN ('voice', 'audio') AND voice_note_transcript IS NOT NULL GROUP BY chat_jid`)
+	trRows, err := db.Query(`SELECT chat_jid, MAX(voice_note_transcript_at) FROM messages WHERE type IN ('voice', 'audio') AND voice_note_transcript IS NOT NULL AND is_deleted = 0 GROUP BY chat_jid`)
 	if err != nil {
 		return nil, 0, fmt.Errorf("query transcript times: %w", err)
 	}
@@ -1064,7 +1064,7 @@ func exportOneUnit(db *sql.DB, outputDir string, u exportUnit, todayStr string) 
 	query := fmt.Sprintf(`
 		SELECT timestamp, COALESCE(scrubbed_text, COALESCE(content_text, '')), COALESCE(sender_display, ''), is_from_me, type, COALESCE(voice_note_transcript, '')
 		FROM messages
-		WHERE chat_jid IN (%s)
+		WHERE chat_jid IN (%s) AND is_deleted = 0
 		ORDER BY timestamp ASC, id ASC
 	`, inClausePlaceholders(len(u.members)))
 	rows, err := db.Query(query, jidsToArgs(u.members)...)
@@ -1284,7 +1284,7 @@ func unitHasRenderableMessages(db *sql.DB, members []string) (bool, error) {
 	query := fmt.Sprintf(`
 		SELECT timestamp, COALESCE(scrubbed_text, COALESCE(content_text, '')), type, COALESCE(voice_note_transcript, '')
 		FROM messages
-		WHERE chat_jid IN (%s)
+		WHERE chat_jid IN (%s) AND is_deleted = 0
 	`, inClausePlaceholders(len(members)))
 	rows, err := db.Query(query, jidsToArgs(members)...)
 	if err != nil {
@@ -1313,7 +1313,7 @@ func unitHasRenderableMessages(db *sql.DB, members []string) (bool, error) {
 func distinctSenderFloor(db *sql.DB, members []string) int {
 	query := fmt.Sprintf(`
 		SELECT COUNT(DISTINCT sender_jid) FROM messages
-		WHERE chat_jid IN (%s) AND COALESCE(sender_jid, '') <> ''
+		WHERE chat_jid IN (%s) AND COALESCE(sender_jid, '') <> '' AND is_deleted = 0
 	`, inClausePlaceholders(len(members)))
 	var n int
 	if err := db.QueryRow(query, jidsToArgs(members)...).Scan(&n); err != nil {

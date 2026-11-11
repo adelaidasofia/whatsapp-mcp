@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **A message deleted "for everyone" is gone from the bridge.** A revoke used to be stored as an `[unsupported: protocolMessage]` row of its own while the message it took back kept its text, transcript and media, and `/api/messages` and the vault export kept serving it (mycelium-hq/tickets#5656). Now a revoke, live or from history sync (a revoke stub), clears the message's text, its normalized and scrubbed copies, its transcript, its media keys and any file downloaded for it, and sets `is_deleted`. `/api/messages`, the vault export, media download and the transcriber skip deleted rows. The chat's `last_message_time` moves to the revoke, so the vault export rewrites that chat's file without the message and apps that watch the chat list read it again. A revoke must name a message in the same chat; in a direct chat only the message's own sender's revoke counts. A revoke that arrives before its message leaves a tombstone, so the message is never written later. Revokes stored before this version named no message and cannot be applied backwards.
+
 ## [0.6.0] - 2026-10-31
 
 ### Changed

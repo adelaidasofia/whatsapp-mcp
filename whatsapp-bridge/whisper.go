@@ -305,7 +305,7 @@ func (t *Transcriber) process(ctx context.Context, workerID int, j transcription
 		SET voice_note_transcript = ?,
 		    voice_note_transcript_backend = ?,
 		    voice_note_transcript_at = ?
-		WHERE id = ? AND voice_note_transcript IS NULL
+		WHERE id = ? AND voice_note_transcript IS NULL AND is_deleted = 0
 	`, transcript, t.cfg.WhisperBackend, now, j.MessageID)
 	if err != nil {
 		outcome = outcomeUnknown // a busy database says nothing about the note

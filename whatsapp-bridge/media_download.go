@@ -157,7 +157,7 @@ func (b *Bridge) DownloadMedia(ctx context.Context, messageID string) (path, mim
 		SELECT type, media_path, media_key, media_direct_path, media_url,
 		       media_enc_sha256, media_sha256, media_file_length,
 		       media_key_timestamp, media_mime
-		FROM messages WHERE id = ?
+		FROM messages WHERE id = ? AND is_deleted = 0
 	`, messageID)
 	if err = row.Scan(&msgType, &mediaPath,
 		&mediaKey, &directPath, &mediaURL,
@@ -205,12 +205,18 @@ func (b *Bridge) DownloadMedia(ctx context.Context, messageID string) (path, mim
 		return "", "", 0, fmt.Errorf("write media file: %w", err)
 	}
 
-	if _, perr := b.db.ExecContext(ctx,
-		`UPDATE messages SET media_path = ?, media_mime = COALESCE(media_mime, ?) WHERE id = ?`,
+	res, perr := b.db.ExecContext(ctx,
+		`UPDATE messages SET media_path = ?, media_mime = COALESCE(media_mime, ?) WHERE id = ? AND is_deleted = 0`,
 		outPath, sql.NullString{String: mt, Valid: mt != ""}, messageID,
-	); perr != nil {
+	)
+	if perr != nil {
 		// Bytes are on disk; persistence is best-effort. Log + continue.
 		log.Printf("DownloadMedia: persist media_path failed for %s: %v", messageID, perr)
+	} else if n, _ := res.RowsAffected(); n == 0 {
+		// Deleted for everyone while it downloaded (tickets#5656): the file is
+		// not kept.
+		_ = os.Remove(outPath)
+		return "", "", 0, fmt.Errorf("message not found: %s", messageID)
 	}
 
 	return outPath, mt, int64(len(bytes)), nil

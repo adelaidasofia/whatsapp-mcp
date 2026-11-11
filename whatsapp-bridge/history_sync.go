@@ -143,9 +143,18 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 				continue
 			}
 
-			content, msgType := extractContentFromProto(wm.GetMessage())
 			ts := int64(wm.GetMessageTimestamp())
 			fromMe := key.GetFromMe()
+
+			// A message history says was deleted for everyone, or a revoke
+			// history carries, clears the message and is stored as nothing
+			// else (tickets#5656, revoke.go).
+			if target := revokedHistoryID(wm); target != "" {
+				b.applyRevoke(chatJID, chatTypeFromJIDString(chatJID) == "group", fromMe, target, ts)
+				continue
+			}
+
+			content, msgType := extractContentFromProto(wm.GetMessage())
 
 			senderJID := chatJID
 			switch {
@@ -222,6 +231,7 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 				       media_mime           = COALESCE(media_mime, ?)
 				 WHERE id = ?
 				   AND media_key IS NULL
+				   AND is_deleted = 0
 			`,
 				fields.MediaKey, fields.MediaDirectPath, fields.MediaURL,
 				fields.MediaEncSHA, fields.MediaSHA, fields.MediaFileLength,
@@ -454,6 +464,7 @@ func (b *Bridge) backfillDecodedContent(msgID string, m *waE2E.Message) (int, er
 		       raw_type           = ?
 		 WHERE id = ?
 		   AND type = 'system'
+		   AND is_deleted = 0
 		   AND (content_text IS NULL OR content_text = ''
 		        OR (content_text LIKE '[unsupported: %' AND ? <> 'system'))
 	`, msgType, text, Normalize(text), scrubbed, ScrubFlagsJSON(flags), rawTypeNullable(msgType, text), msgID, msgType)
