@@ -366,7 +366,7 @@ func (b *Bridge) onMessage(evt *events.Message) {
 	}
 	// A message deleted for everyone before it reached the bridge arrives to a
 	// tombstone: nothing of it is written, not even the chat's preview.
-	if b.isDeleted(id) {
+	if b.landsOnTombstone(id, chatJID, evt.Info.IsGroup, evt.Info.IsFromMe) {
 		return
 	}
 

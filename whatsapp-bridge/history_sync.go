@@ -146,11 +146,23 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 			ts := int64(wm.GetMessageTimestamp())
 			fromMe := key.GetFromMe()
 
+			// Extend the chunk's backward anchor to this message if it is the
+			// oldest seen so far (see the `oldest` declaration above). Before
+			// the revoke and tombstone skips below, so a chunk whose oldest
+			// entry is a deleted message still moves the walk back.
+			if ts > 0 && (oldest.TS == 0 || ts < oldest.TS) {
+				oldest = chunkAnchor{ID: key.GetID(), TS: ts, FromMe: fromMe}
+			}
+
 			// A message history says was deleted for everyone, or a revoke
 			// history carries, clears the message and is stored as nothing
 			// else (tickets#5656, revoke.go).
 			if target := revokedHistoryID(wm); target != "" {
 				b.applyRevoke(chatJID, chatTypeFromJIDString(chatJID) == "group", fromMe, target, ts)
+				continue
+			}
+
+			if b.landsOnTombstone(key.GetID(), chatJID, chatTypeFromJIDString(chatJID) == "group", fromMe) {
 				continue
 			}
 
@@ -192,12 +204,6 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 			}
 			if n, _ := res.RowsAffected(); n > 0 {
 				inserted += int(n)
-			}
-
-			// Extend the chunk's backward anchor to this message if it is the
-			// oldest seen so far (see the `oldest` declaration above).
-			if ts > 0 && (oldest.TS == 0 || ts < oldest.TS) {
-				oldest = chunkAnchor{ID: key.GetID(), TS: ts, FromMe: fromMe}
 			}
 
 			// Re-decode rows the pre-MYC-3284 decoder stored empty. Runs BEFORE
@@ -481,7 +487,7 @@ func (b *Bridge) CountEmptySystemRows(ctx context.Context) (int, error) {
 	var n int
 	err := b.db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM messages
-		 WHERE type = 'system' AND (content_text IS NULL OR content_text = '')
+		 WHERE type = 'system' AND is_deleted = 0 AND (content_text IS NULL OR content_text = '')
 	`).Scan(&n)
 	return n, err
 }
@@ -591,7 +597,7 @@ func (b *Bridge) decodeBackfillTargets(ctx context.Context, opts DecodeBackfillO
 		if err := b.db.QueryRowContext(ctx, `
 			SELECT COUNT(*) FROM messages
 			 WHERE chat_jid = ?
-			   AND type = 'system' AND (content_text IS NULL OR content_text = '')
+			   AND type = 'system' AND is_deleted = 0 AND (content_text IS NULL OR content_text = '')
 		`, opts.ChatJID).Scan(&n); err != nil {
 			return nil, fmt.Errorf("count empty rows for %s: %w", opts.ChatJID, err)
 		}
@@ -604,7 +610,7 @@ func (b *Bridge) decodeBackfillTargets(ctx context.Context, opts DecodeBackfillO
 	rows, err := b.db.QueryContext(ctx, `
 		SELECT chat_jid, COUNT(*) AS n
 		  FROM messages
-		 WHERE type = 'system' AND (content_text IS NULL OR content_text = '')
+		 WHERE type = 'system' AND is_deleted = 0 AND (content_text IS NULL OR content_text = '')
 		   AND chat_jid <> 'status@broadcast'
 		 GROUP BY chat_jid
 		 ORDER BY n DESC

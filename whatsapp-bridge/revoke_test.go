@@ -306,3 +306,34 @@ func TestTheAPIStillAnswersAChatWhoseOnlyMessageWasDeleted(t *testing.T) {
 		t.Fatalf("no message left to serve: %+v", out)
 	}
 }
+
+func TestARevokeThatArrivesFirstInAnotherChatDoesNotSuppressTheMessage(t *testing.T) {
+	b, db, _ := revokeBridge(t)
+	// A revoke in the client's chat names an id the bridge has not seen.
+	receive(b, revokeClient, revokeClient, false, "R1", 1_790_000_100, revokeFrom(revokeClient, revokeMe, types.EmptyJID, "M1"))
+	// That id then arrives in another chat, live.
+	receive(b, revokeOther, revokeOther, false, "M1", 1_790_000_000, &waE2E.Message{Conversation: proto.String("de otro chat")})
+	if r, ok := readRow(t, db, "M1"); !ok || r.deleted != 0 || r.content.String != "de otro chat" {
+		t.Fatalf("a revoke in one chat never suppresses a message in another: %+v", r)
+	}
+	// And the same through history.
+	receive(b, revokeClient, revokeClient, false, "R2", 1_790_000_200, revokeFrom(revokeClient, revokeMe, types.EmptyJID, "M2"))
+	b.processHistorySyncEvent(historyOf(revokeOther.String(), &waWeb.WebMessageInfo{
+		Key:              &waCommon.MessageKey{ID: proto.String("M2"), FromMe: proto.Bool(false), RemoteJID: proto.String(revokeOther.String())},
+		Message:          &waE2E.Message{Conversation: proto.String("historia de otro chat")},
+		MessageTimestamp: proto.Uint64(1_790_000_000),
+	}))
+	if r, ok := readRow(t, db, "M2"); !ok || r.deleted != 0 || r.content.String != "historia de otro chat" {
+		t.Fatalf("history of another chat is stored too: %+v", r)
+	}
+}
+
+func TestTheOtherSideCannotDeleteMyMessageBeforeItIsStored(t *testing.T) {
+	b, db, _ := revokeBridge(t)
+	// The client revokes an id that turns out to be my own message.
+	receive(b, revokeClient, revokeClient, false, "R1", 1_790_000_100, revokeFrom(revokeClient, revokeMe, types.EmptyJID, "M1"))
+	receive(b, revokeClient, revokeMe, true, "M1", 1_790_000_000, &waE2E.Message{Conversation: proto.String("lo que yo escribí")})
+	if r, ok := readRow(t, db, "M1"); !ok || r.deleted != 0 || r.content.String != "lo que yo escribí" {
+		t.Fatalf("only a message's own side takes it back, even before it is stored: %+v", r)
+	}
+}

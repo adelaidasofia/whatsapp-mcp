@@ -87,7 +87,7 @@ func (b *Bridge) applyRevoke(chatJID string, isGroup, revokerFromMe bool, target
 	err := b.db.QueryRow(`SELECT chat_jid, is_from_me, is_deleted, media_path FROM messages WHERE id = ?`, targetID).
 		Scan(&storedChat, &fromMe, &deleted, &mediaPath)
 	if errors.Is(err, sql.ErrNoRows) {
-		b.storeRevokeTombstone(chatJID, targetID, ts)
+		b.storeRevokeTombstone(chatJID, revokerFromMe, targetID, ts)
 		return false
 	}
 	if err != nil {
@@ -160,7 +160,10 @@ func (b *Bridge) applyRevoke(chatJID string, isGroup, revokerFromMe bool, target
 
 // storeRevokeTombstone keeps the fact that targetID was deleted before the
 // bridge ever stored it, so a later delivery of it is not written with text.
-func (b *Bridge) storeRevokeTombstone(chatJID, targetID string, ts int64) {
+// It records the chat and the revoker's side (is_from_me) and no sender, which
+// is what marks it as a tombstone: landsOnTombstone checks a later delivery
+// against them, as applyRevoke checks a stored message.
+func (b *Bridge) storeRevokeTombstone(chatJID string, revokerFromMe bool, targetID string, ts int64) {
 	// messages.chat_jid has a foreign key to chats.
 	if _, err := b.db.Exec(`
 		INSERT INTO chats (jid, chat_type, created_at, updated_at) VALUES (?, ?, ?, ?)
@@ -170,18 +173,43 @@ func (b *Bridge) storeRevokeTombstone(chatJID, targetID string, ts int64) {
 		return
 	}
 	if _, err := b.db.Exec(`
-		INSERT INTO messages (id, chat_jid, timestamp, type, is_deleted)
-		VALUES (?, ?, ?, 'system', 1)
+		INSERT INTO messages (id, chat_jid, timestamp, type, is_from_me, is_deleted)
+		VALUES (?, ?, ?, 'system', ?, 1)
 		ON CONFLICT(id) DO NOTHING
-	`, targetID, chatJID, ts); err != nil {
+	`, targetID, chatJID, ts, boolToInt(revokerFromMe)); err != nil {
 		log.Printf("revoke: tombstone failed: %v", err)
 	}
 }
 
-// isDeleted reports whether id is a message deleted for everyone.
-func (b *Bridge) isDeleted(id string) bool {
-	var deleted int
-	return b.db.QueryRow(`SELECT is_deleted FROM messages WHERE id = ?`, id).Scan(&deleted) == nil && deleted == 1
+// landsOnTombstone reports whether a message arriving now (in chatJID, from
+// this account or not) is one a revoke already deleted, so nothing of it is
+// written. A tombstone the message does not match (another chat, or in a
+// direct chat a revoke from the other side) was not a valid revoke of it: the
+// tombstone is dropped and the message is stored as usual.
+func (b *Bridge) landsOnTombstone(id, chatJID string, isGroup, fromMe bool) bool {
+	var (
+		storedChat string
+		tombFromMe int
+		deleted    int
+		sender     sql.NullString
+	)
+	if err := b.db.QueryRow(`SELECT chat_jid, is_from_me, is_deleted, sender_jid FROM messages WHERE id = ?`, id).
+		Scan(&storedChat, &tombFromMe, &deleted, &sender); err != nil || deleted != 1 {
+		return false
+	}
+	if sender.Valid {
+		// A stored message that was cleared: it stays cleared.
+		return true
+	}
+	if b.sameChat(chatJID, storedChat) && (isGroup || (tombFromMe == 1) == fromMe) {
+		return true
+	}
+	if _, err := b.db.Exec(`DELETE FROM messages WHERE id = ? AND is_deleted = 1 AND sender_jid IS NULL`, id); err != nil {
+		log.Printf("revoke: dropping a tombstone that does not match its message failed: %v", err)
+		return true
+	}
+	log.Printf("revoke: a tombstone did not match the message that arrived and was dropped")
+	return false
 }
 
 // sameChat reports whether two chat JIDs name the same chat, through the
