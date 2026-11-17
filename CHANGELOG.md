@@ -12,6 +12,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **An edit changes the message it names instead of adding a row.** An edit used to be stored as a new message under its own id, so a later delete-for-everyone of the original left the edited text behind. Now it updates the original (`is_edited = 1`), live or from history, only when it comes from the message's own author in its own chat. An edit of a message the bridge has not stored is dropped: it cannot be checked against its author, and history delivers the message with its last text. Edits stored before this version stay separate rows (they name no message).
 - **A chat's preview is read back from its newest remaining message** after a delete or an edit, so `/api/chats` never shows a deleted message, including a preview history sync wrote without naming its message. In a broadcast chat (status), a live revoke must come from the status's own sender.
 
+### Changed
+
+- **`confirm_send` answers a send the bridge refused as data, and keeps raising when the message may have gone out.** A refusal that comes after the bridge has read the draft and before it sends (`400`, `403`, `404`, `410`, `429`: a bad request, the send rules, the daily limit, a draft that is missing or expired) now returns `{"sent": false, "status": "refused", "draft_id": ..., "error": "bridge <status>: ..."}` instead of raising, and the by-hand link stays in `error`. `409`, `500`, `502`, `401`, `503` and a connection that resets or times out after the request was sent still raise: the message may have gone out in each. So does a refusal for a draft whose earlier confirm raised (a retry after a restart, or one racing a slow upload): it says only that the retry sent nothing. An app reading the result can now tell "not sent" from "could not be confirmed", and a person is not told "not sent" for a message that went out.
+- **The MCP server talks to the bridge without a proxy.** `trust_env=False`: the bridge is a local program, and a proxy named in the environment would be shown every message on its way and could answer for the bridge after it had sent one.
+
 ## [0.6.0] - 2026-10-31
 
 ### Changed
