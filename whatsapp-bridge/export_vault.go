@@ -1171,7 +1171,7 @@ func exportOneUnit(db *sql.DB, outputDir string, u exportUnit, todayStr string) 
 	// Pull messages for every merged JID form, assembled chronologically.
 	// The id tiebreak keeps equal-timestamp ordering deterministic across runs.
 	query := fmt.Sprintf(`
-		SELECT timestamp, COALESCE(scrubbed_text, COALESCE(content_text, '')), COALESCE(sender_display, ''), is_from_me, type, COALESCE(voice_note_transcript, '')
+		SELECT timestamp, COALESCE(scrubbed_text, COALESCE(content_text, '')), COALESCE(sender_display, ''), COALESCE(sender_jid, ''), is_from_me, type, COALESCE(voice_note_transcript, '')
 		FROM messages
 		WHERE chat_jid IN (%s) AND is_deleted = 0
 		ORDER BY timestamp ASC, id ASC
@@ -1186,6 +1186,7 @@ func exportOneUnit(db *sql.DB, outputDir string, u exportUnit, todayStr string) 
 		ts            int64
 		text          string
 		senderDisplay string
+		senderJID     string
 		fromMe        bool
 		msgType       string
 		transcript    string
@@ -1194,7 +1195,7 @@ func exportOneUnit(db *sql.DB, outputDir string, u exportUnit, todayStr string) 
 	for rows.Next() {
 		var m msg
 		var fromMe int
-		if err := rows.Scan(&m.ts, &m.text, &m.senderDisplay, &fromMe, &m.msgType, &m.transcript); err != nil {
+		if err := rows.Scan(&m.ts, &m.text, &m.senderDisplay, &m.senderJID, &fromMe, &m.msgType, &m.transcript); err != nil {
 			continue
 		}
 		m.fromMe = fromMe == 1
@@ -1220,10 +1221,19 @@ func exportOneUnit(db *sql.DB, outputDir string, u exportUnit, todayStr string) 
 
 		speaker := "You"
 		if !m.fromMe {
-			if m.senderDisplay != "" {
+			// The bridge fills sender_display with the number or JID when it
+			// knows no name; that never reaches the text (tickets#6939). In a
+			// direct chat the other side is the chat's own label; in a group
+			// an unknown member gets a short id of their JID so members stay
+			// apart without showing the number.
+			switch {
+			case m.senderDisplay != "" && !looksLikeIdentifier(m.senderDisplay):
 				speaker = m.senderDisplay
-			} else {
+			case u.chatType == "direct" || m.senderJID == "":
 				speaker = label
+			default:
+				sum := sha256.Sum256([]byte(m.senderJID))
+				speaker = "Unknown member " + hex.EncodeToString(sum[:])[:6]
 			}
 		}
 

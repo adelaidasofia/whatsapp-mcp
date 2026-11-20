@@ -223,3 +223,45 @@ func TestExportKeepsAbsorbedFileTheDatabaseNoLongerCovers(t *testing.T) {
 		t.Errorf("file with history the database lacks was removed: %v", err)
 	}
 }
+
+// The bridge stores the number or the JID as sender_display when it knows no
+// name. Neither reaches the message lines.
+func TestExportLabelsNumberShapedSenderDisplays(t *testing.T) {
+	db := xvDB(t)
+	outDir := t.TempDir()
+	const memberJID = "15555550177@s.whatsapp.net"
+	xvChat(t, db, xvPhoneJID, "direct", "", xvPhoneLastTS)
+	xvMsg(t, db, "P1", xvPhoneJID, xvPhoneJID, "+"+extractPhone(xvPhoneJID), "text", "numero", "", xvPhoneLastTS, false)
+	xvChat(t, db, xvGroupJID, "group", "Familia", xvGroupLastTS)
+	xvMsg(t, db, "G1", xvGroupJID, memberJID, "+"+extractPhone(memberJID), "text", "por numero", "", xvGroupLastTS, false)
+	xvMsg(t, db, "G2", xvGroupJID, xvLIDJID, xvLIDJID, "text", "por jid", "", xvGroupLastTS+1, false)
+	if err := ExportVault(db, outDir, true, 0); err != nil {
+		t.Fatalf("ExportVault: %v", err)
+	}
+	_, direct := xvReadFile(t, filepath.Join(outDir, xvFileForJID(t, outDir, xvPhoneJID)))
+	if !strings.Contains(direct, "Chat with an unknown number: numero") {
+		t.Errorf("direct line not labelled readably:\n%s", direct)
+	}
+	_, group := xvReadFile(t, filepath.Join(outDir, xvFileForJID(t, outDir, xvGroupJID)))
+	for _, jid := range []string{xvPhoneJID, memberJID, xvLIDJID} {
+		if strings.Contains(direct+group, extractPhone(jid)) {
+			t.Errorf("a number reached the text:\n%s\n%s", direct, group)
+		}
+	}
+	if strings.Count(group, "Unknown member ") != 2 {
+		t.Errorf("unknown group members not labelled:\n%s", group)
+	}
+	lines := strings.Split(group, "\n")
+	var a, b string
+	for _, l := range lines {
+		if strings.Contains(l, "por numero") {
+			a = strings.SplitN(l, ": ", 2)[0]
+		}
+		if strings.Contains(l, "por jid") {
+			b = strings.SplitN(l, ": ", 2)[0]
+		}
+	}
+	if a == "" || b == "" || a[strings.Index(a, "Unknown"):] == b[strings.Index(b, "Unknown"):] {
+		t.Errorf("two unknown members share one label: %q / %q", a, b)
+	}
+}
