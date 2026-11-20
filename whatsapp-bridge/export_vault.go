@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -24,8 +26,19 @@ import (
 // Output layout (one file per HUMAN or group; groups are skipped by default):
 //
 //	<outputDir>/<Contact Name>.md            direct chat, push_name known
-//	<outputDir>/+<phone>.md                  direct chat, only phone known
 //	<outputDir>/<Group Name> (group).md      group chat (never a bare person name)
+//	<outputDir>/Chat with an unknown number (WhatsApp) <id>.md
+//	                                         direct chat, no name known
+//	<outputDir>/Group chat (WhatsApp) <id> (group).md
+//	                                         group chat, no subject known
+//
+// When no human name is known the file is never named after the phone number
+// or JID (tickets#6939): those are private identifiers and unreadable as a
+// title. <id> is the first characters of a hash of the chat's JID, so two
+// unknown chats never share a file and a re-export lands on the same one. The
+// number itself stays in the frontmatter (phone:, jid:). Once a name becomes
+// known, healLegacyFilenames finds the file by its frontmatter jid and renames
+// it to the person's name.
 //
 // YAML frontmatter:
 //
@@ -302,6 +315,24 @@ func ExportVault(db *sql.DB, outputDir string, includeGroups bool, minMessages i
 		}
 	}
 
+	// Retire files a unit has absorbed (tickets#6939): when an unknown chat
+	// merges into a person who already has a file, the unit writes the
+	// person's file and the old file still claims the merged JID. Only on a
+	// clean run, and only files whose messages the unit's file now holds.
+	retired := 0
+	if len(dropped) == 0 {
+		var ok []int
+		for _, f := range files {
+			if _, isAliased := aliasPartner[f.i]; !isAliased {
+				ok = append(ok, f.i)
+			}
+		}
+		retired = retireAbsorbedFiles(db, outputDir, units, ok, entries)
+	}
+	if retired > 0 {
+		log.Printf("export: retired %d file(s) whose chat merged into another file", retired)
+	}
+
 	log.Printf("export: done (%d written, %d skipped-unchanged, %d skipped-empty)",
 		written, skippedUnchanged, skippedEmpty)
 	log.Printf("export: reconcile chats_in_db=%d exported_units=%d written=%d skipped_unchanged=%d skipped_empty=%d dropped=%d",
@@ -345,6 +376,7 @@ type exportUnit struct {
 	lastMessageTs     int64  // max across members
 	transcriptTs      int64  // newest voice-note transcript across members; 0 when none
 	msgCount          int    // total message rows across members
+	unnamed           bool   // no human name is known: display is a phone/JID fallback
 	filename          string // final basename, ".md" included
 	forceRewrite      bool   // set when the file was healed/renamed and must be regenerated
 }
@@ -612,7 +644,10 @@ func buildExportUnits(db *sql.DB, includeGroups bool, minMessages int, entries [
 //
 // Display precedence for direct chats: contacts.push_name (primary JID first),
 // then chats.name, then "+<phone>", then the primary JID's digits. Groups use
-// chats.name only — a group must never inherit a person's contact card.
+// chats.name only — a group must never inherit a person's contact card. A
+// name that is itself a number or JID counts as no name. When no name is
+// known the fallback display is kept for the frontmatter `contact:` and the
+// unit is marked unnamed, so assignFilenames never puts it in the file name.
 //
 // Phone rule: a phone is only a phone when it comes from an @s.whatsapp.net
 // JID's user portion or a contacts.phone column that is NOT the digits of a
@@ -660,7 +695,11 @@ func resolveUnitIdentities(db *sql.DB, units []exportUnit, chats map[string]chat
 
 		if u.chatType != "direct" {
 			u.display = chats[u.primary].name
+			if looksLikeIdentifier(u.display) {
+				u.display = ""
+			}
 			if u.display == "" {
+				u.unnamed = true
 				u.display = extractPhone(u.primary)
 			}
 			if u.display == "" {
@@ -693,20 +732,21 @@ func resolveUnitIdentities(db *sql.DB, units []exportUnit, chats map[string]chat
 		}
 
 		for _, jid := range u.members { // members are primary-first
-			if c, ok := contacts[jid]; ok && c.pushName != "" && !strings.HasPrefix(c.pushName, "+") {
+			if c, ok := contacts[jid]; ok && c.pushName != "" && !strings.HasPrefix(c.pushName, "+") && !looksLikeIdentifier(c.pushName) {
 				u.display = c.pushName
 				break
 			}
 		}
 		if u.display == "" {
 			for _, jid := range u.members {
-				if n := chats[jid].name; n != "" && !strings.HasPrefix(n, "+") {
+				if n := chats[jid].name; n != "" && !strings.HasPrefix(n, "+") && !looksLikeIdentifier(n) {
 					u.display = n
 					break
 				}
 			}
 		}
 		if u.display == "" {
+			u.unnamed = true
 			if u.phone != "" {
 				u.display = "+" + u.phone
 			} else if d := extractPhone(u.primary); d != "" {
@@ -717,6 +757,64 @@ func resolveUnitIdentities(db *sql.DB, units []exportUnit, chats map[string]chat
 		}
 	}
 	return nil
+}
+
+// looksLikeIdentifier reports whether a name is really a phone number or a
+// JID (digits with phone punctuation, or anything with an "@"), which must
+// never become a file name.
+func looksLikeIdentifier(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+	if strings.Contains(s, "@") {
+		return true
+	}
+	digits := 0
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9':
+			digits++
+		case r == '+' || r == ' ' || r == '-' || r == '(' || r == ')' || r == '.':
+		default:
+			return false
+		}
+	}
+	return digits > 0
+}
+
+// unnamedID is the stable disambiguator for a chat with no known name: the
+// first n hex characters of a SHA-256 of its JIDs. It is built from the
+// lexically first JID of the unit's closure rather than the primary, because
+// the primary of a merged human moves with activity and the file name must
+// not flip between runs. It reveals nothing of the number. The id is stable
+// while the chat's set of JIDs is stable; a newly merged JID can change it,
+// and healLegacyFilenames then moves the file by its frontmatter jid.
+func unnamedID(u *exportUnit, n int) string {
+	key := u.primary
+	for _, a := range u.aliasJIDs {
+		if a < key {
+			key = a
+		}
+	}
+	sum := sha256.Sum256([]byte(key))
+	h := hex.EncodeToString(sum[:])
+	if n > len(h) {
+		n = len(h)
+	}
+	return h[:n]
+}
+
+// unnamedLabel is the readable title for a chat with no known name.
+func unnamedLabel(chatType string) string {
+	switch chatType {
+	case "direct":
+		return "Chat with an unknown number (WhatsApp)"
+	case "group":
+		return "Group chat (WhatsApp)"
+	default:
+		return "Broadcast (WhatsApp)"
+	}
 }
 
 // chatRowLite is the slice of a chats row the export planner needs.
@@ -761,6 +859,17 @@ type chatRowLite struct {
 // in ExportVault.
 func assignFilenames(units []exportUnit, taken map[string]string) {
 	name := func(u *exportUnit, level int) string {
+		if u.unnamed {
+			// No digits, handle or JID ever reach the name. Collisions
+			// escalate to a longer hash instead (6, 12, then all 64 hex).
+			// Non-direct chats still end in their (chat_type) marker.
+			n := []int{6, 12, 64}[level]
+			base := unnamedLabel(u.chatType) + " " + unnamedID(u, n)
+			if u.chatType != "direct" {
+				return fmt.Sprintf("%s (%s)", base, u.chatType)
+			}
+			return base
+		}
 		base := sanitizeFilename(u.display)
 		if u.chatType != "direct" {
 			switch level {
@@ -1062,7 +1171,7 @@ func exportOneUnit(db *sql.DB, outputDir string, u exportUnit, todayStr string) 
 	// Pull messages for every merged JID form, assembled chronologically.
 	// The id tiebreak keeps equal-timestamp ordering deterministic across runs.
 	query := fmt.Sprintf(`
-		SELECT timestamp, COALESCE(scrubbed_text, COALESCE(content_text, '')), COALESCE(sender_display, ''), is_from_me, type, COALESCE(voice_note_transcript, '')
+		SELECT timestamp, COALESCE(scrubbed_text, COALESCE(content_text, '')), COALESCE(sender_display, ''), COALESCE(sender_jid, ''), is_from_me, type, COALESCE(voice_note_transcript, '')
 		FROM messages
 		WHERE chat_jid IN (%s) AND is_deleted = 0
 		ORDER BY timestamp ASC, id ASC
@@ -1077,6 +1186,7 @@ func exportOneUnit(db *sql.DB, outputDir string, u exportUnit, todayStr string) 
 		ts            int64
 		text          string
 		senderDisplay string
+		senderJID     string
 		fromMe        bool
 		msgType       string
 		transcript    string
@@ -1085,7 +1195,7 @@ func exportOneUnit(db *sql.DB, outputDir string, u exportUnit, todayStr string) 
 	for rows.Next() {
 		var m msg
 		var fromMe int
-		if err := rows.Scan(&m.ts, &m.text, &m.senderDisplay, &fromMe, &m.msgType, &m.transcript); err != nil {
+		if err := rows.Scan(&m.ts, &m.text, &m.senderDisplay, &m.senderJID, &fromMe, &m.msgType, &m.transcript); err != nil {
 			continue
 		}
 		m.fromMe = fromMe == 1
@@ -1095,6 +1205,12 @@ func exportOneUnit(db *sql.DB, outputDir string, u exportUnit, todayStr string) 
 		return writeResultEmpty, nil // nothing to write
 	}
 
+	// The name shown for the other side: for a chat with no known name, the
+	// same readable label as the file, never the number (tickets#6939).
+	label := u.display
+	if u.unnamed {
+		label = strings.TrimSuffix(unnamedLabel(u.chatType), " (WhatsApp)")
+	}
 	byDate := map[string][]string{}
 	for _, m := range messages {
 		if m.ts < 1000 {
@@ -1105,10 +1221,19 @@ func exportOneUnit(db *sql.DB, outputDir string, u exportUnit, todayStr string) 
 
 		speaker := "You"
 		if !m.fromMe {
-			if m.senderDisplay != "" {
+			// The bridge fills sender_display with the number or JID when it
+			// knows no name; that never reaches the text (tickets#6939). In a
+			// direct chat the other side is the chat's own label; in a group
+			// an unknown member gets a short id of their JID so members stay
+			// apart without showing the number.
+			switch {
+			case m.senderDisplay != "" && !looksLikeIdentifier(m.senderDisplay):
 				speaker = m.senderDisplay
-			} else {
-				speaker = u.display
+			case u.chatType == "direct" || m.senderJID == "":
+				speaker = label
+			default:
+				sum := sha256.Sum256([]byte(m.senderJID))
+				speaker = "Unknown member " + hex.EncodeToString(sum[:])[:6]
 			}
 		}
 
@@ -1187,10 +1312,11 @@ func exportOneUnit(db *sql.DB, outputDir string, u exportUnit, todayStr string) 
 		}
 	}
 
+	heading := label
 	lines = append(lines,
 		"---",
 		"",
-		fmt.Sprintf("# WhatsApp: %s", u.display),
+		fmt.Sprintf("# WhatsApp: %s", heading),
 		"",
 	)
 	for _, d := range dates {
@@ -1280,6 +1406,69 @@ func renderMessageText(msgType, text, transcript string) string {
 // unitHasRenderableMessages reports whether at least one of the unit's rows
 // would produce a line in the chat file, under exactly the rules
 // exportOneUnit applies (renderMessageText + the ts >= 1000 epoch guard).
+// retireAbsorbedFiles removes chat files left behind by a merge: a file of
+// ours (type whatsapp-chat) whose jid and alias_jids all belong to a unit that
+// was just written or confirmed under a different name, and whose
+// message_count the database still covers for those JIDs, so every message
+// it held is in the unit's file. Anything else is left in place. Returns the
+// number of files removed.
+func retireAbsorbedFiles(db *sql.DB, outputDir string, units []exportUnit, ok []int, entries []vaultEntry) int {
+	removed := 0
+	for _, i := range ok {
+		u := &units[i]
+		closure := map[string]bool{u.primary: true}
+		for _, a := range u.aliasJIDs {
+			closure[a] = true
+		}
+		members := map[string]bool{}
+		for _, m := range u.members {
+			members[m] = true
+		}
+		for _, e := range entries {
+			if e.jid == "" || !members[e.jid] || e.name == u.filename {
+				continue
+			}
+			path := filepath.Join(outputDir, e.name)
+			st, err := os.Lstat(path)
+			if err != nil || !st.Mode().IsRegular() {
+				continue
+			}
+			if own, err := os.Stat(filepath.Join(outputDir, u.filename)); err != nil || os.SameFile(st, own) {
+				continue
+			}
+			id := readChatFileIdentity(path)
+			if id.fileType != "whatsapp-chat" || !members[id.jid] {
+				continue
+			}
+			jids := []string{id.jid}
+			covered := true
+			for _, a := range id.aliasJIDs {
+				if !closure[a] {
+					covered = false
+					break
+				}
+				if members[a] {
+					jids = append(jids, a)
+				}
+			}
+			if !covered {
+				continue
+			}
+			var n int
+			if err := db.QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM messages WHERE chat_jid IN (%s) AND is_deleted = 0`,
+				inClausePlaceholders(len(jids))), jidsToArgs(jids)...).Scan(&n); err != nil || n < id.messageCount {
+				continue
+			}
+			if err := os.Remove(path); err != nil {
+				log.Printf("export: could not retire %q: %v", e.name, err)
+				continue
+			}
+			removed++
+		}
+	}
+	return removed
+}
+
 func unitHasRenderableMessages(db *sql.DB, members []string) (bool, error) {
 	query := fmt.Sprintf(`
 		SELECT timestamp, COALESCE(scrubbed_text, COALESCE(content_text, '')), type, COALESCE(voice_note_transcript, '')
