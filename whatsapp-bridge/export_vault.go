@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -24,8 +26,19 @@ import (
 // Output layout (one file per HUMAN or group; groups are skipped by default):
 //
 //	<outputDir>/<Contact Name>.md            direct chat, push_name known
-//	<outputDir>/+<phone>.md                  direct chat, only phone known
 //	<outputDir>/<Group Name> (group).md      group chat (never a bare person name)
+//	<outputDir>/Chat with an unknown number (WhatsApp) <id>.md
+//	                                         direct chat, no name known
+//	<outputDir>/Group chat (WhatsApp) <id> (group).md
+//	                                         group chat, no subject known
+//
+// When no human name is known the file is never named after the phone number
+// or JID (tickets#6939): those are private identifiers and unreadable as a
+// title. <id> is the first characters of a hash of the chat's JID, so two
+// unknown chats never share a file and a re-export lands on the same one. The
+// number itself stays in the frontmatter (phone:, jid:). Once a name becomes
+// known, healLegacyFilenames finds the file by its frontmatter jid and renames
+// it to the person's name.
 //
 // YAML frontmatter:
 //
@@ -345,6 +358,7 @@ type exportUnit struct {
 	lastMessageTs     int64  // max across members
 	transcriptTs      int64  // newest voice-note transcript across members; 0 when none
 	msgCount          int    // total message rows across members
+	unnamed           bool   // no human name is known: display is a phone/JID fallback
 	filename          string // final basename, ".md" included
 	forceRewrite      bool   // set when the file was healed/renamed and must be regenerated
 }
@@ -612,7 +626,10 @@ func buildExportUnits(db *sql.DB, includeGroups bool, minMessages int, entries [
 //
 // Display precedence for direct chats: contacts.push_name (primary JID first),
 // then chats.name, then "+<phone>", then the primary JID's digits. Groups use
-// chats.name only — a group must never inherit a person's contact card.
+// chats.name only — a group must never inherit a person's contact card. A
+// name that is itself a number or JID counts as no name. When no name is
+// known the fallback display is kept for the frontmatter `contact:` and the
+// unit is marked unnamed, so assignFilenames never puts it in the file name.
 //
 // Phone rule: a phone is only a phone when it comes from an @s.whatsapp.net
 // JID's user portion or a contacts.phone column that is NOT the digits of a
@@ -660,7 +677,11 @@ func resolveUnitIdentities(db *sql.DB, units []exportUnit, chats map[string]chat
 
 		if u.chatType != "direct" {
 			u.display = chats[u.primary].name
+			if looksLikeIdentifier(u.display) {
+				u.display = ""
+			}
 			if u.display == "" {
+				u.unnamed = true
 				u.display = extractPhone(u.primary)
 			}
 			if u.display == "" {
@@ -693,20 +714,21 @@ func resolveUnitIdentities(db *sql.DB, units []exportUnit, chats map[string]chat
 		}
 
 		for _, jid := range u.members { // members are primary-first
-			if c, ok := contacts[jid]; ok && c.pushName != "" && !strings.HasPrefix(c.pushName, "+") {
+			if c, ok := contacts[jid]; ok && c.pushName != "" && !strings.HasPrefix(c.pushName, "+") && !looksLikeIdentifier(c.pushName) {
 				u.display = c.pushName
 				break
 			}
 		}
 		if u.display == "" {
 			for _, jid := range u.members {
-				if n := chats[jid].name; n != "" && !strings.HasPrefix(n, "+") {
+				if n := chats[jid].name; n != "" && !strings.HasPrefix(n, "+") && !looksLikeIdentifier(n) {
 					u.display = n
 					break
 				}
 			}
 		}
 		if u.display == "" {
+			u.unnamed = true
 			if u.phone != "" {
 				u.display = "+" + u.phone
 			} else if d := extractPhone(u.primary); d != "" {
@@ -717,6 +739,62 @@ func resolveUnitIdentities(db *sql.DB, units []exportUnit, chats map[string]chat
 		}
 	}
 	return nil
+}
+
+// looksLikeIdentifier reports whether a name is really a phone number or a
+// JID (digits with phone punctuation, or anything with an "@"), which must
+// never become a file name.
+func looksLikeIdentifier(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+	if strings.Contains(s, "@") {
+		return true
+	}
+	digits := 0
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9':
+			digits++
+		case r == '+' || r == ' ' || r == '-' || r == '(' || r == ')' || r == '.':
+		default:
+			return false
+		}
+	}
+	return digits > 0
+}
+
+// unnamedID is the stable disambiguator for a chat with no known name: the
+// first n hex characters of a SHA-256 of its JIDs. It is built from the
+// lexically first JID of the unit's closure rather than the primary, because
+// the primary of a merged human moves with activity and the file name must
+// not flip between runs. It reveals nothing of the number.
+func unnamedID(u *exportUnit, n int) string {
+	key := u.primary
+	for _, a := range u.aliasJIDs {
+		if a < key {
+			key = a
+		}
+	}
+	sum := sha256.Sum256([]byte(key))
+	h := hex.EncodeToString(sum[:])
+	if n > len(h) {
+		n = len(h)
+	}
+	return h[:n]
+}
+
+// unnamedLabel is the readable title for a chat with no known name.
+func unnamedLabel(chatType string) string {
+	switch chatType {
+	case "direct":
+		return "Chat with an unknown number (WhatsApp)"
+	case "group":
+		return "Group chat (WhatsApp)"
+	default:
+		return "Broadcast (WhatsApp)"
+	}
 }
 
 // chatRowLite is the slice of a chats row the export planner needs.
@@ -761,6 +839,17 @@ type chatRowLite struct {
 // in ExportVault.
 func assignFilenames(units []exportUnit, taken map[string]string) {
 	name := func(u *exportUnit, level int) string {
+		if u.unnamed {
+			// No digits, handle or JID ever reach the name. Collisions
+			// escalate to a longer hash instead (6, 12, then all 64 hex).
+			// Non-direct chats still end in their (chat_type) marker.
+			n := []int{6, 12, 64}[level]
+			base := unnamedLabel(u.chatType) + " " + unnamedID(u, n)
+			if u.chatType != "direct" {
+				return fmt.Sprintf("%s (%s)", base, u.chatType)
+			}
+			return base
+		}
 		base := sanitizeFilename(u.display)
 		if u.chatType != "direct" {
 			switch level {
@@ -1187,10 +1276,14 @@ func exportOneUnit(db *sql.DB, outputDir string, u exportUnit, todayStr string) 
 		}
 	}
 
+	heading := u.display
+	if u.unnamed {
+		heading = strings.TrimSuffix(unnamedLabel(u.chatType), " (WhatsApp)")
+	}
 	lines = append(lines,
 		"---",
 		"",
-		fmt.Sprintf("# WhatsApp: %s", u.display),
+		fmt.Sprintf("# WhatsApp: %s", heading),
 		"",
 	)
 	for _, d := range dates {
