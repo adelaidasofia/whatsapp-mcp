@@ -315,6 +315,24 @@ func ExportVault(db *sql.DB, outputDir string, includeGroups bool, minMessages i
 		}
 	}
 
+	// Retire files a unit has absorbed (tickets#6939): when an unknown chat
+	// merges into a person who already has a file, the unit writes the
+	// person's file and the old file still claims the merged JID. Only on a
+	// clean run, and only files whose messages the unit's file now holds.
+	retired := 0
+	if len(dropped) == 0 {
+		var ok []int
+		for _, f := range files {
+			if _, isAliased := aliasPartner[f.i]; !isAliased {
+				ok = append(ok, f.i)
+			}
+		}
+		retired = retireAbsorbedFiles(db, outputDir, units, ok, entries)
+	}
+	if retired > 0 {
+		log.Printf("export: retired %d file(s) whose chat merged into another file", retired)
+	}
+
 	log.Printf("export: done (%d written, %d skipped-unchanged, %d skipped-empty)",
 		written, skippedUnchanged, skippedEmpty)
 	log.Printf("export: reconcile chats_in_db=%d exported_units=%d written=%d skipped_unchanged=%d skipped_empty=%d dropped=%d",
@@ -769,7 +787,9 @@ func looksLikeIdentifier(s string) bool {
 // first n hex characters of a SHA-256 of its JIDs. It is built from the
 // lexically first JID of the unit's closure rather than the primary, because
 // the primary of a merged human moves with activity and the file name must
-// not flip between runs. It reveals nothing of the number.
+// not flip between runs. It reveals nothing of the number. The id is stable
+// while the chat's set of JIDs is stable; a newly merged JID can change it,
+// and healLegacyFilenames then moves the file by its frontmatter jid.
 func unnamedID(u *exportUnit, n int) string {
 	key := u.primary
 	for _, a := range u.aliasJIDs {
@@ -1184,6 +1204,12 @@ func exportOneUnit(db *sql.DB, outputDir string, u exportUnit, todayStr string) 
 		return writeResultEmpty, nil // nothing to write
 	}
 
+	// The name shown for the other side: for a chat with no known name, the
+	// same readable label as the file, never the number (tickets#6939).
+	label := u.display
+	if u.unnamed {
+		label = strings.TrimSuffix(unnamedLabel(u.chatType), " (WhatsApp)")
+	}
 	byDate := map[string][]string{}
 	for _, m := range messages {
 		if m.ts < 1000 {
@@ -1197,7 +1223,7 @@ func exportOneUnit(db *sql.DB, outputDir string, u exportUnit, todayStr string) 
 			if m.senderDisplay != "" {
 				speaker = m.senderDisplay
 			} else {
-				speaker = u.display
+				speaker = label
 			}
 		}
 
@@ -1276,10 +1302,7 @@ func exportOneUnit(db *sql.DB, outputDir string, u exportUnit, todayStr string) 
 		}
 	}
 
-	heading := u.display
-	if u.unnamed {
-		heading = strings.TrimSuffix(unnamedLabel(u.chatType), " (WhatsApp)")
-	}
+	heading := label
 	lines = append(lines,
 		"---",
 		"",
@@ -1373,6 +1396,69 @@ func renderMessageText(msgType, text, transcript string) string {
 // unitHasRenderableMessages reports whether at least one of the unit's rows
 // would produce a line in the chat file, under exactly the rules
 // exportOneUnit applies (renderMessageText + the ts >= 1000 epoch guard).
+// retireAbsorbedFiles removes chat files left behind by a merge: a file of
+// ours (type whatsapp-chat) whose jid and alias_jids all belong to a unit that
+// was just written or confirmed under a different name, and whose
+// message_count the database still covers for those JIDs, so every message
+// it held is in the unit's file. Anything else is left in place. Returns the
+// number of files removed.
+func retireAbsorbedFiles(db *sql.DB, outputDir string, units []exportUnit, ok []int, entries []vaultEntry) int {
+	removed := 0
+	for _, i := range ok {
+		u := &units[i]
+		closure := map[string]bool{u.primary: true}
+		for _, a := range u.aliasJIDs {
+			closure[a] = true
+		}
+		members := map[string]bool{}
+		for _, m := range u.members {
+			members[m] = true
+		}
+		for _, e := range entries {
+			if e.jid == "" || !members[e.jid] || e.name == u.filename {
+				continue
+			}
+			path := filepath.Join(outputDir, e.name)
+			st, err := os.Lstat(path)
+			if err != nil || !st.Mode().IsRegular() {
+				continue
+			}
+			if own, err := os.Stat(filepath.Join(outputDir, u.filename)); err != nil || os.SameFile(st, own) {
+				continue
+			}
+			id := readChatFileIdentity(path)
+			if id.fileType != "whatsapp-chat" || !members[id.jid] {
+				continue
+			}
+			jids := []string{id.jid}
+			covered := true
+			for _, a := range id.aliasJIDs {
+				if !closure[a] {
+					covered = false
+					break
+				}
+				if members[a] {
+					jids = append(jids, a)
+				}
+			}
+			if !covered {
+				continue
+			}
+			var n int
+			if err := db.QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM messages WHERE chat_jid IN (%s) AND is_deleted = 0`,
+				inClausePlaceholders(len(jids))), jidsToArgs(jids)...).Scan(&n); err != nil || n < id.messageCount {
+				continue
+			}
+			if err := os.Remove(path); err != nil {
+				log.Printf("export: could not retire %q: %v", e.name, err)
+				continue
+			}
+			removed++
+		}
+	}
+	return removed
+}
+
 func unitHasRenderableMessages(db *sql.DB, members []string) (bool, error) {
 	query := fmt.Sprintf(`
 		SELECT timestamp, COALESCE(scrubbed_text, COALESCE(content_text, '')), type, COALESCE(voice_note_transcript, '')

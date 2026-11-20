@@ -139,3 +139,87 @@ func TestLooksLikeIdentifier(t *testing.T) {
 		}
 	}
 }
+
+// The other side of an unknown chat is labelled with the readable label in
+// the message lines too, never with the number.
+func TestExportLabelsUnknownSenderWithoutTheNumber(t *testing.T) {
+	db := xvDB(t)
+	outDir := t.TempDir()
+	xvChat(t, db, xvPhoneJID, "direct", "", xvPhoneLastTS)
+	xvMsg(t, db, "P1", xvPhoneJID, xvPhoneJID, "", "text", "hola", "", xvPhoneLastTS, false)
+	if err := ExportVault(db, outDir, false, 0); err != nil {
+		t.Fatalf("ExportVault: %v", err)
+	}
+	_, body := xvReadFile(t, filepath.Join(outDir, xvFileForJID(t, outDir, xvPhoneJID)))
+	if strings.Contains(body, extractPhone(xvPhoneJID)) {
+		t.Errorf("body carries the number:\n%s", body)
+	}
+	if !strings.Contains(body, "Chat with an unknown number: hola") {
+		t.Errorf("message line not labelled readably:\n%s", body)
+	}
+}
+
+// An unknown chat that later merges into a person who already has a named
+// file ends with one file: the named one holds every message and the old
+// unknown-number file is retired.
+func TestExportRetiresUnknownFileAbsorbedByNamedPerson(t *testing.T) {
+	db := xvDB(t)
+	outDir := t.TempDir()
+	xvChat(t, db, xvPhoneJID, "direct", xvPersonName, xvPhoneLastTS)
+	xvContact(t, db, xvPhoneJID, xvPersonName, extractPhone(xvPhoneJID))
+	xvChat(t, db, xvLIDJID, "direct", "", xvLIDLastTS)
+	xvMsg(t, db, "P1", xvPhoneJID, xvPhoneJID, xvPersonName, "text", "desde el telefono", "", xvPhoneLastTS, false)
+	xvMsg(t, db, "L1", xvLIDJID, xvLIDJID, "", "text", "desde el lid", "", xvLIDLastTS, false)
+
+	if err := ExportVault(db, outDir, false, 0); err != nil {
+		t.Fatalf("ExportVault: %v", err)
+	}
+	if entries, _ := os.ReadDir(outDir); len(entries) != 2 {
+		t.Fatalf("before the merge: %d files, want 2", len(entries))
+	}
+
+	xvAlias(t, db, xvLIDJID, xvPhoneJID)
+	if err := ExportVault(db, outDir, false, 0); err != nil {
+		t.Fatalf("second ExportVault: %v", err)
+	}
+	entries, _ := os.ReadDir(outDir)
+	if len(entries) != 1 || entries[0].Name() != xvPersonName+".md" {
+		names := []string{}
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("after the merge: %v, want only %q", names, xvPersonName+".md")
+	}
+	_, body := xvReadFile(t, filepath.Join(outDir, entries[0].Name()))
+	for _, want := range []string{"desde el telefono", "desde el lid"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("merged file lost %q:\n%s", want, body)
+		}
+	}
+}
+
+// A leftover file holding more messages than the database still has is kept.
+func TestExportKeepsAbsorbedFileTheDatabaseNoLongerCovers(t *testing.T) {
+	db := xvDB(t)
+	outDir := t.TempDir()
+	xvChat(t, db, xvPhoneJID, "direct", xvPersonName, xvPhoneLastTS)
+	xvContact(t, db, xvPhoneJID, xvPersonName, extractPhone(xvPhoneJID))
+	xvChat(t, db, xvLIDJID, "direct", "", xvLIDLastTS)
+	xvMsg(t, db, "P1", xvPhoneJID, xvPhoneJID, xvPersonName, "text", "uno", "", xvPhoneLastTS, false)
+	xvMsg(t, db, "L1", xvLIDJID, xvLIDJID, "", "text", "dos", "", xvLIDLastTS, false)
+	xvAlias(t, db, xvLIDJID, xvPhoneJID)
+	old := "Chat with an unknown number (WhatsApp) old.md"
+	seed := "---\ntype: whatsapp-chat\njid: \"" + xvLIDJID + "\"\nchat_type: \"direct\"\nmessage_count: 40\n---\n\nolder history\n"
+	if err := os.WriteFile(filepath.Join(outDir, xvPersonName+".md"), []byte("---\ntype: whatsapp-chat\njid: \""+xvPhoneJID+"\"\nchat_type: \"direct\"\nmessage_count: 1\n---\n\nx\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outDir, old), []byte(seed), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := ExportVault(db, outDir, false, 0); err != nil {
+		t.Fatalf("ExportVault: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(outDir, old)); err != nil {
+		t.Errorf("file with history the database lacks was removed: %v", err)
+	}
+}
